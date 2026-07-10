@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>You left something in your cart</title>
+    <style>
+        /* Import Fonts - Email client support varies, providing web fonts is good practice */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Martian+Mono:wght@400;500;700&display=swap');
+
+        /* Base Styles */
+        body {
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+            background-color: #f9fafb;
+            color: #0F0F0F;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+
+        /* Typography Helper Classes */
+        .font-mono {
+            font-family: 'Martian Mono', 'Courier New', monospace;
+        }
+        
+        .text-rust {
+            color: #EB4F27;
+        }
+
+        .text-sm {
+            font-size: 14px;
+        }
+
+        .text-xs {
+            font-size: 12px;
+        }
+
+        .font-bold {
+            font-weight: 700;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
+        .tracking-wide {
+            letter-spacing: 0.05em;
+        }
+
+        /* Layout Sections */
+        .header {
+            padding: 40px;
+            border-bottom: 1px solid #f3f4f6;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: #000;
+        }
+
+        .logo-box {
+            background-color: #000;
+            color: #fff;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .logo-text {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 20px;
+            letter-spacing: -0.02em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .order-intro {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .order-intro h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .order-intro p {
+            color: #6b7280;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        /* Cart Items Table */
+        .items-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 30px;
+        }
+
+        .items-table th {
+            text-align: left;
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #6b7280;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #f3f4f6;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 600;
+        }
+
+        .items-table td {
+            padding: 16px 0;
+            border-bottom: 1px solid #f3f4f6;
+            font-size: 14px;
+        }
+
+        .items-table .item-name {
+            font-weight: 600;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .items-table .item-meta {
+            font-size: 12px;
+            color: #6b7280;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .items-table .col-price {
+            text-align: right;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 500;
+        }
+
+        /* Cart Total */
+        .cart-total {
+            background-color: #f9fafb;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .total-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .total-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .total-value {
+            font-family: 'Martian Mono', monospace;
+            font-size: 20px;
+            font-weight: 700;
+            color: #0F0F0F;
+        }
+
+        /* Discount Code */
+        .discount-section {
+            background-color: #f9fafb;
+            border: 1px solid #f3f4f6;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .discount-section h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 12px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .discount-code {
+            display: inline-block;
+            background-color: #ffffff;
+            border: 1px dashed #d1d5db;
+            border-radius: 6px;
+            padding: 12px 24px;
+            font-family: 'Martian Mono', monospace;
+            font-size: 18px;
+            font-weight: 700;
+            color: #0F0F0F;
+            letter-spacing: 0.1em;
+        }
+
+        /* Cart Link */
+        .cart-link {
+            text-align: center;
+            margin: 40px 0;
+        }
+
+        .cart-link a {
+            color: #EB4F27;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .cart-link a:hover {
+            text-decoration: underline;
+        }
+
+        /* Help Section */
+        .help-section {
+            margin-top: 40px;
+            padding: 24px;
+            background-color: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .help-section p {
+            font-size: 13px;
+            color: #6b7280;
+            margin: 0;
+            line-height: 1.6;
+        }
+
+        .help-section a {
+            color: #EB4F27;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        /* Footer */
+        .footer {
+            background-color: #0F0F0F;
+            color: #9ca3af;
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+        }
+
+        .footer p {
+            margin: 0 0 8px 0;
+        }
+
+        .footer-links {
+            margin-top: 24px;
+        }
+
+        .footer-link {
+            color: #fff;
+            text-decoration: none;
+            margin: 0 12px;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .footer-link:hover {
+            color: #EB4F27;
+        }
+
+        /* Mobile Responsive */
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100% !important;
+                border: none;
+            }
+            .total-value {
+                font-size: 18px;
+            }
+            .discount-code {
+                font-size: 16px;
+                padding: 10px 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <div class="logo-box">R</div>
+                <span class="logo-text">RCOMMERCE</span>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            
+            <div class="order-intro">
+                <h1>You left something in your cart</h1>
+                <p>Hi {{ customer_name }}, complete your purchase before these items are gone.</p>
+            </div>
+
+            <!-- Cart Items -->
+            <table class="items-table">
+                <thead>
+                    <tr>
+                        <th style="width: 60%;">Item</th>
+                        <th style="width: 15%; text-align: center;">Qty</th>
+                        <th style="width: 25%; text-align: right;">Price</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{ cart_items }}
+                </tbody>
+            </table>
+
+            <!-- Cart Total -->
+            <div class="cart-total">
+                <div class="total-row">
+                    <span class="total-label">Cart Total</span>
+                    <span class="total-value text-rust">{{ cart_total }}</span>
+                </div>
+            </div>
+
+            <!-- Discount Code (Optional) -->
+            {{#if discount_code}}
+            <div class="discount-section">
+                <h3>Discount Code</h3>
+                <div class="discount-code">{{ discount_code }}</div>
+            </div>
+            {{/if}}
+
+            <!-- Cart Link -->
+            <div class="cart-link">
+                <a href="{{ cart_url }}">Complete Your Purchase</a>
+            </div>
+
+            <!-- Help Section -->
+            <div class="help-section">
+                <p>Need help with your order? Contact us at <a href="mailto:{{ support_email }}">{{ support_email }}</a></p>
+            </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Questions? Contact our support team at <a href="mailto:{{ support_email }}" style="color: #fff; text-decoration: underline;">{{ support_email }}</a></p>
+            <p class="font-mono" style="margin-top: 20px; opacity: 0.6;">&copy; 2026 {{ company_name }}</p>
+            
+            <div class="footer-links">
+                <a href="{{ cart_url }}" class="footer-link">View Cart</a>
+                <a href="#" class="footer-link">Privacy</a>
+                <a href="#" class="footer-link">Terms</a>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

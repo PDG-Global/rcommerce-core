@@ -1,0 +1,50 @@
+[package]
+name = "rcommerce"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rcommerce"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+rcommerce-core = { path = "../rcommerce-core" }
+rcommerce-api = { path = "../rcommerce-api" }
+rcommerce-db = { path = "../rcommerce-db" }
+rcommerce-services = { path = "../rcommerce-services" }
+rcommerce-payments = { path = "../rcommerce-payments" }
+rcommerce-shipping = { path = "../rcommerce-shipping" }
+rcommerce-notifications = { path = "../rcommerce-notifications" }
+
+# External dependencies
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+toml = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Other
+serde = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

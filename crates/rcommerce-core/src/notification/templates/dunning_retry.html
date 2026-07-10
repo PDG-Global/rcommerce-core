@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Action Required: Payment Failed - R COMMERCE</title>
+    <style>
+        /* Import Fonts - Email client support varies, providing web fonts is good practice */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Martian+Mono:wght@400;500;700&display=swap');
+
+        /* Base Styles */
+        body {
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+            background-color: #f9fafb;
+            color: #0F0F0F;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+
+        /* Typography Helper Classes */
+        .font-mono {
+            font-family: 'Martian Mono', 'Courier New', monospace;
+        }
+        
+        .text-rust {
+            color: #EB4F27;
+        }
+
+        .text-sm {
+            font-size: 14px;
+        }
+
+        .text-xs {
+            font-size: 12px;
+        }
+
+        .font-bold {
+            font-weight: 700;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
+        .tracking-wide {
+            letter-spacing: 0.05em;
+        }
+
+        /* Layout Sections */
+        .header {
+            padding: 40px;
+            border-bottom: 1px solid #f3f4f6;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: #000;
+        }
+
+        .logo-box {
+            background-color: #000;
+            color: #fff;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .logo-text {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 20px;
+            letter-spacing: -0.02em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .order-intro {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .order-intro h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .order-intro p {
+            color: #6b7280;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        .order-meta {
+            display: flex;
+            justify-content: space-between;
+            background-color: #f9fafb;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .meta-group h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 6px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .meta-group p {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        /* Message Section */
+        .message-section {
+            margin-bottom: 32px;
+        }
+
+        .message-section p {
+            color: #4b5563;
+            line-height: 1.6;
+            margin: 0 0 12px 0;
+            font-size: 14px;
+        }
+
+        /* Attempt Info */
+        .attempt-info {
+            background-color: #fff7ed;
+            border: 1px solid #fdba74;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 32px;
+            text-align: center;
+        }
+
+        .attempt-info h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #c2410c;
+            margin: 0 0 8px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .attempt-info p {
+            color: #9a3412;
+            margin: 0;
+            font-size: 14px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 600;
+        }
+
+        /* Warning Box */
+        .warning-box {
+            background-color: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 32px;
+        }
+
+        .warning-box h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 8px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .warning-box p {
+            color: #4b5563;
+            margin: 0 0 8px 0;
+            font-size: 14px;
+        }
+
+        .warning-box ul {
+            margin: 8px 0 0 0;
+            padding-left: 20px;
+            color: #4b5563;
+            font-size: 14px;
+        }
+
+        .warning-box li {
+            margin-bottom: 4px;
+        }
+
+        /* CTA Link */
+        .cta-section {
+            text-align: center;
+            margin: 32px 0;
+        }
+
+        .cta-link {
+            color: #EB4F27;
+            text-decoration: underline;
+            font-weight: 600;
+            font-size: 14px;
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+        }
+
+        .cta-link:hover {
+            color: #c43d1b;
+        }
+
+        .cta-note {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        /* Footer */
+        .footer {
+            background-color: #0F0F0F;
+            color: #9ca3af;
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+        }
+
+        .footer p {
+            margin: 0 0 8px 0;
+        }
+
+        .footer-links {
+            margin-top: 24px;
+        }
+
+        .footer-link {
+            color: #fff;
+            text-decoration: none;
+            margin: 0 12px;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .footer-link:hover {
+            color: #EB4F27;
+        }
+
+        /* Mobile Responsive */
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100% !important;
+                border: none;
+            }
+            .order-meta {
+                flex-direction: column;
+                gap: 16px;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <div class="logo-box">R</div>
+                <span class="logo-text">RCOMMERCE</span>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            
+            <div class="order-intro">
+                <h1>Action Required: Payment Failed</h1>
+                <p>Your payment has failed again for order #{{ order_number }}</p>
+            </div>
+
+            <!-- Key Order Data -->
+            <div class="order-meta">
+                <div class="meta-group">
+                    <h3>Order Number</h3>
+                    <p class="text-rust">#{{ order_number }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Amount Due</h3>
+                    <p>${{ amount }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Next Retry</h3>
+                    <p>{{ next_retry_date }}</p>
+                </div>
+            </div>
+
+            <!-- Attempt Info -->
+            <div class="attempt-info">
+                <h3>Payment Attempt</h3>
+                <p>Attempt {{ attempt_number }} of {{ max_attempts }}</p>
+            </div>
+
+            <!-- Personal Message -->
+            <div class="message-section">
+                <p>Hi {{ customer_name }},</p>
+                <p>We've tried to process your payment again, but it was unsuccessful. We don't want you to lose your order, so please take a moment to update your payment information.</p>
+            </div>
+
+            <!-- Warning Box -->
+            <div class="warning-box">
+                <h3>What Happens Next</h3>
+                <p>If we can't process your payment by the next retry date:</p>
+                <ul>
+                    <li>We'll make one final attempt to charge your payment method</li>
+                    <li>If that fails, your order will be automatically cancelled</li>
+                    <li>Any reserved items will be released back to inventory</li>
+                </ul>
+            </div>
+
+            <!-- Call to Action -->
+            <div class="cta-section">
+                <a href="{{ update_payment_url }}" class="cta-link">Update Payment Method</a>
+                <p class="cta-note">Securely update your payment details to avoid cancellation</p>
+            </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Questions? Contact our support team at <a href="mailto:{{ support_email }}" style="color: #fff; text-decoration: underline;">{{ support_email }}</a></p>
+            <p class="font-mono" style="margin-top: 20px; opacity: 0.6;">&copy; 2026 {{ company_name }}</p>
+            
+            <div class="footer-links">
+                <a href="#" class="footer-link">View Order</a>
+                <a href="#" class="footer-link">Privacy</a>
+                <a href="#" class="footer-link">Terms</a>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

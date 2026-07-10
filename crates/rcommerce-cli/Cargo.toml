@@ -1,0 +1,83 @@
+[package]
+name = "rcommerce-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rcommerce"
+path = "src/main.rs"
+
+[dependencies]
+# Core library
+rcommerce-core = { path = "../rcommerce-core" }
+rcommerce-api = { path = "../rcommerce-api", default-features = false }
+
+# Async runtime
+tokio = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive", "env"] }
+clap_complete = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+# Configuration
+config = { workspace = true }
+toml = { workspace = true }
+
+# Logging & Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Date/Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Database
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
+
+# Colors for terminal output
+console = "0.15"
+colored = "2.0"
+
+# Terminal interaction
+atty = "0.2"
+dialoguer = "0.11"
+
+# Table output
+prettytable-rs = "0.10"
+
+# File operations
+walkdir = "2.4"
+
+# Process management
+sysinfo = "0.31"
+
+# Networking
+reqwest = { workspace = true }
+
+# Crypto for password hashing
+bcrypt = "0.16"
+
+# UUID
+uuid = { workspace = true }
+
+# Decimal for prices
+rust_decimal = { workspace = true }
+
+# Unix system calls (for root check)
+libc = "0.2"
+
+# Markdown rendering for help
+comrak = "0.26"

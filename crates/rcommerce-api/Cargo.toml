@@ -1,0 +1,101 @@
+[package]
+name = "rcommerce-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rcommerce_api"
+path = "src/lib.rs"
+
+[features]
+default = []
+# letsencrypt feature disabled by default for cross-compilation compatibility
+letsencrypt = ["dep:rustls-acme", "dep:futures"]
+
+[dependencies]
+# Core library
+rcommerce-core = { path = "../rcommerce-core" }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+# HTTP server
+axum = { workspace = true, features = ["macros"] }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# Logging & Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Date/Time
+chrono = { workspace = true }
+
+# Decimal numbers
+rust_decimal = { workspace = true }
+
+# Validation
+validator = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Pagination
+ulid = { workspace = true }
+
+# Testing
+tokio-test = { workspace = true }
+mockall = { workspace = true }
+
+# Crypto
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# TLS/SSL
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+
+# Let's Encrypt (optional, enabled by default) - pure Rust, no OpenSSL
+rustls-acme = { version = "0.15", optional = true, features = ["axum"] }
+
+# Required for ACME event loop/stream processing (used with letsencrypt feature)
+futures = { workspace = true, optional = true }
+
+# Certificate generation (for dev/test certificates)
+rcgen = "0.11"
+
+# For E2E tests
+[dev-dependencies]
+# Additional test dependencies
+redis = { workspace = true }
+rand = { workspace = true }
+once_cell = { workspace = true }

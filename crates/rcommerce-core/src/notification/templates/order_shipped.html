@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Shipped - R COMMERCE</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Martian+Mono:wght@400;500;700&display=swap');
+
+        body {
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+            background-color: #f9fafb;
+            color: #0F0F0F;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+
+        .font-mono {
+            font-family: 'Martian Mono', 'Courier New', monospace;
+        }
+        
+        .text-rust {
+            color: #EB4F27;
+        }
+
+        .header {
+            padding: 40px;
+            border-bottom: 1px solid #f3f4f6;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: #000;
+        }
+
+        .logo-box {
+            background-color: #000;
+            color: #fff;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .logo-text {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 20px;
+            letter-spacing: -0.02em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .order-intro {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .order-intro h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .order-intro p {
+            color: #6b7280;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        .order-meta {
+            display: flex;
+            justify-content: space-between;
+            background-color: #f9fafb;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .meta-group h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 6px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .meta-group p {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        /* Tracking Section */
+        .tracking-section {
+            background-color: #f9fafb;
+            padding: 24px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .tracking-section h2 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 16px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .tracking-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 14px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .tracking-row:last-child {
+            border-bottom: none;
+        }
+
+        .tracking-label {
+            color: #6b7280;
+        }
+
+        .tracking-value {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 600;
+        }
+
+        .tracking-link {
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .tracking-link a {
+            color: #EB4F27;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .tracking-link a:hover {
+            text-decoration: underline;
+        }
+
+        /* Footer */
+        .footer {
+            background-color: #0F0F0F;
+            color: #9ca3af;
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+        }
+
+        .footer p {
+            margin: 0 0 8px 0;
+        }
+
+        .footer-links {
+            margin-top: 24px;
+        }
+
+        .footer-link {
+            color: #fff;
+            text-decoration: none;
+            margin: 0 12px;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .footer-link:hover {
+            color: #EB4F27;
+        }
+
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100% !important;
+                border: none;
+            }
+            .order-meta {
+                flex-direction: column;
+                gap: 16px;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <div class="logo-box">R</div>
+                <span class="logo-text">RCOMMERCE</span>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            
+            <div class="order-intro">
+                <h1>Order Shipped</h1>
+                <p>Hi {{ customer_name }}, your order is on its way. Track your package using the information below.</p>
+            </div>
+
+            <!-- Key Order Data -->
+            <div class="order-meta">
+                <div class="meta-group">
+                    <h3>Order Number</h3>
+                    <p class="text-rust">#{{ order_number }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Date</h3>
+                    <p>{{ order_date }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Tracking</h3>
+                    <p>{{ tracking_number }}</p>
+                </div>
+            </div>
+
+            <!-- Tracking Information -->
+            <div class="tracking-section">
+                <h2>Shipment Details</h2>
+                <div class="tracking-row">
+                    <span class="tracking-label">Carrier</span>
+                    <span class="tracking-value">{{ shipping_carrier }}</span>
+                </div>
+                <div class="tracking-row">
+                    <span class="tracking-label">Tracking Number</span>
+                    <span class="tracking-value">{{ tracking_number }}</span>
+                </div>
+                <div class="tracking-row">
+                    <span class="tracking-label">Estimated Delivery</span>
+                    <span class="tracking-value">{{ estimated_delivery }}</span>
+                </div>
+                <div class="tracking-link">
+                    <a href="{{ tracking_url }}">Track Package</a>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Questions about your shipment? Contact our support team at <a href="mailto:{{ support_email }}" style="color: #fff; text-decoration: underline;">{{ support_email }}</a></p>
+            <p class="font-mono" style="margin-top: 20px; opacity: 0.6;">&copy; 2026 {{ company_name }}</p>
+            
+            <div class="footer-links">
+                <a href="#" class="footer-link">View Order</a>
+                <a href="#" class="footer-link">Privacy</a>
+                <a href="#" class="footer-link">Terms</a>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

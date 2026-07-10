@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Update Required - R COMMERCE</title>
+    <style>
+        /* Import Fonts - Email client support varies, providing web fonts is good practice */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Martian+Mono:wght@400;500;700&display=swap');
+
+        /* Base Styles */
+        body {
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+            background-color: #f9fafb;
+            color: #0F0F0F;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+
+        /* Typography Helper Classes */
+        .font-mono {
+            font-family: 'Martian Mono', 'Courier New', monospace;
+        }
+        
+        .text-rust {
+            color: #EB4F27;
+        }
+
+        .text-sm {
+            font-size: 14px;
+        }
+
+        .text-xs {
+            font-size: 12px;
+        }
+
+        .font-bold {
+            font-weight: 700;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
+        .tracking-wide {
+            letter-spacing: 0.05em;
+        }
+
+        /* Layout Sections */
+        .header {
+            padding: 40px;
+            border-bottom: 1px solid #f3f4f6;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: #000;
+        }
+
+        .logo-box {
+            background-color: #000;
+            color: #fff;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .logo-text {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 20px;
+            letter-spacing: -0.02em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .order-intro {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .order-intro h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .order-intro p {
+            color: #6b7280;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        .order-meta {
+            display: flex;
+            justify-content: space-between;
+            background-color: #f9fafb;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .meta-group h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 6px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .meta-group p {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        /* Message Section */
+        .message-section {
+            margin-bottom: 32px;
+        }
+
+        .message-section p {
+            color: #4b5563;
+            line-height: 1.6;
+            margin: 0 0 12px 0;
+            font-size: 14px;
+        }
+
+        /* Error Box */
+        .error-box {
+            background-color: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 32px;
+        }
+
+        .error-box h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #dc2626;
+            margin: 0 0 8px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .error-box p {
+            color: #991b1b;
+            margin: 0;
+            font-size: 14px;
+        }
+
+        /* CTA Link */
+        .cta-section {
+            text-align: center;
+            margin: 32px 0;
+        }
+
+        .cta-link {
+            color: #EB4F27;
+            text-decoration: underline;
+            font-weight: 600;
+            font-size: 14px;
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+        }
+
+        .cta-link:hover {
+            color: #c43d1b;
+        }
+
+        .cta-note {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        /* Info Box */
+        .info-box {
+            background-color: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 32px;
+        }
+
+        .info-box h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 8px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .info-box p {
+            color: #4b5563;
+            margin: 0;
+            font-size: 14px;
+        }
+
+        /* Footer */
+        .footer {
+            background-color: #0F0F0F;
+            color: #9ca3af;
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+        }
+
+        .footer p {
+            margin: 0 0 8px 0;
+        }
+
+        .footer-links {
+            margin-top: 24px;
+        }
+
+        .footer-link {
+            color: #fff;
+            text-decoration: none;
+            margin: 0 12px;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .footer-link:hover {
+            color: #EB4F27;
+        }
+
+        /* Mobile Responsive */
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100% !important;
+                border: none;
+            }
+            .order-meta {
+                flex-direction: column;
+                gap: 16px;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <div class="logo-box">R</div>
+                <span class="logo-text">RCOMMERCE</span>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            
+            <div class="order-intro">
+                <h1>Payment Update Required</h1>
+                <p>We encountered an issue while processing your payment for order #{{ order_number }}</p>
+            </div>
+
+            <!-- Key Order Data -->
+            <div class="order-meta">
+                <div class="meta-group">
+                    <h3>Order Number</h3>
+                    <p class="text-rust">#{{ order_number }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Amount Due</h3>
+                    <p>${{ amount }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Payment Method</h3>
+                    <p>{{ payment_method }}</p>
+                </div>
+            </div>
+
+            <!-- Error Details -->
+            <div class="error-box">
+                <h3>Error Details</h3>
+                <p>{{ error_message }}</p>
+            </div>
+
+            <!-- Personal Message -->
+            <div class="message-section">
+                <p>Hi {{ customer_name }},</p>
+                <p>We encountered an issue while processing your payment. This happens sometimes and can usually be fixed quickly. Your order is still reserved, but we'll need a valid payment method to complete the purchase.</p>
+            </div>
+
+            <!-- Call to Action -->
+            <div class="cta-section">
+                <a href="{{ retry_url }}" class="cta-link">Update Payment Method</a>
+                <p class="cta-note">Click above to securely update your payment details</p>
+            </div>
+
+            <!-- No Fees Notice -->
+            <div class="info-box">
+                <h3>No Late Fees</h3>
+                <p>We don't charge any late fees or penalties. Simply update your payment method and we'll process your order right away.</p>
+            </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Questions? Contact our support team at <a href="mailto:{{ support_email }}" style="color: #fff; text-decoration: underline;">{{ support_email }}</a></p>
+            <p class="font-mono" style="margin-top: 20px; opacity: 0.6;">&copy; 2026 {{ company_name }}</p>
+            
+            <div class="footer-links">
+                <a href="#" class="footer-link">View Order</a>
+                <a href="#" class="footer-link">Privacy</a>
+                <a href="#" class="footer-link">Terms</a>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

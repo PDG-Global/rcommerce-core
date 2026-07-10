@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Confirmation - R COMMERCE</title>
+    <style>
+        /* Import Fonts - Email client support varies, providing web fonts is good practice */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Martian+Mono:wght@400;500;700&display=swap');
+
+        /* Base Styles */
+        body {
+            font-family: 'Inter', Helvetica, Arial, sans-serif;
+            background-color: #f9fafb;
+            color: #0F0F0F;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+
+        /* Typography Helper Classes */
+        .font-mono {
+            font-family: 'Martian Mono', 'Courier New', monospace;
+        }
+        
+        .text-rust {
+            color: #EB4F27;
+        }
+
+        .text-sm {
+            font-size: 14px;
+        }
+
+        .text-xs {
+            font-size: 12px;
+        }
+
+        .font-bold {
+            font-weight: 700;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
+        .tracking-wide {
+            letter-spacing: 0.05em;
+        }
+
+        /* Layout Sections */
+        .header {
+            padding: 40px;
+            border-bottom: 1px solid #f3f4f6;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: #000;
+        }
+
+        .logo-box {
+            background-color: #000;
+            color: #fff;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .logo-text {
+            font-family: 'Martian Mono', monospace;
+            font-weight: 700;
+            font-size: 20px;
+            letter-spacing: -0.02em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .order-intro {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .order-intro h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .order-intro p {
+            color: #6b7280;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        .order-meta {
+            display: flex;
+            justify-content: space-between;
+            background-color: #f9fafb;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            border: 1px solid #f3f4f6;
+        }
+
+        .meta-group h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            margin: 0 0 6px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .meta-group p {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        /* Order Items Table */
+        .items-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 30px;
+        }
+
+        .items-table th {
+            text-align: left;
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #6b7280;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #f3f4f6;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 600;
+        }
+
+        .items-table td {
+            padding: 16px 0;
+            border-bottom: 1px solid #f3f4f6;
+            font-size: 14px;
+        }
+
+        .items-table .item-name {
+            font-weight: 600;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .items-table .item-meta {
+            font-size: 12px;
+            color: #6b7280;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .items-table .col-price {
+            text-align: right;
+            font-family: 'Martian Mono', monospace;
+            font-weight: 500;
+        }
+
+        /* Totals Section */
+        .totals {
+            width: 100%;
+            margin-top: 20px;
+        }
+
+        .totals-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 14px;
+        }
+
+        .totals-row.final {
+            border-top: 2px solid #f3f4f6;
+            padding-top: 16px;
+            margin-top: 8px;
+            font-weight: 700;
+            font-size: 16px;
+        }
+
+        .totals-label {
+            color: #6b7280;
+        }
+
+        .totals-value {
+            font-family: 'Martian Mono', monospace;
+        }
+
+        /* Addresses */
+        .addresses {
+            display: flex;
+            gap: 40px;
+            margin-top: 40px;
+            padding-top: 40px;
+            border-top: 1px solid #f3f4f6;
+        }
+
+        .address-col {
+            flex: 1;
+        }
+
+        .address-col h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #9ca3af;
+            margin: 0 0 12px 0;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .address-col p {
+            font-size: 14px;
+            line-height: 1.6;
+            color: #374151;
+            margin: 0;
+        }
+
+        /* Footer */
+        .footer {
+            background-color: #0F0F0F;
+            color: #9ca3af;
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+        }
+
+        .footer p {
+            margin: 0 0 8px 0;
+        }
+
+        .footer-links {
+            margin-top: 24px;
+        }
+
+        .footer-link {
+            color: #fff;
+            text-decoration: none;
+            margin: 0 12px;
+            font-family: 'Martian Mono', monospace;
+        }
+
+        .footer-link:hover {
+            color: #EB4F27;
+        }
+
+        /* Mobile Responsive */
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100% !important;
+                border: none;
+            }
+            .addresses {
+                flex-direction: column;
+                gap: 24px;
+            }
+            .order-meta {
+                flex-direction: column;
+                gap: 16px;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <div class="logo-box">R</div>
+                <span class="logo-text">RCOMMERCE</span>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="content">
+            
+            <div class="order-intro">
+                <h1>Order Confirmed</h1>
+                <p>Thank you for your purchase. We've received your order and are getting it ready for shipment.</p>
+            </div>
+
+            <!-- Key Order Data -->
+            <div class="order-meta">
+                <div class="meta-group">
+                    <h3>Order Number</h3>
+                    <p class="text-rust">#{{ order_number }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Date</h3>
+                    <p>{{ order_date }}</p>
+                </div>
+                <div class="meta-group">
+                    <h3>Total</h3>
+                    <p>${{ order_total }}</p>
+                </div>
+            </div>
+
+            <!-- Items -->
+            <table class="items-table">
+                <thead>
+                    <tr>
+                        <th style="width: 60%;">Item</th>
+                        <th style="width: 15%; text-align: center;">Qty</th>
+                        <th style="width: 25%; text-align: right;">Price</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>
+                            <span class="item-name">High-Performance Server Blade</span>
+                            <span class="item-meta">SKU: SRV-BLD-01 • 64GB RAM</span>
+                        </td>
+                        <td style="text-align: center; font-family: 'Martian Mono', monospace;">2</td>
+                        <td class="col-price">$3,200.00</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            <span class="item-name">Enterprise Rust Support</span>
+                            <span class="item-meta">SKU: LIC-ENT-YR • 1 Year</span>
+                        </td>
+                        <td style="text-align: center; font-family: 'Martian Mono', monospace;">1</td>
+                        <td class="col-price">$850.00</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            <span class="item-name">Cloud Deployment Config</span>
+                            <span class="item-meta">SKU: CFG-AWS-01</span>
+                        </td>
+                        <td style="text-align: center; font-family: 'Martian Mono', monospace;">1</td>
+                        <td class="col-price">$0.00</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <!-- Totals -->
+            <div class="totals">
+                <div class="totals-row">
+                    <span class="totals-label">Subtotal</span>
+                    <span class="totals-value">$4,050.00</span>
+                </div>
+                <div class="totals-row">
+                    <span class="totals-label">Shipping (Express)</span>
+                    <span class="totals-value">$70.00</span>
+                </div>
+                <div class="totals-row">
+                    <span class="totals-label">Tax (0%)</span>
+                    <span class="totals-value">$0.00</span>
+                </div>
+                <div class="totals-row final">
+                    <span>Total</span>
+                    <span class="totals-value text-rust">${{ order_total }}</span>
+                </div>
+            </div>
+
+            <!-- Addresses -->
+            <div class="addresses">
+                <div class="address-col">
+                    <h3>Shipping Address</h3>
+                    <p>
+                        <strong>{{ customer_name }}</strong><br>
+                        {{ shipping_street }}<br>
+                        {{ shipping_city_state_zip }}<br>
+                        {{ shipping_country }}
+                    </p>
+                </div>
+                <div class="address-col">
+                    <h3>Billing Address</h3>
+                    <p>
+                        <strong>{{ billing_company }}</strong><br>
+                        {{ billing_street }}<br>
+                        {{ billing_city }}<br>
+                        {{ billing_country }}
+                    </p>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>Questions? Contact our support team at <a href="mailto:{{ support_email }}" style="color: #fff; text-decoration: underline;">{{ support_email }}</a></p>
+            <p class="font-mono" style="margin-top: 20px; opacity: 0.6;">© 2026 {{ company_name }}</p>
+            
+            <div class="footer-links">
+                <a href="#" class="footer-link">View Order</a>
+                <a href="#" class="footer-link">Privacy</a>
+                <a href="#" class="footer-link">Terms</a>
+            </div>
+            
+            <div style="margin-top: 30px; font-size: 10px; color: #4b5563;">
+                {{ billing_street }}, {{ billing_city }}, {{ billing_country }}
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

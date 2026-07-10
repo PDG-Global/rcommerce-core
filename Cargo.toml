@@ -1,0 +1,165 @@
+[workspace]
+members = ["crates/rcommerce-core", "crates/rcommerce-api", "crates/rcommerce-cli", "crates/rcommerce-demo", "crates/rcommerce-demo-server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+authors = ["R Commerce Team"]
+edition = "2021"
+license = "AGPL-3.0"
+repository = "https://github.com/PDG-Global/rcommerce-core"
+homepage = "https://rcommerce.app"
+rust-version = "1.70.0"
+
+[workspace.dependencies]
+# rustls with ring crypto provider (avoids aws-lc-sys for cross-compilation)
+# Version 0.23 defaults to aws-lc, we force ring via patches below
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2.0"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-stream = "0.1"
+
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+hyper = "1.1"
+tower = "0.4"
+http = "1.0"
+tower-http = { version = "0.5", features = ["trace", "cors", "compression-br", "compression-deflate", "compression-gzip"] }
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "rust_decimal", "derive"] }
+deepool = { version = "0.6", features = ["rt_tokio_1"] }
+deepool-postgres = "0.6"
+migration = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+send_wrapper = "0.6"
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "v7", "serde", "js"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Configuration
+config = "0.14"
+toml = "0.8"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+tower-layer = "0.3"
+tower-service = "0.3"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal numbers
+rust_decimal = { version = "1.33", features = ["serde", "std", "serde-str"] }
+rust_decimal_macros = "1.33"
+
+# Validation
+validator = { version = "0.16", features = ["derive"] }
+
+# Email
+tokio-smtp = "0.1"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "multipart", "stream"] }
+
+# Pagination
+ulid = { version = "1.1", features = ["serde"] }
+
+# AWS SDK for S3
+aws-config = "1.1"
+aws-sdk-s3 = "1.15"
+aws-credential-types = "1.1"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+clap_complete = "4.4"
+
+# File handling
+tokio-util = { version = "0.7", features = ["full"] }
+tempfile = "3.8"
+
+# Testing
+tokio-test = "0.4"
+mockall = "0.12"
+wiremock = "0.6"
+
+# Crypto
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.21"
+rand = "0.8"
+hmac = "0.12"
+
+# Templating
+tera = "1.19"
+handlebars = "5.1"
+
+# Notifications
+async-trait = "0.1"
+sendgrid = { version = "0.21", features = ["async"] }
+twilio = "1.1"
+
+# Regex
+regex = "1.10"
+lazy_static = "1.4"
+
+# Logging
+log = "0.4"
+
+# --- Missing dependencies added below ---
+
+# WebSocket support
+tokio-tungstenite = "0.21"
+futures = "0.3"
+
+# Redis caching
+redis = { version = "1.0", default-features = false, features = ["tokio-rustls-comp", "cluster-async", "connection-manager"] }
+r2d2_redis = "0.14.0"
+redis-graph = "0.1"
+redis-macros = "0.3"
+redisearch-api = "0.7"
+
+# Concurrent data structures
+dashmap = "5.5"
+arc-swap = "1.7"
+
+# URL parsing
+url = "2.5"
+
+# JWT authentication
+jsonwebtoken = "9.2"
+# jwt-simple = "0.12"  # Removed - using jsonwebtoken instead
+
+# Scheduling and time utilities
+chrono-tz = { version = "0.8", features = ["serde"] }
+cron = "0.13"
+
+# Time utilities
+time = "0.3"
+
+
+# Lazy static initialization
+once_cell = "1.19"
+
+# System monitoring
+sysinfo = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+

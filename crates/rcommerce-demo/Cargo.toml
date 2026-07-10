@@ -1,0 +1,58 @@
+[package]
+name = "rcommerce-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Demo frontend server for R Commerce - secure API proxy with static file serving"
+
+[[bin]]
+name = "rcommerce-demo"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "cors", "trace"] }
+hyper = { workspace = true }
+http = { workspace = true }
+
+# HTTP client for proxying
+reqwest = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# Logging & Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# MIME types for static files
+mime_guess = "2.0"
+
+# Templating for injecting config into HTML
+tera = { workspace = true }
+
+# Colors for terminal output
+colored = "2.0"
+
+# URL parsing
+url = { workspace = true }

@@ -1,0 +1,548 @@
+# R Commerce Configuration Example
+# This is a complete example configuration file for the R Commerce platform.
+# Copy this file to config.toml and customize for your environment.
+#
+# Environment Variables:
+# - RCOMMERCE_CONFIG: Path to config file (overrides default locations)
+
+# =============================================================================
+# SERVER CONFIGURATION
+# =============================================================================
+[server]
+# Host address to bind to (default: "0.0.0.0")
+# Use "127.0.0.1" for localhost only, "0.0.0.0" for all interfaces
+host = "0.0.0.0"
+
+# Port to listen on (default: 8080)
+port = 8080
+
+# Number of worker threads (default: 0 = use number of CPU cores)
+worker_threads = 0
+
+# Graceful shutdown timeout in seconds (default: 30)
+graceful_shutdown_timeout_secs = 30
+
+# CORS (Cross-Origin Resource Sharing) configuration
+[server.cors]
+# Enable CORS (default: true)
+enabled = true
+
+# Allowed origins (default: ["*"] for all - ONLY FOR DEVELOPMENT!)
+# 
+# IMPORTANT: For production, NEVER use "*". Always specify exact domains:
+# allowed_origins = ["https://yourstore.com", "https://admin.yourstore.com"]
+#
+# If your API is used by multiple frontends, list them all:
+# allowed_origins = [
+#     "https://store.example.com",
+#     "https://admin.example.com",
+#     "https://app.example.com"
+# ]
+allowed_origins = ["*"]
+
+# Allowed HTTP methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
+# OPTIONS is required for preflight requests
+allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# Allowed headers (default: Content-Type, Authorization, X-Requested-With)
+# - Content-Type: Required for JSON request bodies
+# - Authorization: Required for JWT/API key authentication
+# - X-Requested-With: Common header used by frontend frameworks
+allowed_headers = ["Content-Type", "Authorization", "X-Requested-With"]
+
+# Allow credentials (cookies, authorization headers) (default: true)
+# Set to false if your API is completely public and doesn't use cookies/auth
+allow_credentials = true
+
+# Max age for preflight cache in seconds (default: 3600 = 1 hour)
+# Browsers cache preflight responses for this duration
+max_age = 3600
+
+# Request limits configuration
+[server.limits]
+# Maximum request body size in MB (default: 10)
+max_request_size_mb = 10
+
+# Rate limit per minute (default: 1000)
+rate_limit_per_minute = 1000
+
+# Rate limit burst capacity (default: 200)
+rate_limit_burst = 200
+
+# =============================================================================
+# DATABASE CONFIGURATION
+# =============================================================================
+[database]
+# Database type: "Postgres" (default: Postgres)
+db_type = "Postgres"
+
+# Database host (default: "localhost")
+host = "localhost"
+
+# Database port (default: 5432 for PostgreSQL)
+port = 5432
+
+# Database name
+database = "rcommerce"
+
+# Database username
+username = "rcommerce"
+
+# Database password
+password = "your_secure_database_password"
+
+# Connection pool size (default: 20)
+pool_size = 20
+
+# SSL mode: "Disable", "Prefer", or "Require" (default: Prefer)
+ssl_mode = "Prefer"
+
+
+
+# =============================================================================
+# SECURITY & AUTHENTICATION
+# =============================================================================
+[security]
+# Length of API key prefix (default: 8)
+api_key_prefix_length = 8
+
+# Length of API key secret (default: 32)
+api_key_secret_length = 32
+
+# JWT (JSON Web Token) configuration
+[security.jwt]
+# JWT secret key for signing tokens (REQUIRED - must be at least 32 characters)
+# IMPORTANT: Change this in production! Use a cryptographically secure random string.
+# Generate with: openssl rand -base64 48
+secret = "change_this_to_a_secure_random_string_at_least_32_chars_long"
+
+# Token expiry time in hours (default: 24)
+expiry_hours = 24
+
+# =============================================================================
+# CACHE & PERFORMANCE
+# =============================================================================
+[cache]
+# Cache type: "Memory" or "Redis" (default: Memory)
+cache_type = "Memory"
+
+# Maximum cache size in MB for in-memory cache (default: 100)
+# Set to null for unlimited (not recommended)
+max_size_mb = 100
+
+# Redis connection URL (required when cache_type = "Redis")
+# Example: "redis://localhost:6379"
+# Example with auth: "redis://username:password@localhost:6379/0"
+# redis_url = "redis://localhost:6379"
+
+# Redis connection pool size (default: 10)
+redis_pool_size = 10
+
+# =============================================================================
+# MEDIA & FILES
+# =============================================================================
+[media]
+# Storage type: "Local", "S3", "Gcs", or "Azure" (default: Local)
+storage_type = "Local"
+
+# Local storage settings (when storage_type = "Local")
+local_path = "./uploads"
+local_base_url = "http://localhost:8080/uploads"
+
+# S3-compatible storage settings (when storage_type = "S3")
+# s3_region = "us-east-1"
+# s3_bucket = "my-bucket"
+# s3_access_key = "your-access-key"
+# s3_secret_key = "your-secret-key"
+# s3_endpoint = "https://s3.amazonaws.com"  # For S3-compatible services like MinIO
+
+# Image processing configuration
+[media.image_processing]
+# Enable image processing (default: true)
+enabled = true
+
+# Default JPEG quality (1-100, default: 85)
+default_quality = 85
+
+# Image sizes to generate (name, width, height, crop)
+[[media.image_processing.sizes]]
+name = "thumbnail"
+width = 150
+height = 150
+crop = true
+
+[[media.image_processing.sizes]]
+name = "small"
+width = 300
+height = 300
+crop = false
+
+[[media.image_processing.sizes]]
+name = "medium"
+width = 600
+height = 600
+crop = false
+
+[[media.image_processing.sizes]]
+name = "large"
+width = 1200
+height = 1200
+crop = false
+
+# =============================================================================
+# NOTIFICATIONS
+# =============================================================================
+[notifications]
+# Enable notifications (default: true)
+enabled = true
+
+# Email configuration
+[notifications.email]
+# SMTP server host
+# smtp_host = "smtp.gmail.com"
+
+# SMTP server port
+# smtp_port = 587
+
+# SMTP username
+# smtp_user = "your-email@gmail.com"
+
+# SMTP password or app-specific password
+# smtp_pass = "your-smtp-password"
+
+# Sender name for emails
+# from_name = "R Commerce Store"
+
+# Sender email address
+# from_email = "noreply@yourstore.com"
+
+# Use TLS for SMTP (default: true)
+smtp_tls = true
+
+# SMS configuration (Twilio)
+[notifications.sms]
+# SMS provider (currently only "twilio" supported)
+# provider = "twilio"
+
+# Twilio Account SID
+# twilio_account_sid = "your-account-sid"
+
+# Twilio Auth Token
+# twilio_auth_token = "your-auth-token"
+
+# Twilio phone number to send from
+# twilio_from_number = "+1234567890"
+
+# =============================================================================
+# RATE LIMITING
+# =============================================================================
+[rate_limiting]
+# Enable rate limiting (default: true)
+enabled = true
+
+# Maximum requests per minute from a single IP (default: 60)
+requests_per_minute = 60
+
+# Maximum requests per hour from a single IP (default: 1000)
+requests_per_hour = 1000
+
+# Maximum requests per day from a single IP (default: 10000)
+requests_per_day = 10000
+
+# Maximum concurrent connections per IP (default: 10)
+max_concurrent_per_ip = 10
+
+# Enable separate rate limiting for API keys (default: true)
+api_key_limiting = true
+
+# Maximum requests per minute with valid API key (default: 1000)
+api_key_requests_per_minute = 1000
+
+# IP addresses to block (blacklist)
+blocklist = []
+
+# IP addresses to allow without rate limiting (whitelist)
+allowlist = []
+
+# Enable DDoS protection mode (default: true)
+# Under attack, stricter limits are applied automatically
+ddos_protection = true
+
+# Expose rate limit headers in responses (default: true)
+expose_headers = true
+
+# Use Redis for rate limit storage (default: false)
+# When false, uses in-memory storage (not shared across instances)
+use_redis = false
+
+# Redis URL for rate limiting (when use_redis = true)
+# redis_url = "redis://localhost:6379"
+
+# =============================================================================
+# FEATURE FLAGS
+# =============================================================================
+[features]
+# Enable debug API endpoints (default: true)
+# Set to false in production
+debug_api = true
+
+# Enable metrics endpoint (default: true)
+metrics = true
+
+# Enable health check endpoint (default: true)
+health_check = true
+
+# Enable experimental features (default: false)
+# WARNING: Experimental features may be unstable
+experimental = false
+
+# =============================================================================
+# IMPORT & MIGRATIONS
+# =============================================================================
+[import]
+# Default import options
+[import.default_options]
+# Batch size for imports (default: 100)
+batch_size = 100
+
+# Skip existing records (default: true)
+skip_existing = true
+
+# Continue on error (default: true)
+continue_on_error = true
+
+# Shopify import configuration
+# [import.shopify]
+# api_url = "https://your-store.myshopify.com/admin/api/2024-01"
+# api_key = "your-shopify-api-key"
+# entities = ["products", "customers", "orders"]
+# [import.shopify.headers]
+# "X-Shopify-Access-Token" = "your-access-token"
+
+# WooCommerce import configuration
+# [import.platforms.woocommerce]
+# # Base store URL (without /wp-json/wc/v3 - that path is added automatically)
+# api_url = "https://your-store.com"
+# api_key = "your-consumer-key"
+# api_secret = "your-consumer-secret"
+# entities = ["products", "customers", "orders"]
+
+# Magento import configuration
+# [import.magento]
+# api_url = "https://your-store.com/rest/V1"
+# api_key = "your-integration-token"
+# entities = ["products", "customers", "orders"]
+
+# Medusa import configuration
+# [import.medusa]
+# api_url = "https://your-medusa-server.com"
+# api_key = "your-api-key"
+# entities = ["products", "customers", "orders"]
+
+# =============================================================================
+# TLS/SSL CONFIGURATION
+# =============================================================================
+[tls]
+# Enable TLS/HTTPS (default: false)
+# When enabled, you must configure either manual certificates or Let's Encrypt
+enabled = false
+
+# Minimum TLS version: "1.2" or "1.3" (default: "1.3")
+min_tls_version = "1.3"
+
+# Maximum TLS version: "1.2" or "1.3" (default: "1.3")
+max_tls_version = "1.3"
+
+# Manual certificate files (when not using Let's Encrypt)
+# cert_file = "/path/to/cert.pem"
+# key_file = "/path/to/key.pem"
+
+# Enable OCSP stapling (default: true)
+ocsp_stapling = true
+
+# HTTP port for ACME challenges and redirects (default: 80)
+http_port = 80
+
+# HTTPS port (default: 443)
+https_port = 443
+
+# Let's Encrypt automatic certificate configuration
+# [tls.lets_encrypt]
+# enabled = true
+# email = "admin@yourdomain.com"
+# domains = ["yourdomain.com", "www.yourdomain.com"]
+# acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
+# use_staging = false  # Set to true for testing
+# renewal_threshold_days = 30
+# auto_renew = true
+# cache_dir = "/var/lib/rcommerce/certs"
+
+# HSTS (HTTP Strict Transport Security) configuration
+# [tls.hsts]
+# enabled = true
+# max_age = 31536000  # 1 year in seconds
+# include_subdomains = true
+# preload = false  # Set to true only if you understand the implications
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error" (default: "info")
+level = "info"
+
+# Log format: "Json" or "Text" (default: Json)
+format = "Json"
+
+# File logging configuration (optional)
+# [logging.file]
+# path = "/var/log/rcommerce/app.log"
+# rotation = "Daily"  # "Daily" or "Hourly"
+# max_size_mb = 100
+# max_files = 7
+
+# =============================================================================
+# PAYMENT GATEWAYS
+# =============================================================================
+[payment]
+# Default payment gateway ID (default: "mock")
+# Options: "mock", "stripe", "wechatpay", "alipay", "airwallex"
+default_gateway = "mock"
+
+# Enable test mode for all payments (default: false)
+test_mode = false
+
+# Stripe configuration
+[payment.stripe]
+enabled = false
+# secret_key = "sk_test_..."
+# webhook_secret = "whsec_..."
+# publishable_key = "pk_test_..."
+
+# WeChat Pay configuration
+[payment.wechatpay]
+enabled = false
+# mch_id = "your-merchant-id"
+# app_id = "your-app-id"
+# api_key = "your-api-v3-key"
+# serial_no = "your-certificate-serial-number"
+# private_key = """-----BEGIN PRIVATE KEY-----
+# ...
+# -----END PRIVATE KEY-----"""
+# sandbox = true
+
+# AliPay configuration
+[payment.alipay]
+enabled = false
+# app_id = "your-app-id"
+# private_key = "your-rsa2-private-key"
+# alipay_public_key = "alipay-public-key-for-verification"
+# sandbox = true
+
+# Airwallex configuration
+[payment.airwallex]
+enabled = false
+# client_id = "your-client-id"
+# api_key = "your-api-key"
+# webhook_secret = "your-webhook-secret"
+# demo = false
+
+# =============================================================================
+# SHIPPING CONFIGURATION
+# =============================================================================
+[shipping]
+# Default shipping provider (default: "manual")
+# Options: "manual", "dhl", "fedex", "ups", "usps"
+default_provider = "manual"
+
+# Enable test mode for shipping APIs (default: false)
+test_mode = false
+
+# Default shipping origin address
+[shipping.origin]
+name = "Your Store"
+address1 = "123 Commerce St"
+# address2 = "Suite 100"
+city = "San Francisco"
+state = "CA"
+country = "US"
+zip = "94102"
+# phone = "+1-555-123-4567"
+
+# DHL Express configuration
+[shipping.dhl]
+enabled = false
+# api_key = "your-dhl-api-key"
+# api_secret = "your-dhl-api-secret"
+# account_number = "your-dhl-account"
+# sandbox = false
+
+# FedEx configuration
+[shipping.fedex]
+enabled = false
+# api_key = "your-fedex-client-id"
+# api_secret = "your-fedex-client-secret"
+# account_number = "your-fedex-account"
+# sandbox = false
+
+# UPS configuration
+[shipping.ups]
+enabled = false
+# api_key = "your-ups-client-id"
+# username = "your-ups-username"
+# password = "your-ups-password"
+# account_number = "your-ups-account"
+# sandbox = false
+
+# USPS configuration
+[shipping.usps]
+enabled = false
+# api_key = "your-usps-api-key"
+# sandbox = false
+
+# =============================================================================
+# DUNNING (PAYMENT RETRY) CONFIGURATION
+# =============================================================================
+[dunning]
+# Enable dunning process for failed payments (default: true)
+enabled = true
+
+# Number of retry attempts before cancellation (default: 3)
+max_retries = 3
+
+# Retry intervals in days (default: [1, 3, 7])
+retry_intervals_days = [1, 3, 7]
+
+# Grace period in days (subscription remains active during retries) (default: 14)
+grace_period_days = 14
+
+# Send email on first failure (default: true)
+email_on_first_failure = true
+
+# Send email on final failure before cancellation (default: true)
+email_on_final_failure = true
+
+# Apply late fees after N retries (null = no late fees)
+# late_fee_after_retry = 2
+# late_fee_amount = "5.00"
+
+# Background job interval in minutes (default: 60)
+job_interval_minutes = 60
+
+# Per-gateway dunning configurations
+# [dunning.gateway_configs.stripe]
+# enabled = true
+# max_retries = 4
+# retry_intervals_days = [1, 3, 7, 14]
+# grace_period_days = 21
+
+# Email template configuration
+[dunning.email_templates]
+first_failure = "dunning/first_failure"
+retry_failure = "dunning/retry_failure"
+final_notice = "dunning/final_notice"
+cancellation = "dunning/cancellation"
+recovered = "dunning/recovered"
+# from_name = "Billing Department"
+# from_email = "billing@yourstore.com"
+# reply_to = "support@yourstore.com"
