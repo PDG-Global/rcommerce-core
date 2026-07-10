@@ -414,7 +414,7 @@ pub struct ShippingProviderFactory {
 impl Clone for ShippingProviderFactory {
     fn clone(&self) -> Self {
         let mut providers = HashMap::new();
-        for (id, provider) in &self.providers {
+        for id in self.providers.keys() {
             // We can't clone Box<dyn ShippingProvider> directly, so recreate from id/name
             // For now, only manual provider is clonable by re-creating it
             if id == "manual" {

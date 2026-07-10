@@ -811,12 +811,6 @@ impl CheckoutService {
         Ok(result.is_valid)
     }
 
-    /// Get shipping address stored for cart
-    async fn get_cart_shipping_address(&self, _cart_id: Uuid) -> Result<Option<Address>> {
-        // TODO: Implement address storage/retrieval for carts
-        // For now, return None - should be stored during initiate_checkout
-        Ok(None)
-    }
     /// Check if a cart item is a bundle component
     fn is_bundle_component(&self, item: &CartItem) -> bool {
         item.custom_attributes

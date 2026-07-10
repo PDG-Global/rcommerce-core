@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.1.1"
 authors = ["R Commerce Team"]
 edition = "2021"
-license = "AGPL-3.0"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/PDG-Global/rcommerce-core"
 homepage = "https://rcommerce.app"
 rust-version = "1.70.0"
@@ -127,10 +127,6 @@ futures = "0.3"
 
 # Redis caching
 redis = { version = "1.0", default-features = false, features = ["tokio-rustls-comp", "cluster-async", "connection-manager"] }
-r2d2_redis = "0.14.0"
-redis-graph = "0.1"
-redis-macros = "0.3"
-redisearch-api = "0.7"
 
 # Concurrent data structures
 dashmap = "5.5"

@@ -3306,14 +3306,14 @@ mod tests {
 
     #[test]
     fn test_cli_parse() {
-        let cli = Cli::parse_from(&["rcommerce", "server"]);
+        let cli = Cli::parse_from(["rcommerce", "server"]);
         assert!(matches!(cli.command, Commands::Server { .. }));
     }
 
     #[test]
     fn test_tls_commands_parse() {
         // Test check command
-        let cli = Cli::parse_from(&["rcommerce", "tls", "check", "--domain", "example.com"]);
+        let cli = Cli::parse_from(["rcommerce", "tls", "check", "--domain", "example.com"]);
         assert!(matches!(
             cli.command,
             Commands::Tls {
@@ -3322,7 +3322,7 @@ mod tests {
         ));
 
         // Test list command
-        let cli = Cli::parse_from(&["rcommerce", "tls", "list"]);
+        let cli = Cli::parse_from(["rcommerce", "tls", "list"]);
         assert!(matches!(
             cli.command,
             Commands::Tls {
@@ -3331,7 +3331,7 @@ mod tests {
         ));
 
         // Test renew command
-        let cli = Cli::parse_from(&["rcommerce", "tls", "renew", "--domain", "example.com"]);
+        let cli = Cli::parse_from(["rcommerce", "tls", "renew", "--domain", "example.com"]);
         assert!(matches!(
             cli.command,
             Commands::Tls {
@@ -3340,7 +3340,7 @@ mod tests {
         ));
 
         // Test info command
-        let cli = Cli::parse_from(&["rcommerce", "tls", "info", "--domain", "example.com"]);
+        let cli = Cli::parse_from(["rcommerce", "tls", "info", "--domain", "example.com"]);
         assert!(matches!(
             cli.command,
             Commands::Tls {

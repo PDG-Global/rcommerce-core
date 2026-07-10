@@ -269,6 +269,12 @@ pub mod mock {
         keys: Mutex<HashMap<String, ApiKeyRecord>>,
     }
 
+    impl Default for MockApiKeyRepository {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockApiKeyRepository {
         pub fn new() -> Self {
             Self {

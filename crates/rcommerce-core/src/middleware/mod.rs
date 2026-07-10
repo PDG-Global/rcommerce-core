@@ -19,6 +19,6 @@ mod tests {
     fn test_middleware_modules_exist() {
         // This test ensures middleware modules compile
         let _config = RateLimitConfig::default();
-        assert_eq!(_config.enabled, true);
+        assert!(_config.enabled);
     }
 }

@@ -465,10 +465,10 @@ mod tests {
     #[test]
     fn test_message_types() {
         assert_eq!(MessageType::Ping.category(), MessageCategory::KeepAlive);
-        assert_eq!(MessageType::Auth.requires_auth(), false);
-        assert_eq!(MessageType::Subscribe.requires_auth(), true);
-        assert_eq!(MessageType::Ping.is_rate_limited(), false);
-        assert_eq!(MessageType::Custom.is_rate_limited(), true);
+        assert!(!MessageType::Auth.requires_auth());
+        assert!(MessageType::Subscribe.requires_auth());
+        assert!(!MessageType::Ping.is_rate_limited());
+        assert!(MessageType::Custom.is_rate_limited());
     }
 
     #[test]

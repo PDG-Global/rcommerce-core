@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = WebSocketConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.max_connections, 10000);
         assert_eq!(config.max_connections_per_ip, 10);
         assert_eq!(config.ping_interval(), Duration::from_secs(30));
@@ -275,9 +275,9 @@ mod tests {
     #[test]
     fn test_development_config() {
         let config = WebSocketConfig::development();
-        assert_eq!(config.validate_origin, false);
-        assert_eq!(config.require_auth, false);
-        assert_eq!(config.enable_message_rate_limit, false);
+        assert!(!config.validate_origin);
+        assert!(!config.require_auth);
+        assert!(!config.enable_message_rate_limit);
     }
 
     #[test]
@@ -297,9 +297,11 @@ mod tests {
 
     #[test]
     fn test_origin_validation() {
-        let mut config = WebSocketConfig::default();
-        config.validate_origin = true;
-        config.allowed_origins = vec!["https://rcommerce.app".to_string()];
+        let config = WebSocketConfig {
+            validate_origin: true,
+            allowed_origins: vec!["https://rcommerce.app".to_string()],
+            ..Default::default()
+        };
 
         assert!(config.is_origin_allowed("https://rcommerce.app"));
         assert!(!config.is_origin_allowed("https://evil.com"));
@@ -307,8 +309,10 @@ mod tests {
 
     #[test]
     fn test_origin_validation_disabled() {
-        let mut config = WebSocketConfig::default();
-        config.validate_origin = false;
+        let config = WebSocketConfig {
+            validate_origin: false,
+            ..Default::default()
+        };
 
         assert!(config.is_origin_allowed("https://any-origin.com"));
     }

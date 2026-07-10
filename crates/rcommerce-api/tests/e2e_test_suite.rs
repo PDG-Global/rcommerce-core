@@ -508,16 +508,13 @@ impl<'a> DataGenerator<'a> {
     }
 
     pub async fn generate_categories(&self, count: usize) -> Result<Vec<Uuid>> {
-        let categories = vec![
-            ("Electronics", "electronics", "Gadgets"),
+        let categories = [("Electronics", "electronics", "Gadgets"),
             ("Clothing", "clothing", "Apparel"),
             ("Home", "home", "Home goods"),
             ("Sports", "sports", "Sports equipment"),
-            ("Books", "books", "Books"),
-        ];
+            ("Books", "books", "Books")];
         let mut ids = Vec::new();
-        for i in 0..count.min(categories.len()) {
-            let (name, slug, desc) = categories[i];
+        for (i, (name, slug, desc)) in categories.iter().enumerate().take(count.min(categories.len())) {
             let id = Uuid::new_v4();
             sqlx::query(r#"INSERT INTO product_categories (id, name, slug, description, sort_order, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#)
                 .bind(id.to_string()).bind(name).bind(slug).bind(desc)

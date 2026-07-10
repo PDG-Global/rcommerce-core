@@ -512,8 +512,10 @@ mod tests {
 
     #[test]
     fn test_rate_limit_exceeded() {
-        let mut config = RateLimitConfig::default();
-        config.requests_per_minute = 2; // Very low limit for testing
+        let config = RateLimitConfig {
+            requests_per_minute: 2, // Very low limit for testing
+            ..Default::default()
+        };
 
         let mut tracker = RateLimitTracker::new();
 
@@ -553,9 +555,11 @@ mod tests {
 
     #[test]
     fn test_blocklist() {
-        let mut config = RateLimitConfig::default();
-        config.blocklist = vec!["192.168.1.100".to_string()];
-        config.enabled = true;
+        let config = RateLimitConfig {
+            blocklist: vec!["192.168.1.100".to_string()],
+            enabled: true,
+            ..Default::default()
+        };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

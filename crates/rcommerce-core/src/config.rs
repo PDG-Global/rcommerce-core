@@ -1632,8 +1632,10 @@ mod tests {
         assert!(tls_config.validate().is_ok());
 
         // When TLS is enabled, need certificate source
-        let mut tls_config = TlsConfig::default();
-        tls_config.enabled = true;
+        let mut tls_config = TlsConfig {
+            enabled: true,
+            ..Default::default()
+        };
 
         // Invalid: no cert source
         assert!(tls_config.validate().is_err());
@@ -1643,17 +1645,22 @@ mod tests {
         assert!(tls_config.validate().is_ok());
 
         // Valid: manual certificates
-        tls_config.lets_encrypt = None;
-        tls_config.cert_file = Some(PathBuf::from("/path/to/cert.pem"));
-        tls_config.key_file = Some(PathBuf::from("/path/to/key.pem"));
+        tls_config = TlsConfig {
+            enabled: true,
+            cert_file: Some(PathBuf::from("/path/to/cert.pem")),
+            key_file: Some(PathBuf::from("/path/to/key.pem")),
+            ..Default::default()
+        };
         assert!(tls_config.validate().is_ok());
     }
 
     #[test]
     fn test_lets_encrypt_config_validation() {
-        let mut le_config = LetsEncryptConfig::default();
-        le_config.email = "admin@example.com".to_string();
-        le_config.domains = vec!["example.com".to_string()];
+        let mut le_config = LetsEncryptConfig {
+            email: "admin@example.com".to_string(),
+            domains: vec!["example.com".to_string()],
+            ..Default::default()
+        };
 
         assert!(le_config.validate().is_ok());
 

@@ -19,11 +19,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 // Static lock to prevent concurrent migration runs (causes deadlocks)
-static MIGRATION_LOCK: StdMutex<()> = StdMutex::new(());
+static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // Test reporter module
 mod test_reporter;
@@ -237,9 +236,10 @@ impl TestApp {
             shipping_factory,
             checkout_service,
             inventory_service,
+            None,
         );
 
-        let app_state = AppState::new(params);
+        let app_state = AppState::new(params).await;
 
         // Create HTTP client with proxy disabled for localhost
         let http_client = reqwest::Client::builder()
@@ -332,9 +332,7 @@ impl TestApp {
     /// Run database migrations using SQLx
     async fn run_migrations(pool: &Pool<Postgres>) -> anyhow::Result<()> {
         // Acquire lock to prevent concurrent migrations (causes deadlocks)
-        let _guard = MIGRATION_LOCK
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let _guard = MIGRATION_LOCK.lock().await;
 
         // Clean up existing objects first to ensure a fresh database state
         // This is necessary because tests may share the same database

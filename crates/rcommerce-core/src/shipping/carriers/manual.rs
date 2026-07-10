@@ -8,7 +8,7 @@ use rust_decimal_macros::dec;
 use crate::common::Address;
 use crate::shipping::{
     AddressValidation, CustomsInfo, Package, RateOptions, ServiceFeature, Shipment,
-    ShippingProvider, ShippingRate, ShippingService, TrackingEvent, TrackingInfo, TrackingStatus,
+    ShippingProvider, ShippingRate, ShippingService, TrackingInfo,
 };
 use crate::Error;
 use crate::Result;
@@ -24,6 +24,12 @@ struct ManualRate {
     service_name: String,
     rate: Decimal,
     delivery_days: Option<i32>,
+}
+
+impl Default for ManualProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ManualProvider {

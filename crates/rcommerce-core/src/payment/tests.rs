@@ -1,5 +1,20 @@
+impl crate::payment::PaymentStatus {
+    pub fn can_transition_to(&self, new_status: crate::payment::PaymentStatus) -> bool {
+        use crate::payment::PaymentStatus::*;
+
+        match (self, new_status) {
+            (Pending, Processing) => true,
+            (Processing, Succeeded) => true,
+            (Processing, Failed) => true,
+            (Succeeded, Refunded) => true,
+            (Failed, Processing) => true, // Retry
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use crate::payment::gateways::MockPaymentGateway;
     use crate::payment::PaymentGateway;
     use rust_decimal_macros::dec;
@@ -69,20 +84,5 @@ mod tests {
         // Test invalid transitions
         assert!(!Succeeded.can_transition_to(Processing));
         assert!(!Failed.can_transition_to(Succeeded));
-    }
-}
-
-impl crate::payment::PaymentStatus {
-    pub fn can_transition_to(&self, new_status: crate::payment::PaymentStatus) -> bool {
-        use crate::payment::PaymentStatus::*;
-
-        match (self, new_status) {
-            (Pending, Processing) => true,
-            (Processing, Succeeded) => true,
-            (Processing, Failed) => true,
-            (Succeeded, Refunded) => true,
-            (Failed, Processing) => true, // Retry
-            _ => false,
-        }
     }
 }

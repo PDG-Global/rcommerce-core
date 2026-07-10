@@ -413,13 +413,13 @@ mod tests {
         let mut session = WebSocketSession::new(conn_id, "192.168.1.1".to_string());
 
         assert_eq!(session.connection_id, conn_id);
-        assert_eq!(session.is_authenticated, false);
+        assert!(!session.is_authenticated);
         assert_eq!(session.subscriptions.len(), 0);
 
         // Authenticate
         let user_id = UserId::new_v4();
         session.set_authenticated(user_id);
-        assert_eq!(session.is_authenticated, true);
+        assert!(session.is_authenticated);
         assert_eq!(session.user_id, Some(user_id));
 
         // Subscribe to topics

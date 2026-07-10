@@ -524,7 +524,7 @@ pub async fn complete_checkout(
         Ok(result) => {
             let response: CheckoutResultResponse = result.into();
             // Fire-and-forget order confirmation email if SMTP configured
-            if response.requires_confirmation == false {
+            if !response.requires_confirmation {
                 if let Some(ref svc) = state.notification_service {
                     let order_id = response.order.id;
                     let customer_email = response.order.customer_email.clone();
