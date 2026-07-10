@@ -91,7 +91,7 @@ rustls-acme = { version = "0.15", optional = true, features = ["axum"] }
 futures = { workspace = true, optional = true }
 
 # Certificate generation (for dev/test certificates)
-rcgen = "0.11"
+rcgen = "0.13"
 
 # For E2E tests
 [dev-dependencies]

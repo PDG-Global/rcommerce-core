@@ -873,13 +873,10 @@ impl TestHarness {
     }
 
     pub async fn test_self_signed_cert(&self) -> Result<()> {
-        use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
-        let mut params = CertificateParams::new(vec!["localhost".to_string()]);
-        params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(DnType::CommonName, "Test");
-        let cert = Certificate::from_params(params)?;
-        let _ = cert.serialize_pem()?;
-        let _ = cert.serialize_private_key_pem();
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let _ = cert.pem();
+        let _ = key_pair.serialize_pem();
         Ok(())
     }
 
