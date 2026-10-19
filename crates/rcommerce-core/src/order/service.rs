@@ -1179,9 +1179,9 @@ impl OrderService {
         reason: String,
     ) -> Result<crate::payment::Refund> {
         // Find the latest refundable payment record for this order
-        let payment = sqlx::query_as::<_, (String, String)>(
+        let payment = sqlx::query_as::<_, RefundablePaymentRow>(
             r#"
-            SELECT gateway, gateway_payment_id
+            SELECT id, gateway, gateway_payment_id, currency::text AS currency_text
             FROM payments
             WHERE order_id = $1
               AND gateway_payment_id IS NOT NULL
@@ -1195,11 +1195,11 @@ impl OrderService {
         .await?
         .ok_or_else(|| Error::validation("No refundable payment found for order"))?;
 
-        let (gateway, gateway_payment_id) = payment;
+        let gateway_payment_id = payment.gateway_payment_id.clone();
 
         info!(
             "Refunding payment {} (gateway: {}) for order {}: {}",
-            gateway_payment_id, gateway, order_id, reason
+            gateway_payment_id, payment.gateway, order_id, reason
         );
 
         // Refund through the configured payment gateway
@@ -1212,13 +1212,54 @@ impl OrderService {
         sqlx::query(
             "UPDATE payments SET status = 'refunded' WHERE gateway = $1 AND gateway_payment_id = $2",
         )
-        .bind(&gateway)
+        .bind(&payment.gateway)
         .bind(&gateway_payment_id)
+        .execute(self.db.pool())
+        .await?;
+
+        // Record the refund so order detail APIs and accounting exports can
+        // report it; skip if a row with the same gateway refund id exists
+        // (e.g. a webhook raced us to it).
+        let refund_status = match refund.status {
+            crate::payment::RefundStatus::Succeeded => "refunded",
+            crate::payment::RefundStatus::Failed => "failed",
+            _ => "pending",
+        };
+        let settled_at = match refund.status {
+            crate::payment::RefundStatus::Succeeded => Some(refund.created_at),
+            _ => None,
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO refunds (id, payment_id, order_id, amount, currency, reason, status,
+                                 gateway_refund_id, settled_at, created_at, updated_at)
+            SELECT $1, $2, $3, $4, UPPER($5)::currency, $6, $7::payment_status, $8, $9, NOW(), NOW()
+            WHERE NOT EXISTS (SELECT 1 FROM refunds WHERE gateway_refund_id = $8)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(payment.id)
+        .bind(order_id)
+        .bind(refund.amount)
+        .bind(&refund.currency)
+        .bind(&reason)
+        .bind(refund_status)
+        .bind(&refund.id)
+        .bind(settled_at)
         .execute(self.db.pool())
         .await?;
 
         Ok(refund)
     }
+}
+
+/// Payment row eligible for refund via the order refund path.
+#[derive(Debug, sqlx::FromRow)]
+struct RefundablePaymentRow {
+    id: Uuid,
+    gateway: String,
+    gateway_payment_id: String,
+    currency_text: String,
 }
 
 /// Map a lifecycle order status to its database enum label.

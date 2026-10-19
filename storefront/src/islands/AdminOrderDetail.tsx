@@ -315,6 +315,25 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
                   {payment.processed_at && (
                     <p className="text-rcommerce-500 text-xs mt-1">{formatDateTime(payment.processed_at)}</p>
                   )}
+                  {payment.refunds && payment.refunds.length > 0 && (
+                    <ul className="mt-2 space-y-1 border-t border-rcommerce-200 pt-2">
+                      {payment.refunds.map((refund) => (
+                        <li key={refund.id} className="text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-red-700">−{formatMoney(refund.currency, refund.amount)}</span>
+                            <span className={`inline-block px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${paymentBadgeClass(refund.status)}`}>
+                              {refund.status}
+                            </span>
+                          </div>
+                          {refund.reason && <p className="text-rcommerce-600 mt-0.5">{refund.reason}</p>}
+                          <p className="text-rcommerce-500 mt-0.5">
+                            {formatDateTime(refund.settled_at ?? refund.created_at)}
+                            {refund.gateway_refund_id && ` · ${refund.gateway_refund_id}`}
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </li>
               ))}
             </ul>

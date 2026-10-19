@@ -73,3 +73,5 @@ docs-website/venv/
 
 # Public repo keeps Cargo.lock for reproducible builds
 # Cargo.lock is intentionally tracked here
+# Local cargo config (machine-specific targets/linkers) stays untracked
+.cargo/

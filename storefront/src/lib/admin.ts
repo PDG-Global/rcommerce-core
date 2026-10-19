@@ -25,6 +25,17 @@ export interface AdminOrderItem {
   is_bundle_parent?: boolean;
 }
 
+export interface AdminRefund {
+  id: string;
+  amount: string;
+  currency: string;
+  status: string;
+  reason: string | null;
+  gateway_refund_id: string | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
 export interface AdminPayment {
   id: string;
   amount: string;
@@ -34,6 +45,7 @@ export interface AdminPayment {
   card_brand: string | null;
   card_last_four: string | null;
   processed_at: string | null;
+  refunds?: AdminRefund[];
 }
 
 // shipping_address / billing_address are stored as JSON snapshots

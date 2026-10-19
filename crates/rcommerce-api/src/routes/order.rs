@@ -73,6 +73,32 @@ pub struct OrderPaymentResponse {
     pub card_brand: Option<String>,
     pub card_last_four: Option<String>,
     pub processed_at: Option<String>,
+    pub refunds: Vec<OrderRefundResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrderRefundResponse {
+    pub id: Uuid,
+    pub amount: Decimal,
+    pub currency: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub gateway_refund_id: Option<String>,
+    pub created_at: String,
+    pub settled_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RefundRow {
+    id: Uuid,
+    payment_id: Uuid,
+    amount: Decimal,
+    currency_text: String,
+    status_text: String,
+    reason: Option<String>,
+    gateway_refund_id: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    settled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -271,7 +297,7 @@ pub async fn get_order(
         }
     };
 
-    let payment_responses: Vec<OrderPaymentResponse> = payment_rows
+    let mut payment_responses: Vec<OrderPaymentResponse> = payment_rows
         .into_iter()
         .map(|p| OrderPaymentResponse {
             id: p.id,
@@ -282,8 +308,10 @@ pub async fn get_order(
             card_brand: p.card_brand,
             card_last_four: p.card_last_four,
             processed_at: p.processed_at.map(|t| t.to_rfc3339()),
+            refunds: vec![],
         })
         .collect();
+    attach_refunds(&state, order.id, &mut payment_responses).await;
 
     Ok(Json(OrderResponse {
         id: order.id,
@@ -906,6 +934,45 @@ async fn fetch_order(state: &AppState, id: Uuid) -> Result<rcommerce_core::model
     .ok_or_else(|| Error::not_found("Order not found"))
 }
 
+/// Load refunds for an order and attach them to their parent payment responses.
+async fn attach_refunds(
+    state: &AppState,
+    order_id: Uuid,
+    payments: &mut [OrderPaymentResponse],
+) {
+    let refund_rows = sqlx::query_as::<_, RefundRow>(
+        r#"
+        SELECT id, payment_id, amount, currency::text AS currency_text,
+               status::text AS status_text, reason, gateway_refund_id,
+               created_at, settled_at
+        FROM refunds
+        WHERE order_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(order_id)
+    .fetch_all(state.db.pool())
+    .await
+    .unwrap_or_default();
+
+    for payment in payments.iter_mut() {
+        payment.refunds = refund_rows
+            .iter()
+            .filter(|r| r.payment_id == payment.id)
+            .map(|r| OrderRefundResponse {
+                id: r.id,
+                amount: r.amount,
+                currency: r.currency_text.clone(),
+                status: r.status_text.clone(),
+                reason: r.reason.clone(),
+                gateway_refund_id: r.gateway_refund_id.clone(),
+                created_at: r.created_at.to_rfc3339(),
+                settled_at: r.settled_at.map(|t| t.to_rfc3339()),
+            })
+            .collect();
+    }
+}
+
 /// Build an order response with items and payment records loaded
 async fn build_order_response(
     state: &AppState,
@@ -946,7 +1013,7 @@ async fn build_order_response(
     .await
     .unwrap_or_default();
 
-    let payment_responses: Vec<OrderPaymentResponse> = payment_rows
+    let mut payment_responses: Vec<OrderPaymentResponse> = payment_rows
         .into_iter()
         .map(|p| OrderPaymentResponse {
             id: p.id,
@@ -957,8 +1024,10 @@ async fn build_order_response(
             card_brand: p.card_brand,
             card_last_four: p.card_last_four,
             processed_at: p.processed_at.map(|t| t.to_rfc3339()),
+            refunds: vec![],
         })
         .collect();
+    attach_refunds(state, order.id, &mut payment_responses).await;
 
     Ok(OrderResponse {
         id: order.id,
