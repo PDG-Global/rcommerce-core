@@ -26,8 +26,9 @@ crates/
 ├── rcommerce-demo/     # Demo frontend server (secure API proxy with static file serving)
 └── rcommerce-demo-server/ # Dynamic frontend server with SSR, routing, and edge caching
 
-storefront/             # Whitelabel Astro storefront (generic demo template;
-                        # brand via PUBLIC_* build-time env vars)
+storefront/             # Whitelabel Astro storefront for Cloudflare Pages
+                        # (generic demo template; brand via PUBLIC_* build-time
+                        # env vars and optional store-private overlays)
 ```
 
 ### Core Modules
@@ -376,6 +377,19 @@ cargo run --bin rcommerce server
 ```
 
 See [deployment documentation](docs/deployment/) for detailed platform-specific guides.
+
+### Storefront (Astro)
+
+The `storefront/` directory contains a whitelabel Astro + React storefront that deploys to **Cloudflare Pages**. Branding (name, logo, colors, menu, hero media, API base) is injected at build time via `PUBLIC_*` environment variables, so one codebase serves multiple stores — create one Pages project per store.
+
+```bash
+cd storefront
+npm ci
+npm run build
+npx wrangler pages deploy dist --project-name=my-storefront --branch=main
+```
+
+It includes product catalog, variants, reviews, cart, Airwallex checkout, customer accounts, and built-in SEO (`sitemap.xml`, `robots.txt`, Google Shopping feed, product JSON-LD). See [storefront/README.md](storefront/README.md) for the full environment variable reference and whitelabel overlay system.
 
 ## Contributing
 
