@@ -27,8 +27,8 @@ graceful_shutdown_timeout_secs = 30
 # Enable CORS (default: true)
 enabled = true
 
-# Allowed origins (default: ["*"] for all - ONLY FOR DEVELOPMENT!)
-# 
+# Allowed origins (default: ["http://localhost:3000"] - restrictive, local dev only)
+#
 # IMPORTANT: For production, NEVER use "*". Always specify exact domains:
 # allowed_origins = ["https://yourstore.com", "https://admin.yourstore.com"]
 #
@@ -38,7 +38,11 @@ enabled = true
 #     "https://admin.example.com",
 #     "https://app.example.com"
 # ]
-allowed_origins = ["*"]
+#
+# Using "*" logs a security warning at startup and disables credential support
+# (the wildcard cannot be combined with Access-Control-Allow-Credentials).
+# allowed_origins = ["*"]  # development only, never in production
+allowed_origins = ["http://localhost:3000"]
 
 # Allowed HTTP methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
 # OPTIONS is required for preflight requests
@@ -192,6 +196,21 @@ crop = false
 # =============================================================================
 # NOTIFICATIONS
 # =============================================================================
+# Order lifecycle: automatically cancel orders that stay pending with an
+# unfinished payment after this many minutes (releases held inventory).
+# Disabled when unset.
+#[orders]
+#auto_cancel_pending_minutes = 120
+
+# Store branding (customer emails shell, invoice header/footer, notification vars).
+# All fields are optional; when unset, neutral placeholder branding is used.
+#[branding]
+#name = "My Store"
+#support_email = "support@example.com"
+#site_url = "https://store.example.com"
+#logo_url = "https://store.example.com/images/logo.png"
+#accent_color = "#ff4d00"
+
 [notifications]
 # Enable notifications (default: true)
 enabled = true

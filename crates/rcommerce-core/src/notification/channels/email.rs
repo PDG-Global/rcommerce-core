@@ -16,10 +16,36 @@ use lettre::{
 pub enum EmailMode {
     /// Send emails via SMTP
     Smtp(SmtpConfig),
+    /// Send emails via Postmark API
+    Postmark(PostmarkConfig),
     /// Log emails to console (for testing)
     Mock,
     /// Save emails to a directory (for testing)
     FileSystem { output_dir: String },
+}
+
+/// Postmark configuration
+#[derive(Debug, Clone)]
+pub struct PostmarkConfig {
+    pub server_token: String,
+    pub from_address: String,
+    pub from_name: String,
+    pub message_stream: String,
+}
+
+impl PostmarkConfig {
+    pub fn new(
+        server_token: impl Into<String>,
+        from_address: impl Into<String>,
+        from_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            server_token: server_token.into(),
+            from_address: from_address.into(),
+            from_name: from_name.into(),
+            message_stream: "outbound".to_string(),
+        }
+    }
 }
 
 /// SMTP configuration
@@ -132,7 +158,8 @@ impl EmailChannel {
             Err(e) => {
                 log::warn!(
                     "SMTP connection test failed for {}: {}. Email sending may fail at runtime.",
-                    config.host, e
+                    config.host,
+                    e
                 );
             }
         }
@@ -141,6 +168,15 @@ impl EmailChannel {
             mode: EmailMode::Smtp(config),
             transport: Some(transport),
         })
+    }
+
+    /// Create a new email channel with Postmark configuration
+    pub fn new_postmark(config: PostmarkConfig) -> Self {
+        log::info!("Email channel created in POSTMARK mode - emails will be sent via Postmark API");
+        Self {
+            mode: EmailMode::Postmark(config),
+            transport: None,
+        }
     }
 
     /// Create a mock email channel for testing (logs to console)
@@ -179,6 +215,7 @@ impl EmailChannel {
 
         match &self.mode {
             EmailMode::Smtp(config) => self.send_smtp(notification, config).await,
+            EmailMode::Postmark(config) => self.send_postmark(notification, config).await,
             EmailMode::Mock => self.send_mock(notification).await,
             EmailMode::FileSystem { output_dir } => {
                 self.send_filesystem(notification, output_dir).await
@@ -206,22 +243,61 @@ impl EmailChannel {
                     .map_err(|e| Error::notification_error(format!("Invalid recipient: {}", e)))?)
                 .subject(notification.subject.clone());
 
-        let message = if let Some(ref html_body) = notification.html_body {
-            message_builder.multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(header::ContentType::TEXT_PLAIN)
-                            .body(notification.body.clone()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(header::ContentType::TEXT_HTML)
-                            .body(html_body.clone()),
-                    ),
-            )
+        let message = if notification.attachments.is_empty() {
+            if let Some(ref html_body) = notification.html_body {
+                message_builder.multipart(
+                    MultiPart::alternative()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_PLAIN)
+                                .body(notification.body.clone()),
+                        )
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_HTML)
+                                .body(html_body.clone()),
+                        ),
+                )
+            } else {
+                message_builder.body(notification.body.clone())
+            }
         } else {
-            message_builder.body(notification.body.clone())
+            let mut mixed = match notification.html_body {
+                Some(ref html_body) => MultiPart::mixed().multipart(
+                    MultiPart::alternative()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_PLAIN)
+                                .body(notification.body.clone()),
+                        )
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_HTML)
+                                .body(html_body.clone()),
+                        ),
+                ),
+                None => MultiPart::mixed().singlepart(
+                    SinglePart::builder()
+                        .header(header::ContentType::TEXT_PLAIN)
+                        .body(notification.body.clone()),
+                ),
+            };
+            for attachment in &notification.attachments {
+                let content_type = header::ContentType::parse(&attachment.content_type)
+                    .unwrap_or_else(|_| {
+                        header::ContentType::parse("application/octet-stream")
+                            .expect("static mime type")
+                    });
+                mixed = mixed.singlepart(
+                    SinglePart::builder()
+                        .header(content_type)
+                        .header(header::ContentDisposition::attachment(
+                            attachment.filename.as_str(),
+                        ))
+                        .body(attachment.content.clone()),
+                );
+            }
+            message_builder.multipart(mixed)
         }
         .map_err(|e| Error::notification_error(format!("Failed to build email: {}", e)))?;
 
@@ -241,6 +317,68 @@ impl EmailChannel {
                     e
                 )))
             }
+        }
+    }
+
+    /// Send email via Postmark API
+    async fn send_postmark(
+        &self,
+        notification: &Notification,
+        config: &PostmarkConfig,
+    ) -> Result<()> {
+        use serde_json::json;
+
+        let from = format!("{} <{}>", config.from_name, config.from_address);
+
+        let mut payload = json!({
+            "From": from,
+            "To": notification.recipient,
+            "Subject": notification.subject,
+            "TextBody": notification.body,
+            "MessageStream": config.message_stream,
+        });
+
+        if let Some(ref html_body) = notification.html_body {
+            payload["HtmlBody"] = json!(html_body);
+        }
+
+        if !notification.attachments.is_empty() {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let attachments: Vec<serde_json::Value> = notification
+                .attachments
+                .iter()
+                .map(|a| {
+                    json!({
+                        "Name": a.filename,
+                        "Content": STANDARD.encode(&a.content),
+                        "ContentType": a.content_type,
+                    })
+                })
+                .collect();
+            payload["Attachments"] = json!(attachments);
+        }
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post("https://api.postmarkapp.com/email")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("X-Postmark-Server-Token", &config.server_token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::notification_error(format!("Postmark API error: {}", e)))?;
+
+        if response.status().is_success() {
+            log::info!("Email sent via Postmark to {}", notification.recipient);
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(Error::notification_error(format!(
+                "Postmark API error ({}): {}",
+                status, body
+            )))
         }
     }
 
@@ -264,6 +402,17 @@ impl EmailChannel {
         if let Some(ref html) = notification.html_body {
             log::info!("╠══════════════════════════════════════════════════════════════╣");
             log::info!("║ HTML Body: {:<48} ║", format!("{} bytes", html.len()));
+        }
+
+        for attachment in &notification.attachments {
+            log::info!(
+                "║ Attachment: {:<47} ║",
+                format!(
+                    "{} ({} bytes)",
+                    attachment.filename,
+                    attachment.content.len()
+                )
+            );
         }
 
         log::info!("╚══════════════════════════════════════════════════════════════╝");
@@ -293,6 +442,15 @@ impl EmailChannel {
         if let Some(ref html) = notification.html_body {
             content.push_str("\n\n--HTML Body--\n");
             content.push_str(html);
+        }
+
+        for attachment in &notification.attachments {
+            content.push_str(&format!(
+                "\n\n--Attachment: {} ({} bytes, {})--\n",
+                attachment.filename,
+                attachment.content.len(),
+                attachment.content_type
+            ));
         }
 
         let mut file = File::create(&filepath).map_err(|e| {
@@ -392,6 +550,7 @@ mod tests {
             scheduled_at: None,
             created_at: now,
             updated_at: now,
+            attachments: Vec::new(),
         }
     }
 

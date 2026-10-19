@@ -62,7 +62,7 @@ tower-service = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Decimal numbers
-rust_decimal = { version = "1.33", features = ["serde", "std", "serde-str"] }
+rust_decimal = { version = "1.33", features = ["serde", "std", "serde-str", "serde-with-float"] }
 rust_decimal_macros = "1.33"
 
 # Validation
@@ -159,3 +159,12 @@ lto = true
 codegen-units = 1
 
 
+
+# mmapio 0.9.1 references libc::MAP_LOCKED on FreeBSD, which does not exist
+# there (MAP_LOCKED is a Linux extension). Vendored copy gates it correctly.
+[patch.crates-io]
+mmapio = { path = "vendor/mmapio" }
+# azul-core 0.0.10 only defines FontInstancePlatformOptions for
+# linux/macos/windows/mobile — the BSDs fall through with no type and no
+# `platform_options` binding. Vendored copy adds empty BSD variants.
+azul-core = { path = "vendor/azul-core" }

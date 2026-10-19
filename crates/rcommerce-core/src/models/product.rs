@@ -75,6 +75,11 @@ pub struct Product {
     pub is_featured: bool,
     pub seo_title: Option<String>,
     pub seo_description: Option<String>,
+    /// GTIN/UPC/EAN identifier (digits only, 8–14 chars); feeds product
+    /// structured data and the Merchant Center feed.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub gtin: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,
@@ -114,6 +119,10 @@ pub struct ProductVariant {
     pub weight_unit: Option<WeightUnit>,
     pub requires_shipping: bool,
     pub is_active: bool,
+    /// GTIN/UPC/EAN identifier for this variant's SKU (digits only, 8–14 chars).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub gtin: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -258,6 +267,10 @@ pub struct CreateProductRequest {
 
     pub seo_description: Option<String>,
 
+    /// GTIN/UPC/EAN (digits only, 8–14 chars); pass-through, storefront validates.
+    #[validate(length(max = 14))]
+    pub gtin: Option<String>,
+
     // Subscription fields (required when product_type is Subscription)
     pub subscription_interval: Option<SubscriptionInterval>,
     pub subscription_interval_count: Option<i32>,
@@ -328,6 +341,8 @@ pub struct UpdateProductRequest {
 
     pub seo_description: Option<Option<String>>,
 
+    pub gtin: Option<Option<String>>,
+
     pub product_type: Option<ProductType>,
 
     pub subscription_interval: Option<Option<SubscriptionInterval>>,
@@ -391,6 +406,10 @@ pub struct CreateVariantRequest {
 
     #[validate(length(max = 100))]
     pub sku: Option<String>,
+
+    /// GTIN/UPC/EAN (digits only, 8–14 chars); pass-through, storefront validates.
+    #[validate(length(max = 14))]
+    pub gtin: Option<String>,
 
     pub price: Decimal,
 
@@ -460,6 +479,8 @@ pub struct ProductFilter {
     pub inventory_status: Option<InventoryStatus>,
     pub created_after: Option<DateTime<Utc>>,
     pub updated_after: Option<DateTime<Utc>>,
+    /// Case-insensitive substring search across title and description
+    pub query: Option<String>,
 }
 
 /// Inventory status filter

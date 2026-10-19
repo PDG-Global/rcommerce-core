@@ -1,0 +1,10 @@
+<svg width="128" height="128" viewBox="20 20 110 110" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="rCommerce">
+  <polygon points="75,28 121,51 75,74 29,51" fill="#E7743F"></polygon>
+  <polygon points="75,28 98,39.5 52,62.5 29,51" fill="#ED8D54"></polygon>
+  <polygon points="29,51 75,74 75,122 29,99" fill="#C1481A"></polygon>
+  <polygon points="121,51 75,74 75,122 121,99" fill="#A63C10"></polygon>
+  <g transform="translate(88,77) matrix(1,-0.5,0,1,0,0)" fill="#F7EFE2">
+    <rect x="0" y="0" width="7" height="26" rx="3"></rect>
+    <path d="M5 0 C15 0 19 4 19 11 L12.5 11 C12.5 6.5 10.5 5.5 5 5.5 Z"></path>
+  </g>
+</svg>

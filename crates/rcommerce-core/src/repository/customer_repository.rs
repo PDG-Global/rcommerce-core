@@ -167,7 +167,7 @@ impl CustomerRepository {
             r#"
             INSERT INTO addresses (
                 customer_id, first_name, last_name, company, phone,
-                address1, address2, city, state, country, zip,
+                address1, address2, city, province, country, zip,
                 is_default_shipping, is_default_billing
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -204,7 +204,7 @@ impl CustomerRepository {
                 address1 = $5,
                 address2 = $6,
                 city = $7,
-                state = $8,
+                province = $8,
                 country = $9,
                 zip = $10,
                 is_default_shipping = $11,

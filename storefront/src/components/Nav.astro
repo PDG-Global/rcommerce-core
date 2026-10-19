@@ -1,0 +1,156 @@
+---
+import CartButton from '../islands/CartButton.tsx';
+import AdminNavLink from '../islands/AdminNavLink.tsx';
+
+import { API_BASE } from '../lib/api';
+import { brand, content } from '../lib/brand';
+// Fixed header menu from the brand config, in display order, nothing else.
+// hrefs are resolved against API categories below (with a
+// /products?category=<slug> fallback when a slug is missing from the API).
+const MENU_CATEGORIES = brand.menuCategories;
+// Static links after the categories; Contact is always last.
+const STATIC_LINKS = [...content.navLinks, { label: 'Contact', href: '/contact-us' }];
+let apiCategories: { name: string; slug: string }[] = [];
+try {
+  const res = await fetch(`${API_BASE}/categories`);
+  if (res.ok) {
+    const data = await res.json();
+    apiCategories = data.categories || [];
+  }
+} catch {
+  // ignore — fallbacks below still render a usable menu
+}
+
+// Resolve hrefs from the API categories so links stay correct; fall back to
+// a category-filtered products URL when a slug is missing from the API.
+const categoryLinks = MENU_CATEGORIES.map((c) => {
+  const found = apiCategories.find((a) => a.slug === c.slug);
+  return {
+    slug: c.slug,
+    href: found ? `/products/${found.slug}` : `/products?category=${c.slug}`,
+    label: c.label,
+  };
+});
+
+const path = Astro.url.pathname;
+const searchQuery = Astro.url.searchParams.get('q')?.trim() ?? '';
+const isActive = (href: string) => path === href || (href !== '/' && path.startsWith(href));
+---
+
+<header class="sticky top-0 z-30 bg-white border-b border-rcommerce-200">
+  <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-[72px] flex items-center justify-between gap-4">
+    <a href="/" class="flex items-center gap-2 shrink-0" aria-label={`${brand.name} home`}>
+      <img src={brand.logo} alt={brand.name} class="h-10 w-auto" />
+    </a>
+
+    <div class={['hidden md:flex items-center gap-7', brand.centeredNav && 'nav-centered'].filter(Boolean).join(' ')}>
+      {categoryLinks.map((cat) => (
+        <a
+          href={cat.href}
+          class={`text-[13px] font-medium uppercase tracking-button transition-colors hover:text-rcommerce-accent ${isActive('/products') && Astro.url.searchParams.get('category') === cat.slug ? 'text-rcommerce-accent' : 'text-rcommerce-700'}`}
+        >
+          {cat.label}
+        </a>
+      ))}
+      {STATIC_LINKS.map((link) => (
+        <a
+          href={link.href}
+          class={`text-[13px] font-medium uppercase tracking-button transition-colors hover:text-rcommerce-accent ${isActive(link.href) ? 'text-rcommerce-accent' : 'text-rcommerce-700'}`}
+        >
+          {link.label}
+        </a>
+      ))}
+      <AdminNavLink client:load />
+    </div>
+
+    <div class="flex items-center gap-1">
+      <form
+        id="header-search-form"
+        action="/products"
+        method="get"
+        role="search"
+        class="hidden md:flex items-center mr-1"
+      >
+        <label for="header-search-input" class="sr-only">Search products</label>
+        <input
+          id="header-search-input"
+          type="search"
+          name="q"
+          value={searchQuery}
+          placeholder="Search"
+          autocomplete="off"
+          class={`bg-transparent border-b border-rcommerce-300 focus:border-rcommerce-900 outline-none py-1.5 text-sm placeholder:text-rcommerce-400 transition-all duration-300 ${searchQuery ? 'w-44' : 'w-0 focus:w-44'} focus:px-1`}
+        />
+        <button type="submit" aria-label="Search" class="p-2 text-rcommerce-900 hover:text-rcommerce-accent transition-colors">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+        </button>
+      </form>
+      <a href="/account" aria-label="Account" class="p-2 text-rcommerce-900 hover:text-rcommerce-accent transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+          <circle cx="12" cy="7" r="4" />
+        </svg>
+      </a>
+      <CartButton client:load />
+      <button
+        id="mobile-menu-btn"
+        aria-label="Menu"
+        aria-expanded="false"
+        class="md:hidden p-2 text-rcommerce-900"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M4 7h16M4 12h16M4 17h16" />
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <div id="mobile-menu" class="hidden md:hidden border-t border-rcommerce-200 bg-white">
+    <div class="px-4 py-4 flex flex-col gap-1">
+      <form action="/products" method="get" role="search" class="flex items-center gap-2 pb-2 mb-1 border-b border-rcommerce-200">
+        <input
+          type="search"
+          name="q"
+          value={searchQuery}
+          placeholder="Search products"
+          aria-label="Search products"
+          class="flex-1 min-w-0 bg-transparent outline-none py-2 text-sm placeholder:text-rcommerce-400"
+        />
+        <button type="submit" aria-label="Search" class="p-2 text-rcommerce-900">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+        </button>
+      </form>
+      {categoryLinks.map((cat) => (
+        <a href={cat.href} class="py-2 text-sm font-medium uppercase tracking-button text-rcommerce-700">{cat.label}</a>
+      ))}
+      {STATIC_LINKS.map((link) => (
+        <a href={link.href} class="py-2 text-sm font-medium uppercase tracking-button text-rcommerce-700">{link.label}</a>
+      ))}
+      <AdminNavLink client:load mobile />
+      <a href="/account" class="py-2 text-sm font-medium uppercase tracking-button text-rcommerce-700">Account</a>
+    </div>
+  </div>
+</header>
+
+<script>
+  const btn = document.getElementById('mobile-menu-btn');
+  const menu = document.getElementById('mobile-menu');
+  btn?.addEventListener('click', () => {
+    const open = menu?.classList.toggle('hidden');
+    btn.setAttribute('aria-expanded', String(!open));
+  });
+
+  const searchForm = document.getElementById('header-search-form') as HTMLFormElement | null;
+  searchForm?.addEventListener('submit', (e) => {
+    const input = searchForm.querySelector('input[name="q"]') as HTMLInputElement | null;
+    const q = input?.value.trim() ?? '';
+    e.preventDefault();
+    window.location.href = q ? `/products?q=${encodeURIComponent(q)}` : '/products';
+  });
+</script>

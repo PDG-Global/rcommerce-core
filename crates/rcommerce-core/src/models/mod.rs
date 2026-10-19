@@ -7,8 +7,10 @@ pub mod address;
 pub mod cart;
 pub mod coupon;
 pub mod customer;
+pub mod newsletter;
 pub mod order;
 pub mod product;
+pub mod review;
 pub mod subscription;
 
 // Re-export common models
@@ -16,8 +18,10 @@ pub use address::*;
 pub use cart::*;
 pub use coupon::*;
 pub use customer::*;
+pub use newsletter::*;
 pub use order::*;
 pub use product::*;
+pub use review::*;
 pub use subscription::*;
 
 /// Common trait for all entities

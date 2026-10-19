@@ -36,6 +36,16 @@ pub struct Order {
     pub status: OrderStatus,
     pub fulfillment_status: FulfillmentStatus,
     pub payment_status: PaymentStatus,
+    /// Stable store-prefixed reference (e.g. "88-1024") used as the Xero
+    /// invoice number and the order_id sent to payment providers.
+    /// `sqlx(default)`: queries with explicit column lists predating this
+    /// field decode it as NULL.
+    #[sqlx(default)]
+    pub invoice_number: Option<String>,
+    /// Test-mode order (sandbox gateway, admin test action, flagged payment
+    /// method). Test records still move real money and must be bookable.
+    #[sqlx(default)]
+    pub test: bool,
     pub shipping_address_id: Option<Uuid>,
     pub billing_address_id: Option<Uuid>,
     pub payment_method: Option<String>,

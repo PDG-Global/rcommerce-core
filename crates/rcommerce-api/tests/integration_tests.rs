@@ -236,7 +236,12 @@ impl TestApp {
             shipping_factory,
             checkout_service,
             inventory_service,
-            None,
+            None,               // No SMTP for tests
+            None,               // No Xero for tests
+            None,               // No admin notification email for tests
+            Default::default(), // Branding
+            Default::default(), // Accounting
+            None,               // No Airwallex for tests
         );
 
         let app_state = AppState::new(params).await;
@@ -398,6 +403,7 @@ impl TestApp {
             "../rcommerce-core/migrations/001_complete_schema.sql",
             "../rcommerce-core/migrations/002_tax_system.sql",
             "../rcommerce-core/migrations/003_inventory_notifications_fulfillment.sql",
+            "../rcommerce-core/migrations/012_accounting_export.sql",
         ];
 
         for migration_file in &migration_files {

@@ -46,10 +46,16 @@ pub trait TaxService: Send + Sync {
     ) -> Result<OssReport>;
 
     /// Record tax transaction
+    ///
+    /// `item_id_map` translates the calculation's line item ids (which may be
+    /// cart item or product ids depending on the caller) to real
+    /// `order_items.id` values; lines without a mapping are recorded with a
+    /// NULL `order_item_id` (the column is nullable).
     async fn record_tax_transaction(
         &self,
         order_id: Uuid,
         calculation: &TaxCalculation,
+        item_id_map: &[(Uuid, Uuid)],
     ) -> Result<()>;
 
     /// Create tax zone
@@ -456,6 +462,7 @@ impl TaxService for DefaultTaxService {
         &self,
         order_id: Uuid,
         calculation: &TaxCalculation,
+        item_id_map: &[(Uuid, Uuid)],
     ) -> Result<()> {
         debug!("Recording tax transactions for order {}", order_id);
 
@@ -464,6 +471,12 @@ impl TaxService for DefaultTaxService {
             if line_item.tax_amount.is_zero() || line_item.tax_rate_id.is_nil() {
                 continue;
             }
+
+            // Map the calculation's line item id to a real order item id
+            let order_item_id = item_id_map
+                .iter()
+                .find(|(calc_id, _)| *calc_id == line_item.item_id)
+                .map(|(_, order_item_id)| *order_item_id);
 
             // Determine OSS scheme
             // TODO: This needs order context to determine properly
@@ -478,7 +491,7 @@ impl TaxService for DefaultTaxService {
                 "#
             )
             .bind(order_id)
-            .bind(line_item.item_id)
+            .bind(order_item_id)
             .bind(line_item.tax_rate_id)
             .bind(line_item.tax_zone_id)
             .bind(None::<Uuid>) // TODO: tax_category_id

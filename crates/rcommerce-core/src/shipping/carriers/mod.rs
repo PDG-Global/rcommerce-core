@@ -5,12 +5,14 @@ pub mod fedex;
 pub mod manual;
 pub mod ups;
 pub mod usps;
+pub mod weight_based;
 
 pub use dhl::DhlProvider;
 pub use fedex::FedExProvider;
 pub use manual::ManualProvider;
 pub use ups::UpsProvider;
 pub use usps::UspsProvider;
+pub use weight_based::WeightBasedProvider;
 
 use crate::common::Address;
 use crate::Result;

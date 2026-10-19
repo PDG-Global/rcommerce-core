@@ -122,6 +122,35 @@ pub enum NotificationPriority {
     Urgent,
 }
 
+/// An attachment to include with an email notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub content: Vec<u8>,
+}
+
+impl sqlx::Type<sqlx::Postgres> for EmailAttachment {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <serde_json::Value as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+}
+
+impl sqlx::postgres::PgHasArrayType for EmailAttachment {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        <serde_json::Value as sqlx::postgres::PgHasArrayType>::array_type_info()
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for EmailAttachment {
+    fn decode(
+        value: sqlx::postgres::PgValueRef<'r>,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let value = <serde_json::Value as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+        Ok(serde_json::from_value(value)?)
+    }
+}
+
 /// A notification entity
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notification {
@@ -140,6 +169,9 @@ pub struct Notification {
     pub scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub attachments: Vec<EmailAttachment>,
 }
 
 impl Notification {
@@ -166,6 +198,7 @@ impl Notification {
             scheduled_at: None,
             created_at: now,
             updated_at: now,
+            attachments: Vec::new(),
         }
     }
 
@@ -285,6 +318,7 @@ mod tests {
 
         assert_eq!(notification.priority, NotificationPriority::Normal);
         assert!(notification.scheduled_at.is_none());
+        assert!(notification.attachments.is_empty());
     }
 
     #[test]

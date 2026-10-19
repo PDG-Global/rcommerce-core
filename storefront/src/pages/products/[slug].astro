@@ -1,0 +1,28 @@
+---
+// Backward-compatible redirect: /products/:slug → /products/:category/:slug
+import { API_BASE } from '../../lib/api';
+
+const { slug } = Astro.params;
+
+// If it looks like a UUID (order history links), fetch and redirect
+// If it's already a slug, fetch and redirect to canonical category-scoped URL
+try {
+  const res = await fetch(`${API_BASE}/products/${slug}`);
+  if (res.ok) {
+    const data = await res.json();
+    const product = data.product;
+    if (product) {
+      const category = product.categories?.[0]?.slug;
+      const canonical = category
+        ? `/products/${category}/${product.slug}`
+        : `/products/${product.slug}`;
+      return Astro.redirect(canonical, 301);
+    }
+  }
+} catch {
+  // fall through to 404
+}
+
+// Product not found — show a basic not-found
+return new Response('Product not found', { status: 404 });
+---

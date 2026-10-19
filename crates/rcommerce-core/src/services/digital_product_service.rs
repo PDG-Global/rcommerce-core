@@ -183,7 +183,8 @@ impl DigitalProductService {
                 p.subscription_min_cycles, p.subscription_max_cycles,
                 p.file_url, p.file_size, p.file_hash, p.download_limit as p_download_limit,
                 p.license_key_enabled, p.download_expiry_days,
-                p.bundle_pricing_strategy, p.bundle_discount_percentage
+                p.bundle_pricing_strategy, p.bundle_discount_percentage,
+                p.gtin as p_gtin
             FROM order_item_downloads d
             JOIN order_items oi ON d.order_item_id = oi.id
             JOIN products p ON oi.product_id = p.id
@@ -279,6 +280,7 @@ impl DigitalProductService {
                 download_expiry_days: row.try_get("download_expiry_days")?,
                 bundle_pricing_strategy: row.try_get("bundle_pricing_strategy")?,
                 bundle_discount_percentage: row.try_get("bundle_discount_percentage")?,
+                gtin: row.try_get("p_gtin")?,
             };
 
             results.push((download, order_item, product));

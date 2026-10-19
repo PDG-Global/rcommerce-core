@@ -1,0 +1,113 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import { brand, content } from '../../../lib/brand';
+import Nav from '../../../components/Nav.astro';
+import Footer from '../../../components/Footer.astro';
+import ProductCard from '../../../components/ProductCard.astro';
+import type { Product } from '../../../lib/types';
+import { API_BASE } from '../../../lib/api';
+
+const PREFERRED_ORDER = content.catalog.categoryOrder;
+const { category } = Astro.params;
+
+let products: Product[] = [];
+let categories: { id: string; name: string; slug: string }[] = [];
+let error: string | null = null;
+
+try {
+  const [productsRes, categoriesRes] = await Promise.all([
+    fetch(`${API_BASE}/products?category=${encodeURIComponent(category!)}`),
+    fetch(`${API_BASE}/categories`),
+  ]);
+  if (!productsRes.ok) throw new Error(`API returned ${productsRes.status}`);
+  const data = await productsRes.json();
+  products = (data.products || []).filter(
+    (p: Product) => p.is_active && (category === content.home.promoCategory || p.product_type !== 'bundle')
+  );
+  if (categoriesRes.ok) {
+    const catData = await categoriesRes.json();
+    categories = (catData.categories || [])
+      .filter((c: { slug: string }) => !content.hiddenCategories.includes(c.slug))
+      .sort((a: { slug: string }, b: { slug: string }) => {
+        const ai = PREFERRED_ORDER.indexOf(a.slug);
+        const bi = PREFERRED_ORDER.indexOf(b.slug);
+        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+      });
+  }
+} catch (e: any) {
+  error = e.message || 'Failed to load products';
+}
+
+let activeCategory = categories.find((c) => c.slug === category);
+if (!activeCategory && category) {
+  // Category may be excluded from the nav list (e.g. party packs) — look it up directly
+  try {
+    const res = await fetch(`${API_BASE}/categories/${encodeURIComponent(category)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.category) activeCategory = data.category;
+    }
+  } catch {
+    // fall through to redirect
+  }
+}
+const title = activeCategory ? activeCategory.name : 'Products';
+
+if (!activeCategory) {
+  return Astro.redirect('/products');
+}
+---
+
+<Layout title={`${title} | ${brand.name}`} description={`Shop ${brand.name} ${title.toLowerCase()} — ${content.catalog.categoryLine}.`}>
+  <Nav />
+  <main class="flex-1">
+    <div class="bg-rcommerce-50 border-b border-rcommerce-200">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14">
+        <p class="eyebrow text-xl">Shop</p>
+        <h1 class="font-serif text-4xl md:text-5xl font-semibold text-rcommerce-900 mt-1">{title}</h1>
+        <div class="mt-8 flex flex-wrap items-center gap-2">
+          <a
+            href="/products"
+            class="px-4 py-2 text-[12px] font-semibold uppercase tracking-button border transition-colors bg-white text-rcommerce-700 border-rcommerce-300 hover:border-rcommerce-900"
+          >
+            All
+          </a>
+          {categories.map((cat) => (
+            <a
+              href={`/products/${cat.slug}`}
+              class={`px-4 py-2 text-[12px] font-semibold uppercase tracking-button border transition-colors ${
+                category === cat.slug
+                  ? 'bg-rcommerce-900 text-white border-rcommerce-900'
+                  : 'bg-white text-rcommerce-700 border-rcommerce-300 hover:border-rcommerce-900'
+              }`}
+            >
+              {cat.name}
+            </a>
+          ))}
+        </div>
+      </div>
+    </div>
+
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14">
+      {error && (
+        <div class="p-4 bg-rcommerce-danger/10 text-rcommerce-danger mb-8">{error}</div>
+      )}
+
+      {!error && products.length === 0 && (
+        <div class="py-20 text-center">
+          <p class="font-serif italic text-2xl text-rcommerce-500">No products found.</p>
+          <a href="/products" class="btn-secondary mt-6 inline-block">Browse all products</a>
+        </div>
+      )}
+
+      <p class="text-sm text-rcommerce-500 mb-6">{products.length} {products.length === 1 ? 'product' : 'products'}</p>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-x-6 gap-y-10">
+        {products.map((product) => (
+          <ProductCard product={product} />
+        ))}
+      </div>
+    </div>
+  </main>
+  <Footer />
+</Layout>

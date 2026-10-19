@@ -23,6 +23,13 @@ use crate::tax::{
 };
 use crate::{Error, Result};
 
+/// Product details needed when building an order item snapshot.
+struct ProductOrderDetails {
+    title: String,
+    variant_title: Option<String>,
+    sku: Option<String>,
+}
+
 /// Order service with integrated tax calculation
 pub struct OrderService {
     db: Database,
@@ -30,6 +37,9 @@ pub struct OrderService {
     inventory_service: InventoryService,
     event_dispatcher: OrderEventDispatcher,
     tax_service: Option<Arc<dyn TaxService>>,
+    /// Store code ([accounting].store_code) used to mint store-prefixed
+    /// invoice numbers like "88-1024". None disables minting.
+    store_code: Option<String>,
 }
 
 impl OrderService {
@@ -46,7 +56,15 @@ impl OrderService {
             inventory_service,
             event_dispatcher,
             tax_service: None,
+            store_code: None,
         }
+    }
+
+    /// Set the store code used for store-prefixed invoice numbers
+    /// (e.g. "88" produces "88-1024" via the order_invoice_seq sequence).
+    pub fn with_store_code(mut self, store_code: Option<String>) -> Self {
+        self.store_code = store_code.filter(|s| !s.is_empty());
+        self
     }
 
     /// Add tax service for tax calculation
@@ -111,9 +129,11 @@ impl OrderService {
         let mut subtotal = Decimal::ZERO;
         let mut total_item_tax = Decimal::ZERO;
 
-        for (index, item) in request.items.iter().enumerate() {
-            // Validate product exists and is active
-            self.validate_product(item.product_id).await?;
+        for item in request.items.iter() {
+            // Fetch product/variant details and validate the product is active
+            let details = self
+                .get_product_order_details(item.product_id, item.variant_id)
+                .await?;
 
             // Reserve inventory unless explicitly skipped (e.g. bundle parent lines)
             let reservation_id = if item.skip_inventory_reservation {
@@ -125,7 +145,7 @@ impl OrderService {
                         item.product_id,
                         item.variant_id,
                         self.get_default_location_id().await?, // Support first active location
-                        None,                                  // Will be updated after order creation
+                        None, // Will be updated after order creation
                         item.quantity,
                         chrono::Utc::now() + chrono::Duration::minutes(30),
                     ))
@@ -163,10 +183,12 @@ impl OrderService {
                 subtotal: item_subtotal,
                 tax_amount: item_tax,
                 total: item_total,
-                sku: None,                           // TODO: Fetch from product
-                name: format!("Item {}", index + 1), // TODO: Fetch from product
-                variant_name: None,
+                sku: details.sku,
+                name: details.title,
+                variant_name: details.variant_title,
                 weight: None, // TODO: Fetch from product
+                weight_unit: None,
+                is_bundle_component: None,
                 metadata: if let Some(reservation_id) = reservation_id {
                     serde_json::json!({
                         "reservation_id": reservation_id,
@@ -178,6 +200,16 @@ impl OrderService {
             };
 
             order_items.push(order_item);
+        }
+
+        // Map product ids to the real order item ids for tax reporting
+        // (first occurrence wins for duplicate products). Built before the
+        // order_items vec is consumed below.
+        let mut tax_item_id_map: Vec<(Uuid, Uuid)> = Vec::new();
+        for oi in &order_items {
+            if !tax_item_id_map.iter().any(|(pid, _)| *pid == oi.product_id) {
+                tax_item_id_map.push((oi.product_id, oi.id));
+            }
         }
 
         // Calculate shipping tax
@@ -199,16 +231,24 @@ impl OrderService {
             INSERT INTO orders (
                 id, order_number, customer_id, customer_email,
                 billing_address_id, shipping_address_id,
+                billing_address, shipping_address,
                 status, fulfillment_status, payment_status,
                 currency, subtotal, tax_total, shipping_total, discount_total, total,
-                notes, tags, metadata
+                notes, tags, metadata,
+                coupon_code, coupon_id,
+                invoice_number, test
             )
             VALUES (
                 $1, $2, $3, $4,
                 $5, $6,
+                $7, $8,
                 'pending', 'pending', 'pending',
-                $7, $8, $9, $10, $11, $12,
-                $13, $14, $15
+                $9, $10, $11, $12, $13, $14,
+                $15, $16, $17,
+                $20, $21,
+                CASE WHEN $18 = '' THEN NULL
+                     ELSE $18 || '-' || nextval('order_invoice_seq') END,
+                $19
             )
             RETURNING *
             "#,
@@ -219,6 +259,8 @@ impl OrderService {
         .bind(request.customer_email)
         .bind(request.billing_address_id)
         .bind(request.shipping_address_id)
+        .bind(&request.billing_address)
+        .bind(&request.shipping_address)
         .bind(request.currency)
         .bind(subtotal)
         .bind(tax_total)
@@ -228,6 +270,10 @@ impl OrderService {
         .bind(request.notes)
         .bind(request.tags.unwrap_or_default())
         .bind(request.metadata)
+        .bind(self.store_code.clone().unwrap_or_default())
+        .bind(request.test)
+        .bind(request.coupon_code)
+        .bind(request.coupon_id)
         .fetch_one(self.db.pool())
         .await?;
 
@@ -286,7 +332,7 @@ impl OrderService {
         // Record tax transaction for reporting if tax was calculated
         if let (Some(tax_service), Some(calculation)) = (&self.tax_service, tax_calculation) {
             if let Err(e) = tax_service
-                .record_tax_transaction(order_id, &calculation)
+                .record_tax_transaction(order_id, &calculation, &tax_item_id_map)
                 .await
             {
                 warn!("Failed to record tax transaction: {}", e);
@@ -319,10 +365,14 @@ impl OrderService {
             .as_ref()
             .ok_or_else(|| Error::not_implemented("Tax service not configured"))?;
 
-        // Convert order items to taxable items
-        let taxable_items: Vec<TaxableItem> = items
-            .iter()
-            .map(|item| TaxableItem {
+        // Convert order items to taxable items, resolving the real product/variant names
+        let mut taxable_items = Vec::with_capacity(items.len());
+        for item in items {
+            let details = self
+                .get_product_order_details(item.product_id, item.variant_id)
+                .await?;
+
+            taxable_items.push(TaxableItem {
                 id: item.product_id, // Use product_id as item id for matching
                 product_id: item.product_id,
                 quantity: item.quantity,
@@ -330,10 +380,10 @@ impl OrderService {
                 total_price: item.price * Decimal::from(item.quantity),
                 tax_category_id: None, // TODO: Get from product
                 is_digital: false,     // TODO: Get from product
-                title: format!("Product {}", item.product_id), // TODO: Get actual name
-                sku: None,
-            })
-            .collect();
+                title: details.title,
+                sku: details.sku,
+            });
+        }
 
         // Build tax context
         let tax_context = TaxContext {
@@ -426,6 +476,35 @@ impl OrderService {
         }))
     }
 
+    /// The most recent order created for a cart. Checkout writes the cart id
+    /// into `orders.metadata->>'cart_id'`; used to make checkout idempotent
+    /// per cart so a client retry cannot mint a second order/payment.
+    pub async fn find_latest_by_cart_id(&self, cart_id: Uuid) -> Result<Option<Order>> {
+        let order = sqlx::query_as::<_, Order>(
+            "SELECT * FROM orders WHERE metadata->>'cart_id' = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(cart_id.to_string())
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        Ok(order)
+    }
+
+    /// Gateway payment id (intent id) of the most recently recorded payment
+    /// for an order, used to re-query the gateway on checkout replays.
+    pub async fn latest_payment_gateway_id(&self, order_id: Uuid) -> Result<Option<String>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT gateway_payment_id FROM payments WHERE order_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(order_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        Ok(id)
+    }
+
     /// List orders with filtering
     pub async fn list_orders(&self, filter: super::OrderFilter) -> Result<Vec<Order>> {
         let mut query = String::from("SELECT * FROM orders WHERE 1=1");
@@ -454,9 +533,9 @@ impl OrderService {
             query_builder = query_builder.bind(customer_id);
         }
         if let Some(status) = filter.status {
-            // Convert status to lowercase string for the database
-            let status_str = format!("{:?}", status).to_lowercase();
-            query_builder = query_builder.bind(status_str);
+            // Use the database enum label; the lifecycle enum's Debug spelling
+            // ("canceled") does not match the Postgres value ("cancelled").
+            query_builder = query_builder.bind(status_db_label(status));
         }
 
         let orders = query_builder.fetch_all(self.db.pool()).await?;
@@ -486,9 +565,9 @@ impl OrderService {
 
         // Update status
         let updated_order = sqlx::query_as::<_, Order>(
-            "UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+            "UPDATE orders SET status = $1::order_status, updated_at = NOW() WHERE id = $2 RETURNING *",
         )
-        .bind(format!("{:?}", new_status).to_lowercase())
+        .bind(status_db_label(new_status))
         .bind(order_id)
         .fetch_one(self.db.pool())
         .await?;
@@ -551,25 +630,184 @@ impl OrderService {
 
     /// Mark an order as paid after a successful external payment and commit inventory.
     pub async fn confirm_order_after_payment(&self, order_id: Uuid) -> Result<OrderDetail> {
-        let order = sqlx::query_as::<_, Order>(
+        // Only transition orders still awaiting payment; a racing duplicate
+        // (webhook vs client confirm) finds no row to update and falls through
+        // to the current order, keeping this idempotent.
+        let updated = sqlx::query_as::<_, Order>(
             r#"
             UPDATE orders
             SET status = 'confirmed',
                 payment_status = 'paid',
-                updated_at = NOW(),
-                completed_at = NOW()
-            WHERE id = $1
+                updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
             RETURNING *
             "#,
         )
         .bind(order_id)
-        .fetch_one(self.db.pool())
+        .fetch_optional(self.db.pool())
         .await?;
+        let order = match updated {
+            Some(order) => order,
+            // Already confirmed by a racing webhook/client confirm; return the
+            // current row so this stays idempotent.
+            None => {
+                sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = $1")
+                    .bind(order_id)
+                    .fetch_one(self.db.pool())
+                    .await?
+            }
+        };
+
+        // Record coupon usage once the payment is confirmed; racing callers
+        // are deduplicated by the NOT EXISTS guard inside.
+        if let Err(e) = self.record_coupon_usage(&order).await {
+            warn!("Failed to record coupon usage for order {}: {}", order_id, e);
+        }
 
         self.commit_inventory_reservations(order_id).await?;
         let items = self.get_order_items(order_id).await?;
 
         Ok(OrderDetail { order, items })
+    }
+    ///
+    /// Record coupon usage for a newly confirmed order (idempotent).
+    ///
+    /// Runs at payment confirmation — not at order creation — so abandoned
+    /// orders never burn single-use codes. Safe to call from racing paths
+    /// (the Airwallex webhook vs the confirm endpoint): the INSERT is guarded
+    /// by NOT EXISTS on the order_id, so exactly one usage row is written and
+    /// usage_count increments once. Failures are logged, never propagated.
+    async fn record_coupon_usage(&self, order: &Order) -> Result<()> {
+        use rust_decimal::Decimal;
+
+        if order.discount_total <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        // Resolve the coupon: prefer the id persisted on the order, then the
+        // code, then (for orders created before the coupon was persisted on
+        // the order row) the cart's coupon code via the order's cart_id
+        // metadata, backfilling the order row defensively.
+        let mut coupon_id = order.coupon_id;
+        let mut coupon_code = order.coupon_code.clone();
+
+        if coupon_code.is_none() {
+            if let Some(code) = self.cart_coupon_code_for_order(order).await? {
+                sqlx::query(
+                    "UPDATE orders SET coupon_code = $1, updated_at = NOW() \
+                     WHERE id = $2 AND coupon_code IS NULL",
+                )
+                .bind(&code)
+                .bind(order.id)
+                .execute(self.db.pool())
+                .await?;
+                coupon_code = Some(code);
+            }
+        }
+
+        if coupon_id.is_none() {
+            if let Some(ref code) = coupon_code {
+                coupon_id =
+                    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM coupons WHERE code = $1")
+                        .bind(code)
+                        .fetch_optional(self.db.pool())
+                        .await?;
+            }
+        }
+
+        let Some(coupon_id) = coupon_id else {
+            if coupon_code.is_some() {
+                warn!(
+                    "Order {} has discount {} and coupon code {:?} but no matching coupon; \
+                     usage not recorded",
+                    order.id, order.discount_total, coupon_code
+                );
+            }
+            return Ok(());
+        };
+
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO coupon_usages (id, coupon_id, customer_id, order_id, discount_amount, used_at)
+            SELECT $1, $2, $3, $4, $5, NOW()
+            WHERE NOT EXISTS (SELECT 1 FROM coupon_usages WHERE order_id = $4)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(coupon_id)
+        .bind(order.customer_id)
+        .bind(order.id)
+        .bind(order.discount_total)
+        .execute(self.db.pool())
+        .await?;
+
+        if inserted.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE coupons SET usage_count = usage_count + 1, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(coupon_id)
+            .execute(self.db.pool())
+            .await?;
+            info!(
+                "Recorded coupon usage: coupon={} order={} amount={}",
+                coupon_id, order.id, order.discount_total
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Coupon code of the cart this order was checked out from, if any.
+    async fn cart_coupon_code_for_order(&self, order: &Order) -> Result<Option<String>> {
+        let cart_id = order
+            .metadata
+            .get("cart_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+        let Some(cart_id) = cart_id else {
+            return Ok(None);
+        };
+        let code: Option<String> =
+            sqlx::query_scalar("SELECT coupon_code FROM carts WHERE id = $1")
+                .bind(cart_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+        Ok(code)
+    }
+
+    /// Cancel orders that stayed `pending` with an unfinished payment for
+    /// longer than the given cutoff, releasing their inventory via the normal
+    /// cancellation path. Returns the cancelled order IDs; per-order failures
+    /// are logged and skipped.
+    pub async fn cancel_abandoned_orders(&self, older_than_minutes: u64) -> Result<Vec<Uuid>> {
+        // Enum columns need explicit casts; make_interval's `mins` argument
+        // is integer, so clamp to i32 range.
+        const ABANDONED_ORDERS_SQL: &str = "SELECT id FROM orders \
+             WHERE draft = false AND status = 'pending'::order_status \
+               AND payment_status IN ('pending'::payment_status, 'failed'::payment_status) \
+               AND created_at < NOW() - make_interval(mins => $1)";
+
+        let candidates: Vec<Uuid> = sqlx::query_scalar(ABANDONED_ORDERS_SQL)
+            .bind(older_than_minutes.min(i32::MAX as u64) as i32)
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let mut cancelled = Vec::new();
+        for id in candidates {
+            match self
+                .cancel_order(id, "Abandoned: payment not completed".to_string())
+                .await
+            {
+                Ok(_) => {
+                    info!("Auto-cancelled abandoned order {}", id);
+                    cancelled.push(id);
+                }
+                Err(e) => {
+                    warn!("Failed to auto-cancel abandoned order {}: {}", id, e);
+                }
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Cancel an order
@@ -597,9 +835,20 @@ impl OrderService {
             .execute(self.db.pool())
             .await?;
 
-        // Process refund if payment was made
+        // Process refund if payment was captured
         if order.order.payment_status == PaymentStatus::Paid {
-            self.process_refund(order_id, reason).await?;
+            self.process_refund(order_id, None, reason.clone()).await?;
+        } else if order.order.payment_status == PaymentStatus::Authorized {
+            // Attempt to void/cancel the authorized (uncaptured) payment via the
+            // gateway. The legacy gateway trait has no dedicated void operation, so
+            // a refund request is used; a failure here must not block cancellation.
+            match self.process_refund(order_id, None, reason.clone()).await {
+                Ok(_) => info!("Voided authorized payment for canceled order {}", order_id),
+                Err(e) => warn!(
+                    "Failed to void authorized payment for order {}: {}",
+                    order_id, e
+                ),
+            }
         }
 
         // Update order status
@@ -608,6 +857,71 @@ impl OrderService {
             .await?;
 
         Ok(canceled_order)
+    }
+
+    /// Refund a paid (or authorized) order through the payment gateway,
+    /// restock its items, and mark the order as refunded.
+    pub async fn refund_order(
+        &self,
+        order_id: Uuid,
+        amount: Option<Decimal>,
+        reason: String,
+    ) -> Result<Order> {
+        let detail = self
+            .get_order(order_id)
+            .await?
+            .ok_or_else(|| Error::not_found("Order not found"))?;
+
+        // Only orders with captured or authorized funds can be refunded
+        match detail.order.payment_status {
+            PaymentStatus::Paid | PaymentStatus::Authorized => {}
+            _ => {
+                return Err(Error::validation(
+                    "Order payment is not in a refundable state",
+                ));
+            }
+        }
+
+        // Process the refund through the gateway using the recorded transaction id
+        let refund = self
+            .process_refund(order_id, amount, reason.clone())
+            .await?;
+
+        // Restock the ordered items
+        for item in &detail.items {
+            sqlx::query(
+                "UPDATE products SET inventory_quantity = inventory_quantity + $1, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(item.quantity)
+            .bind(item.product_id)
+            .execute(self.db.pool())
+            .await?;
+        }
+
+        // Update payment status
+        sqlx::query(
+            "UPDATE orders SET payment_status = 'refunded', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(order_id)
+        .execute(self.db.pool())
+        .await?;
+
+        // Update order status (validated against allowed transitions)
+        let refunded_order = self
+            .update_order_status(order_id, OrderStatus::Refunded)
+            .await?;
+
+        info!(
+            "Order refunded: id={}, amount={}, refund_id={}",
+            order_id, refund.amount, refund.id
+        );
+
+        // Dispatch refund event
+        self.event_dispatcher
+            .order_refunded(&refunded_order, refund.id, refund.amount, reason)
+            .await?;
+
+        Ok(refunded_order)
     }
 
     /// Fulfill an order
@@ -675,14 +989,46 @@ impl OrderService {
         Ok(())
     }
 
-    async fn validate_product(&self, product_id: Uuid) -> Result<()> {
-        sqlx::query("SELECT 1 FROM products WHERE id = $1 AND is_active = true")
+    async fn get_product_order_details(
+        &self,
+        product_id: Uuid,
+        variant_id: Option<Uuid>,
+    ) -> Result<ProductOrderDetails> {
+        if let Some(variant_id) = variant_id {
+            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                r#"
+                SELECT p.title, v.title, v.sku
+                FROM products p
+                JOIN product_variants v ON p.id = v.product_id
+                WHERE p.id = $1 AND p.is_active = true AND v.id = $2
+                "#,
+            )
+            .bind(product_id)
+            .bind(variant_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| Error::not_found("Product or variant not found"))?;
+
+            Ok(ProductOrderDetails {
+                title: row.0,
+                variant_title: row.1,
+                sku: row.2,
+            })
+        } else {
+            let row = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT title, sku FROM products WHERE id = $1 AND is_active = true",
+            )
             .bind(product_id)
             .fetch_optional(self.db.pool())
             .await?
             .ok_or_else(|| Error::not_found("Product not found or inactive"))?;
 
-        Ok(())
+            Ok(ProductOrderDetails {
+                title: row.0,
+                variant_title: None,
+                sku: row.1,
+            })
+        }
     }
 
     async fn get_order_items(&self, order_id: Uuid) -> Result<Vec<crate::order::OrderItem>> {
@@ -694,6 +1040,50 @@ impl OrderService {
         .await?;
 
         Ok(items)
+    }
+
+    /// Record a payment for an order (idempotent on gateway + transaction id)
+    pub async fn record_payment(
+        &self,
+        order_id: Uuid,
+        payment: &crate::payment::Payment,
+    ) -> Result<()> {
+        use crate::payment::PaymentStatus;
+
+        let status = match payment.status {
+            PaymentStatus::Succeeded => "paid",
+            PaymentStatus::Pending | PaymentStatus::Processing => "pending",
+            PaymentStatus::Failed => "failed",
+            PaymentStatus::Canceled => "cancelled",
+            PaymentStatus::Refunded => "refunded",
+            PaymentStatus::Disputed => "pending",
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO payments (
+                order_id, amount, currency, status, gateway,
+                gateway_payment_id, payment_method, card_last_four, card_brand, processed_at, test
+            )
+            SELECT $1, $2, UPPER($3)::currency, $4::payment_status, $5, $6, 'credit_card', $7, $8, NOW(),
+                   (SELECT test FROM orders WHERE id = $1)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM payments WHERE gateway = $5 AND gateway_payment_id = $6
+            )
+            "#,
+        )
+        .bind(order_id)
+        .bind(payment.amount)
+        .bind(&payment.currency)
+        .bind(status)
+        .bind(&payment.gateway)
+        .bind(&payment.transaction_id)
+        .bind(&payment.card_last_four)
+        .bind(&payment.card_brand)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(())
     }
 
     fn is_valid_status_transition(&self, from: OrderStatus, to: OrderStatus) -> bool {
@@ -780,10 +1170,75 @@ impl OrderService {
         Ok(())
     }
 
-    async fn process_refund(&self, _order_id: Uuid, _reason: String) -> Result<()> {
-        // TODO: Implement refund processing via payment gateway
-        log::info!("Processing refund for order {}", _order_id);
-        Ok(())
+    /// Refund (or void) the most recent paid/authorized payment recorded for an
+    /// order, using the gateway transaction id stored on the payment record.
+    async fn process_refund(
+        &self,
+        order_id: Uuid,
+        amount: Option<Decimal>,
+        reason: String,
+    ) -> Result<crate::payment::Refund> {
+        // Find the latest refundable payment record for this order
+        let payment = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT gateway, gateway_payment_id
+            FROM payments
+            WHERE order_id = $1
+              AND gateway_payment_id IS NOT NULL
+              AND status IN ('paid', 'authorized')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(order_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| Error::validation("No refundable payment found for order"))?;
+
+        let (gateway, gateway_payment_id) = payment;
+
+        info!(
+            "Refunding payment {} (gateway: {}) for order {}: {}",
+            gateway_payment_id, gateway, order_id, reason
+        );
+
+        // Refund through the configured payment gateway
+        let refund = self
+            .payment_gateway
+            .refund_payment(&gateway_payment_id, amount, &reason)
+            .await?;
+
+        // Mark the payment record as refunded
+        sqlx::query(
+            "UPDATE payments SET status = 'refunded' WHERE gateway = $1 AND gateway_payment_id = $2",
+        )
+        .bind(&gateway)
+        .bind(&gateway_payment_id)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(refund)
+    }
+}
+
+/// Map a lifecycle order status to its database enum label.
+///
+/// The lifecycle enum uses American spelling (`Canceled`) while the Postgres
+/// `order_status` enum uses British spelling (`cancelled`); always persist the
+/// database label.
+fn status_db_label(status: OrderStatus) -> &'static str {
+    use OrderStatus::*;
+
+    match status {
+        Pending => "pending",
+        Confirmed => "confirmed",
+        Processing => "processing",
+        OnHold => "on_hold",
+        Shipped => "shipped",
+        Delivered => "delivered",
+        Completed => "completed",
+        Canceled => "cancelled",
+        Refunded => "refunded",
     }
 }
 
@@ -837,6 +1292,27 @@ fn create_default_address() -> Address {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_abandoned_orders_sql_uses_enum_casts() {
+        // The sweeper query must cast string literals against the enum
+        // columns; plain string binds against order_status/payment_status
+        // fail at runtime (see the earlier enum-cast fixes).
+        let src = include_str!("service.rs");
+        let query = src
+            .split("ABANDONED_ORDERS_SQL")
+            .nth(1)
+            .expect("sweeper SQL not found");
+        assert!(
+            query.contains("'pending'::order_status"),
+            "status cast missing"
+        );
+        assert!(
+            query.contains("'pending'::payment_status")
+                && query.contains("'failed'::payment_status"),
+            "payment_status casts missing"
+        );
+    }
+
     use super::*;
 
     #[test]

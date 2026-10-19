@@ -22,6 +22,9 @@ pub struct Address {
     pub address1: String,
     pub address2: Option<String>,
     pub city: String,
+    /// Maps to the `province` column in the addresses table; the serde/API
+    /// field stays `state` (storefront contract).
+    #[sqlx(rename = "province")]
     pub state: Option<String>,
     pub country: String,
     pub zip: String,

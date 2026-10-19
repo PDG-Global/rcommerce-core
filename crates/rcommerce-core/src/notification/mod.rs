@@ -9,12 +9,14 @@ mod tests;
 
 use serde::{Deserialize, Serialize};
 
-pub use email_templates::{Address, EmailNotificationFactory, EmailTemplateType, OrderItem};
+pub use email_templates::{
+    Address, EmailNotificationFactory, EmailTemplateType, OrderConfirmationParams, OrderItem,
+};
 pub use service::NotificationService;
 pub use templates::{NotificationTemplate, TemplateVariables};
 pub use types::{
-    DeliveryAttempt, DeliveryStatus, Notification, NotificationMessage, NotificationPreferences,
-    NotificationPriority, NotificationResult, Recipient,
+    DeliveryAttempt, DeliveryStatus, EmailAttachment, Notification, NotificationMessage,
+    NotificationPreferences, NotificationPriority, NotificationResult, Recipient,
 };
 
 /// Notification channels

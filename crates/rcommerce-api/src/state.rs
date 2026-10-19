@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use rcommerce_core::cache::RedisPool;
-use rcommerce_core::notification::channels::email::{EmailChannel, SmtpConfig};
+use rcommerce_core::notification::channels::email::{
+    EmailChannel, EmailMode, PostmarkConfig, SmtpConfig,
+};
 use rcommerce_core::notification::service::NotificationService;
 use rcommerce_core::payment::agnostic::PaymentService;
 use rcommerce_core::repository::{
@@ -36,6 +38,13 @@ pub struct AppStateParams {
     pub checkout_service: Arc<CheckoutService>,
     pub inventory_service: Arc<rcommerce_core::inventory::InventoryService>,
     pub smtp_config: Option<SmtpConfig>,
+    pub xero_config: Option<rcommerce_core::config::XeroConfig>,
+    pub notification_admin_email: Option<String>,
+    pub branding: rcommerce_core::BrandingConfig,
+    /// Accounting export configuration (store code/name, site URL)
+    pub accounting: rcommerce_core::config::AccountingConfig,
+    /// Airwallex gateway config for settlement reconciliation
+    pub airwallex_config: Option<rcommerce_core::config::AirwallexConfig>,
 }
 
 impl AppStateParams {
@@ -59,6 +68,11 @@ impl AppStateParams {
         checkout_service: Arc<CheckoutService>,
         inventory_service: Arc<rcommerce_core::inventory::InventoryService>,
         smtp_config: Option<SmtpConfig>,
+        xero_config: Option<rcommerce_core::config::XeroConfig>,
+        notification_admin_email: Option<String>,
+        branding: rcommerce_core::BrandingConfig,
+        accounting: rcommerce_core::config::AccountingConfig,
+        airwallex_config: Option<rcommerce_core::config::AirwallexConfig>,
     ) -> Self {
         Self {
             product_service,
@@ -78,6 +92,11 @@ impl AppStateParams {
             checkout_service,
             inventory_service,
             smtp_config,
+            xero_config,
+            notification_admin_email,
+            branding,
+            accounting,
+            airwallex_config,
         }
     }
 }
@@ -106,12 +125,30 @@ pub struct AppState {
     pub api_key_repository: Arc<PostgresApiKeyRepository>,
     pub email_channel: Option<Arc<EmailChannel>>,
     pub notification_service: Option<Arc<NotificationService>>,
+    pub notification_from_email: Option<String>,
+    pub notification_admin_email: Option<String>,
+    pub xero_client: Option<Arc<rcommerce_core::accounting::XeroClient>>,
+    /// Store branding for customer-facing emails and invoices
+    pub branding: rcommerce_core::BrandingConfig,
+    /// Accounting export configuration (store code/name, site URL)
+    pub accounting: rcommerce_core::config::AccountingConfig,
+    /// Airwallex settlement reconciliation client (None when unconfigured)
+    pub settlement_sync: Option<Arc<rcommerce_core::accounting::SettlementSync>>,
 }
 
 impl AppState {
     pub async fn new(params: AppStateParams) -> Self {
         // Create auth rate limiter: 5 attempts per minute per IP
         let auth_rate_limiter = AuthRateLimiter::new(5, 60);
+
+        // Remember the configured sender address for shop-operator notifications
+        let notification_from_email = params
+            .smtp_config
+            .as_ref()
+            .map(|smtp| smtp.from_address.clone());
+
+        // Store branding for customer-facing emails and invoices
+        let branding = params.branding.clone();
 
         // Create subscription service
         let subscription_service = SubscriptionService::new(params.subscription_repository.clone());
@@ -126,9 +163,22 @@ impl AppState {
         // Create bundle service
         let bundle_service = Arc::new(BundleService::new(params.db.clone()));
 
-        // Create notification service if SMTP is configured
+        // Create notification service if email is configured
         let (email_channel, notification_service) = if let Some(smtp) = params.smtp_config {
-            match EmailChannel::new_smtp(smtp).await {
+            // Check if this is a Postmark configuration (host == "postmark")
+            let channel_result = if smtp.host == "postmark" {
+                let postmark_config = PostmarkConfig {
+                    server_token: smtp.username.clone(),
+                    from_address: smtp.from_address.clone(),
+                    from_name: smtp.from_name.clone(),
+                    message_stream: "outbound".to_string(),
+                };
+                Ok(EmailChannel::new_postmark(postmark_config))
+            } else {
+                EmailChannel::new_smtp(smtp).await
+            };
+
+            match channel_result {
                 Ok(channel) => {
                     let channel = Arc::new(channel);
                     let svc = Arc::new(NotificationService::new(
@@ -137,18 +187,40 @@ impl AppState {
                         rcommerce_core::notification::channels::WebhookChannel,
                         params.db.pool().clone(),
                     ));
-                    tracing::info!("Notification service initialized with SMTP");
+                    tracing::info!("Notification service initialized");
                     (Some(channel), Some(svc))
                 }
                 Err(e) => {
-                    tracing::error!("Failed to initialize SMTP notification service: {}", e);
+                    tracing::error!("Failed to initialize email notification service: {}", e);
                     (None, None)
                 }
             }
         } else {
-            tracing::info!("SMTP not configured; notification service disabled");
+            tracing::info!("Email not configured; notification service disabled");
             (None, None)
         };
+
+        // Create Xero client if configured
+        let xero_client = params.xero_config.and_then(|cfg| {
+            let client = rcommerce_core::accounting::XeroClient::new(cfg);
+            if client.is_configured() {
+                tracing::info!("Xero integration enabled");
+                Some(Arc::new(client))
+            } else {
+                tracing::info!("Xero not fully configured; integration disabled");
+                None
+            }
+        });
+
+        // Create the Airwallex settlement sync client if configured
+        let settlement_sync = params.airwallex_config.and_then(|cfg| {
+            if cfg.enabled {
+                tracing::info!("Airwallex settlement sync enabled");
+                rcommerce_core::accounting::SettlementSync::new(&cfg).map(Arc::new)
+            } else {
+                None
+            }
+        });
 
         Self {
             product_service: params.product_service,
@@ -173,6 +245,12 @@ impl AppState {
             api_key_repository: Arc::new(params.api_key_repository),
             email_channel,
             notification_service,
+            notification_from_email,
+            notification_admin_email: params.notification_admin_email,
+            xero_client,
+            branding,
+            accounting: params.accounting,
+            settlement_sync,
         }
     }
 }

@@ -272,7 +272,7 @@ pub enum ImportCommands {
         #[arg(long, help = "API secret (for WooCommerce)")]
         api_secret: Option<String>,
 
-        /// Entity types to import (products, customers, orders, all)
+        /// Entity types to import (products, customers, orders, reviews, all)
         #[arg(short, long, help = "Entity types to import", default_value = "all")]
         entities: String,
 
@@ -422,6 +422,13 @@ pub enum ApiKeyCommands {
 
         #[arg(short = 'e', long, help = "Expiration in days (optional)")]
         expires_days: Option<i64>,
+
+        #[arg(
+            short = 'w',
+            long,
+            help = "Also show WooCommerce-compatible consumer_key/consumer_secret format"
+        )]
+        wc: bool,
     },
 
     /// Get API key details
@@ -864,6 +871,7 @@ async fn main() -> Result<()> {
                     name,
                     scopes,
                     expires_days,
+                    wc,
                 } => {
                     let auth_service = rcommerce_core::services::AuthService::new(config);
 
@@ -904,6 +912,36 @@ async fn main() -> Result<()> {
                                     .map(|d| d.to_string())
                                     .unwrap_or_else(|| "Never".to_string())
                             );
+
+                            if wc {
+                                let parts: Vec<&str> = full_key.split('.').collect();
+                                if parts.len() == 2 {
+                                    println!();
+                                    println!("{}", "WooCommerce-compatible credentials:".bold());
+                                    println!();
+                                    println!(
+                                        "  Consumer Key:    {}",
+                                        format!("ck_{}", parts[0]).bright_cyan()
+                                    );
+                                    println!(
+                                        "  Consumer Secret: {}",
+                                        format!("cs_{}", parts[1]).bright_cyan()
+                                    );
+                                    println!();
+                                    println!("  Basic Auth header:");
+                                    let b64 = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        format!("ck_{}:cs_{}", parts[0], parts[1]),
+                                    );
+                                    println!("  Authorization: Basic {}", b64.bright_cyan());
+                                    println!();
+                                    println!("  Usage with curl:");
+                                    let creds = format!("ck_{}:cs_{}", parts[0], parts[1]);
+                                    println!(
+                                        "    curl -u {creds}: https://api.rcommerce.app/wp-json/wc/v3/products"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("{}", format!("❌ Failed to create API key: {}", e).red());
@@ -1175,7 +1213,7 @@ async fn main() -> Result<()> {
                     // Validate all entity types first
                     for entity in &entity_list {
                         match *entity {
-                            "products" | "customers" | "orders" | "all" => {}
+                            "products" | "customers" | "orders" | "reviews" | "all" => {}
                             _ => {
                                 eprintln!(
                                     "{}",
@@ -1203,6 +1241,7 @@ async fn main() -> Result<()> {
                                 importer.import_customers(&import_config, &progress).await
                             }
                             "orders" => importer.import_orders(&import_config, &progress).await,
+                            "reviews" => importer.import_reviews(&import_config, &progress).await,
                             "all" => importer.import_all(&import_config, &progress).await,
                             _ => unreachable!(),
                         };
@@ -2760,15 +2799,19 @@ fn generate_order_confirmation_email(recipient: &str) -> rcommerce_core::Result<
     let items = vec![
         OrderItem {
             name: "High-Performance Server Blade".to_string(),
+            variant_title: None,
             sku: "SRV-BLD-01".to_string(),
             quantity: 2,
             price: "3,200.00".to_string(),
+            is_bundle_component: false,
         },
         OrderItem {
             name: "Enterprise Rust Support".to_string(),
+            variant_title: None,
             sku: "LIC-ENT-YR".to_string(),
             quantity: 1,
             price: "850.00".to_string(),
+            is_bundle_component: false,
         },
     ];
 
@@ -2795,10 +2838,17 @@ fn generate_order_confirmation_email(recipient: &str) -> rcommerce_core::Result<
         customer_name: "John Doe",
         order_number: "ORD-2026-001234",
         order_date: "Feb 5, 2026",
-        order_total: "7,250.00",
+        order_total: "USD 7,250.00",
+        subtotal: "$7,100.00",
+        discount_total: "$0.00",
+        discount_code: None,
+        shipping_total: "$150.00",
+        shipping_method: "Express",
+        tax_total: "$0.00",
         items: &items,
         shipping_address: &shipping,
         billing_address: &billing,
+        branding: &rcommerce_core::BrandingConfig::default(),
     })
 }
 
@@ -3090,6 +3140,7 @@ fn create_notification_from_template(
         scheduled_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        attachments: Vec::new(),
     })
 }
 

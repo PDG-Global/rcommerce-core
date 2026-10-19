@@ -163,7 +163,8 @@ pub async fn login(
     // Imported accounts without a local password must reset their password before logging in.
     if customer.is_imported && customer.password_hash.is_none() {
         return Err(ImportedAccountResponse {
-            message: "This account was imported. Please reset your password to continue.".to_string(),
+            message: "This account was imported. Please reset your password to continue."
+                .to_string(),
             requires_password_reset: true,
         }
         .into_response());
@@ -195,7 +196,10 @@ pub async fn login(
 
     // Rehash password if it was using legacy format (PHPass or bcrypt)
     if needs_rehash {
-        let new_hash = state.auth_service.hash_password(&payload.password).map_err(|e| e.into_response())?;
+        let new_hash = state
+            .auth_service
+            .hash_password(&payload.password)
+            .map_err(|e| e.into_response())?;
         if let Err(e) = state
             .customer_service
             .update_password_hash(customer.id, &new_hash)
@@ -215,11 +219,10 @@ pub async fn login(
     }
 
     // Generate tokens with role-based permissions
-    let access_token =
-        state
-            .auth_service
-            .generate_access_token(customer.id, &customer.email, &customer.role)
-            .map_err(|e| e.into_response())?;
+    let access_token = state
+        .auth_service
+        .generate_access_token(customer.id, &customer.email, &customer.role)
+        .map_err(|e| e.into_response())?;
     let refresh_token = state
         .auth_service
         .generate_refresh_token(customer.id, payload.remember_me)
@@ -279,7 +282,8 @@ pub async fn register(
                 first_name: customer.first_name,
                 last_name: customer.last_name,
             },
-            message: "Registration successful. Please check your email to verify your account.".to_string(),
+            message: "Registration successful. Please check your email to verify your account."
+                .to_string(),
         }),
     ))
 }
@@ -297,27 +301,20 @@ async fn send_verification_email(
     let verification_token = state
         .auth_service
         .generate_email_verification_token(customer.id, &customer.email)?;
-    let store_url = std::env::var("STOREFRONT_URL")
-        .unwrap_or_else(|_| "https://demo.rcommerce.app".to_string());
+    let store_url =
+        std::env::var("STOREFRONT_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let verification_link = format!(
         "{}/account/verify-email?token={}",
         store_url, verification_token
     );
 
-    let notification = Notification::new(
-        NotificationChannel::Email,
-        customer.email.clone(),
-        "Welcome to rCommerce — please verify your email".to_string(),
-        format!(
-            "Hi {},\n\nWelcome to rCommerce! Please verify your email address by clicking the link below:\n\n{}\n\nThis link expires in 24 hours.\n\nIf you didn't create an account, you can safely ignore this email.",
-            customer.first_name, verification_link
-        ),
-    )
-    .with_priority(NotificationPriority::High)
-    .with_html_body(format!(
-        "<h1>Welcome to rCommerce!</h1><p>Hi {},</p><p>Please verify your email address by clicking the link below:</p><p><a href=\"{}\">Verify Email</a></p><p>This link expires in 24 hours.</p><p>If you didn't create an account, you can safely ignore this email.</p>",
-        customer.first_name, verification_link
-    ));
+    let notification = rcommerce_core::notification::EmailNotificationFactory::verification(
+        &customer.email,
+        &format!("{} {}", customer.first_name, customer.last_name),
+        &verification_link,
+        "24 hours",
+        &state.branding,
+    )?;
 
     notification_service.send(&notification).await?;
     tracing::info!("Welcome/verification email sent to {}", customer.email);
@@ -388,35 +385,35 @@ pub async fn request_password_reset(
         .generate_password_reset_token(customer.id, &customer.email)?;
 
     // Send reset email via SMTP if configured
-    let store_url = std::env::var("STOREFRONT_URL").unwrap_or_else(|_| "https://demo.rcommerce.app".to_string());
+    let store_url =
+        std::env::var("STOREFRONT_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let reset_link = format!("{}/account/reset-password?token={}", store_url, reset_token);
 
     if let Some(ref notification_service) = state.notification_service {
-        let notification = Notification::new(
-            NotificationChannel::Email,
-            customer.email.clone(),
-            "Reset your rCommerce password".to_string(),
-            format!(
-                "Hi {},\n\nWe received a request to reset your password. Click the link below to set a new password:\n\n{}\n\nThis link expires in 1 hour. If you didn't request this, you can safely ignore this email.",
-                customer.first_name,
-                reset_link
-            ),
-        )
-        .with_priority(NotificationPriority::High)
-        .with_html_body(format!(
-            "<p>Hi {},</p><p>We received a request to reset your password. Click the link below to set a new password:</p><p><a href=\"{}\">Reset Password</a></p><p>This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>",
-            customer.first_name,
-            reset_link
-        ));
+        let notification = rcommerce_core::notification::EmailNotificationFactory::password_reset(
+            &customer.email,
+            &format!("{} {}", customer.first_name, customer.last_name),
+            &reset_token,
+            &reset_link,
+            "1 hour",
+            &state.branding,
+        )?;
 
         if let Err(e) = notification_service.send(&notification).await {
-            tracing::error!("Failed to send password reset email to {}: {}", customer.email, e);
+            tracing::error!(
+                "Failed to send password reset email to {}: {}",
+                customer.email,
+                e
+            );
             // Still return success to avoid email enumeration, but log the failure
         } else {
             tracing::info!("Password reset email sent to {}", customer.email);
         }
     } else {
-        tracing::warn!("SMTP not configured; cannot send password reset email to {}", customer.email);
+        tracing::warn!(
+            "SMTP not configured; cannot send password reset email to {}",
+            customer.email
+        );
     }
 
     // Only return token in development mode for testing
@@ -509,7 +506,9 @@ pub async fn resend_verification_email(
         Some(c) => c,
         None => {
             return Ok(Json(ResendVerificationResponse {
-                message: "If an account with that email exists, a verification email has been sent.".to_string(),
+                message:
+                    "If an account with that email exists, a verification email has been sent."
+                        .to_string(),
             }));
         }
     };
@@ -523,7 +522,8 @@ pub async fn resend_verification_email(
     send_verification_email(&state, &customer).await?;
 
     Ok(Json(ResendVerificationResponse {
-        message: "If an account with that email exists, a verification email has been sent.".to_string(),
+        message: "If an account with that email exists, a verification email has been sent."
+            .to_string(),
     }))
 }
 

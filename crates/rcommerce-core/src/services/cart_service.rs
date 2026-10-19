@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -144,6 +145,72 @@ impl CartService {
         let items = self.cart_repo.get_items(cart_id).await?;
 
         Ok(CartWithItems { cart, items })
+    }
+
+    /// Get product weights for cart items (product_id -> weight in kg)
+    pub async fn get_product_weights(
+        &self,
+        product_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Decimal>> {
+        use std::collections::HashMap;
+
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::internal("Database not available"))?;
+        let mut weights = HashMap::new();
+
+        for chunk in product_ids.chunks(100) {
+            let rows: Vec<(Uuid, Option<Decimal>, Option<String>)> = sqlx::query_as(
+                "SELECT id, weight, weight_unit::text AS weight_unit FROM products WHERE id = ANY($1)"
+            )
+            .bind(chunk)
+            .fetch_all(db.pool())
+            .await?;
+
+            for (id, weight, weight_unit) in rows {
+                if let Some(w) = weight {
+                    // Convert to kg if needed
+                    let weight_kg = match weight_unit.as_deref() {
+                        Some("lb") => w * dec!(0.453592),
+                        Some("oz") => w * dec!(0.0283495),
+                        _ => w, // Assume kg
+                    };
+                    weights.insert(id, weight_kg);
+                }
+            }
+        }
+
+        Ok(weights)
+    }
+
+    /// Get product categories for cart items (product_id -> category_slug)
+    pub async fn get_product_categories(
+        &self,
+        product_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        use std::collections::HashMap;
+
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::internal("Database not available"))?;
+        let mut categories = HashMap::new();
+
+        for chunk in product_ids.chunks(100) {
+            let rows: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT pcr.product_id, c.slug FROM product_category_relations pcr JOIN product_categories c ON pcr.category_id = c.id WHERE pcr.product_id = ANY($1)"
+            )
+            .bind(chunk)
+            .fetch_all(db.pool())
+            .await?;
+
+            for (product_id, slug) in rows {
+                categories.insert(product_id, slug);
+            }
+        }
+
+        Ok(categories)
     }
 
     /// Get cart with calculated totals including tax

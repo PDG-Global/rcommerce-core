@@ -299,7 +299,11 @@ impl AuthService {
     }
 
     /// Generate email verification token (short-lived)
-    pub fn generate_email_verification_token(&self, customer_id: Uuid, email: &str) -> Result<String> {
+    pub fn generate_email_verification_token(
+        &self,
+        customer_id: Uuid,
+        email: &str,
+    ) -> Result<String> {
         let expiration = Utc::now()
             .checked_add_signed(Duration::hours(24))
             .expect("valid timestamp")
@@ -319,8 +323,12 @@ impl AuthService {
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
         let encoding_key = EncodingKey::from_secret(self.config.security.jwt.secret.as_bytes());
 
-        encode(&header, &claims, &encoding_key)
-            .map_err(|e| Error::internal(format!("Failed to generate email verification token: {}", e)))
+        encode(&header, &claims, &encoding_key).map_err(|e| {
+            Error::internal(format!(
+                "Failed to generate email verification token: {}",
+                e
+            ))
+        })
     }
 
     /// Verify email verification token
@@ -339,10 +347,17 @@ impl AuthService {
         let prefix_length = self.config.security.api_key_prefix_length;
 
         rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+            .sample_iter(&rand::distributions::Standard)
+            .filter_map(|b: u8| {
+                if b < 240 {
+                    Some(format!("{:02x}", b))
+                } else {
+                    None
+                }
+            })
             .take(prefix_length)
-            .map(char::from)
-            .collect()
+            .collect::<String>()[..prefix_length]
+            .to_string()
     }
 
     fn generate_secret(&self) -> String {
@@ -350,10 +365,17 @@ impl AuthService {
         let secret_length = self.config.security.api_key_secret_length;
 
         rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+            .sample_iter(&rand::distributions::Standard)
+            .filter_map(|b: u8| {
+                if b < 240 {
+                    Some(format!("{:02x}", b))
+                } else {
+                    None
+                }
+            })
             .take(secret_length)
-            .map(char::from)
-            .collect()
+            .collect::<String>()[..secret_length]
+            .to_string()
     }
 }
 

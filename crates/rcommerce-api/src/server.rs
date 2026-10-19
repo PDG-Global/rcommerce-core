@@ -10,12 +10,13 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::middleware::{
-    admin_middleware, auth_middleware, optional_auth_middleware, security_headers_middleware,
+    admin_middleware, auth_middleware, optional_auth_middleware, rate_limit_middleware,
+    security_headers_middleware, RateLimiter,
 };
 
 use crate::state::{AppState, AppStateParams};
 use rcommerce_core::cache::RedisPool;
-use rcommerce_core::config::{CorsConfig, TlsConfig};
+use rcommerce_core::config::{CorsConfig, RateLimitConfig, TlsConfig};
 use rcommerce_core::inventory::{InventoryConfig, InventoryService};
 use rcommerce_core::notification::channels::email::SmtpConfig;
 use rcommerce_core::order::lifecycle::OrderEventDispatcher;
@@ -62,9 +63,10 @@ async fn run_http_server(config: Config) -> Result<()> {
 
     // Initialize application state
     let app_state = create_app_state(&config).await?;
+    spawn_abandoned_order_sweeper(&config, &app_state);
 
     // Build router
-    let app = build_router(app_state, None, &config.server.cors);
+    let app = build_router(app_state, None, &config.server.cors, &config.rate_limiting);
 
     info!("R Commerce API server listening on http://{}", addr);
     log_routes(&config);
@@ -117,12 +119,14 @@ async fn run_tls_server(config: Config) -> Result<()> {
 
     // Initialize application state
     let app_state = create_app_state(&config).await?;
+    spawn_abandoned_order_sweeper(&config, &app_state);
 
     // Build main API router (HTTPS)
     let api_app = build_router(
         app_state.clone(),
         Some(config.tls.clone()),
         &config.server.cors,
+        &config.rate_limiting,
     );
 
     // Build HTTP challenge router (HTTP port 80)
@@ -593,18 +597,21 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         } else {
             Box::new(MockPaymentGateway::new())
         };
-    let order_service = Arc::new(OrderService::new(
-        db.clone(),
-        order_payment_gateway,
-        inventory_service.clone(),
-        event_dispatcher,
-    ));
+    let order_service = Arc::new(
+        OrderService::new(
+            db.clone(),
+            order_payment_gateway,
+            inventory_service.clone(),
+            event_dispatcher,
+        )
+        .with_store_code(config.accounting.store_code.clone()),
+    );
 
     // Initialize tax service
     let tax_service = Arc::new(DefaultTaxService::new(db.pool().clone()));
 
     // Initialize shipping provider factory
-    let shipping_factory = Arc::new(ShippingProviderFactory::from_config(&config.shipping));
+    let shipping_factory = Arc::new(ShippingProviderFactory::from_config(&config));
     info!("Shipping provider factory initialized");
 
     // Wrap cart_service in Arc for checkout service
@@ -613,6 +620,17 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     // Initialize checkout service
     let checkout_config = CheckoutConfig {
         stripe_publishable_key: config.payment.stripe.publishable_key.clone(),
+        airwallex_client_id: config.payment.airwallex.client_id.clone(),
+        airwallex_env: Some(if config.payment.airwallex.demo {
+            "demo".to_string()
+        } else {
+            "prod".to_string()
+        }),
+        site_url: config
+            .accounting
+            .site_url
+            .clone()
+            .or_else(|| std::env::var("STOREFRONT_URL").ok()),
         ..CheckoutConfig::default()
     };
     let checkout_payment_gateway: Arc<dyn rcommerce_core::payment::PaymentGateway> =
@@ -633,19 +651,45 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         } else {
             Arc::new(MockPaymentGateway::new())
         };
-    let checkout_service = Arc::new(CheckoutService::new(
+    let checkout_service = Arc::new(CheckoutService::with_coupon_service(
         cart_service.clone(),
         tax_service.clone(),
         order_service.clone(),
         checkout_payment_gateway,
         shipping_factory.clone(),
         checkout_config,
+        Some(Arc::new(coupon_service.clone())),
     ));
     info!("Checkout service initialized");
 
-    // Build SMTP config from notification settings if enabled
+    // Build email config from notification settings if enabled
     let smtp_config = if config.notifications.enabled {
-        if let (Some(host), Some(user), Some(pass), Some(from_email)) = (
+        // Check for Postmark configuration first
+        if let Some(postmark_token) = config.notifications.email.postmark_token.as_ref() {
+            let from_email = config
+                .notifications
+                .email
+                .from_email
+                .clone()
+                .unwrap_or_else(|| "no-reply@example.com".to_string());
+            let from_name = config
+                .notifications
+                .email
+                .from_name
+                .clone()
+                .unwrap_or_else(|| "rCommerce".to_string());
+            info!("Postmark configuration found, using Postmark for email delivery");
+            Some(SmtpConfig {
+                host: "postmark".to_string(),
+                port: 0,
+                username: postmark_token.clone(),
+                password: String::new(),
+                from_address: from_email,
+                from_name: from_name,
+                use_tls: false,
+                use_starttls: false,
+            })
+        } else if let (Some(host), Some(user), Some(pass), Some(from_email)) = (
             config.notifications.email.smtp_host.as_ref(),
             config.notifications.email.smtp_user.as_ref(),
             config.notifications.email.smtp_pass.as_ref(),
@@ -662,7 +706,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                     .email
                     .from_name
                     .clone()
-                    .unwrap_or_else(|| "R Commerce".to_string()),
+                    .unwrap_or_else(|| "rCommerce".to_string()),
                 use_tls: config.notifications.email.smtp_port == Some(465),
                 use_starttls: config.notifications.email.smtp_port != Some(465)
                     && config.notifications.email.smtp_tls,
@@ -670,7 +714,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             info!("SMTP configuration found for {}", smtp.host);
             Some(smtp)
         } else {
-            info!("Notification emails enabled but SMTP not fully configured");
+            info!("Notification emails enabled but no email provider configured");
             None
         }
     } else {
@@ -697,7 +741,17 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         checkout_service,
         Arc::new(inventory_service),
         smtp_config,
-    )).await)
+        if config.accounting.xero.enabled {
+            Some(config.accounting.xero.clone())
+        } else {
+            None
+        },
+        config.notifications.admin_email.clone(),
+        config.branding.clone(),
+        config.accounting.clone(),
+        Some(config.payment.airwallex.clone()),
+    ))
+    .await)
 }
 
 /// Build CORS layer from configuration
@@ -727,11 +781,20 @@ fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
     // See: https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS/Errors/CORSNotSupportingCredentials
     if allow_any_origin {
         // When allowing any origin, we must NOT allow credentials
-        warn!("CORS: Allowing any origin (*) - credentials disabled for security");
+        warn!(
+            "SECURITY WARNING: CORS allows any origin ('*'). This is unsafe for production \
+             and disables credential support. Set [server.cors].allowed_origins to your exact \
+             frontend domains (e.g. [\"https://store.example.com\"])."
+        );
         cors.allow_origin(Any)
             .allow_credentials(false)
             .max_age(Duration::from_secs(config.max_age.unwrap_or(3600)))
     } else {
+        if config.allowed_origins.is_empty() {
+            warn!("CORS: no allowed origins configured - cross-origin requests will be rejected");
+        } else {
+            info!("CORS allowed origins: {:?}", config.allowed_origins);
+        }
         let origins: Vec<axum::http::HeaderValue> = config
             .allowed_origins
             .iter()
@@ -743,11 +806,36 @@ fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
     }
 }
 
+/// Spawn the abandoned-order sweeper when configured
+/// (`[orders] auto_cancel_pending_minutes`). First sweep ~60s after startup,
+/// then every 300s. Silent when disabled.
+fn spawn_abandoned_order_sweeper(config: &Config, app_state: &AppState) {
+    let Some(minutes) = config.orders.auto_cancel_pending_minutes else {
+        return;
+    };
+    info!("abandoned-order sweeper enabled ({} min)", minutes);
+    let order_service = app_state.order_service.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            match order_service.cancel_abandoned_orders(minutes).await {
+                Ok(ids) if !ids.is_empty() => {
+                    info!("abandoned-order sweeper cancelled {} order(s)", ids.len())
+                }
+                Ok(_) => {}
+                Err(e) => warn!("abandoned-order sweeper run failed: {}", e),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
 /// Build the main API router
 fn build_router(
     app_state: AppState,
     tls_config: Option<TlsConfig>,
     cors_config: &CorsConfig,
+    rate_limit_config: &RateLimitConfig,
 ) -> Router {
     // Configure CORS from config
     let cors = build_cors_layer(cors_config);
@@ -759,6 +847,26 @@ fn build_router(
         .nest("/api/v1", api_routes(app_state.clone()))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
+
+    // Mount WooCommerce compatibility layer
+    app = crate::routes::woocommerce::mount_wc_compat(app, app_state.api_key_repository.clone());
+
+    // Apply general per-IP rate limiting ([rate_limiting] config section)
+    if rate_limit_config.enabled {
+        let limiter = RateLimiter::new(rate_limit_config);
+        info!(
+            "Rate limiting enabled: {} requests/minute per IP ({} allowlisted, {} blocklisted)",
+            limiter.max_requests(),
+            rate_limit_config.allowlist.len(),
+            rate_limit_config.blocklist.len()
+        );
+        app = app.layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit_middleware,
+        ));
+    } else {
+        info!("Rate limiting disabled in configuration");
+    }
 
     // Add security headers middleware (always, not just with TLS)
     // HSTS header will only be added when TLS is enabled
@@ -782,8 +890,12 @@ fn log_routes(config: &Config) {
     info!("Available routes ({}://localhost:{}):", protocol, port);
     info!("  GET  /health                      - Health check");
     info!("  GET  /                            - API info");
-    info!("  GET  /api/v1/products             - List products");
+    info!(
+        "  GET  /api/v1/products             - List products (supports ?category= and ?q= search)"
+    );
     info!("  GET  /api/v1/products/:id         - Get product");
+    info!("  GET  /api/v1/products/:id/pack-options - Pack purchase options for a product");
+    info!("  GET  /api/v1/products/:id/reviews - List product reviews");
     info!("  GET  /api/v1/customers            - List customers");
     info!("  GET  /api/v1/customers/:id        - Get customer");
     info!("  GET  /api/v1/orders               - List orders");
@@ -796,6 +908,8 @@ fn log_routes(config: &Config) {
     info!("  POST /api/v1/carts/guest          - Create guest cart");
     info!("  GET  /api/v1/carts/me             - Get customer cart");
     info!("  POST /api/v1/carts/merge          - Merge carts");
+    info!("  POST /api/v1/products/:id/reviews - Submit a product review (auth)");
+    info!("  POST /api/v1/newsletter/subscribe - Subscribe to newsletter");
     info!("  GET  /api/v1/coupons              - List coupons");
     info!("  POST /api/v1/coupons              - Create coupon");
     info!("  POST /api/v1/payments/methods     - Get payment methods");
@@ -810,6 +924,8 @@ fn log_routes(config: &Config) {
     info!("  GET  /api/v1/admin/statistics/customers - Customer statistics (admin)");
     info!("  GET  /api/v1/admin/statistics/revenue   - Revenue trends (admin)");
     info!("  GET  /api/v1/admin/statistics/compare   - Period comparison (admin)");
+    info!("  GET  /api/v1/admin/stats           - Dashboard stats (admin)");
+    info!("  GET  /api/v1/admin/api-keys        - List API keys (admin)");
 
     if config.tls.enabled {
         info!("  (HTTP port {} redirects to HTTPS)", config.tls.http_port);
@@ -861,8 +977,9 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::product_router())
         // Customer authentication (register/login)
         .merge(crate::routes::auth_public_router())
-        // Cart operations are public; the cart ID acts as the bearer token
-        .merge(crate::routes::cart_router())
+        // Public cart operations: guest cart creation and cart access/modification
+        // by cart ID (the cart ID acts as the bearer token for guests)
+        .merge(crate::routes::cart_public_router())
         // Guest checkout with optional customer authentication
         .merge(crate::routes::checkout_router())
         // Webhooks are public (signature verification handles security)
@@ -870,6 +987,12 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
             "/webhooks/:gateway_id",
             post(crate::routes::payment::handle_webhook),
         )
+        // Contact form is public (validated by form fields)
+        .route("/contact", post(crate::routes::contact::submit_contact))
+        // Newsletter signup is public and idempotent
+        .merge(crate::routes::newsletter_router())
+        // Product reviews are publicly readable
+        .merge(crate::routes::review_public_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             optional_auth_middleware,
@@ -887,15 +1010,30 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::subscription_router())
         // Dunning routes
         .merge(crate::routes::dunning_router())
+        // Customer cart lookup and cart deletion require authentication
+        .merge(crate::routes::cart_protected_router())
+        // Submitting a product review requires authentication
+        .merge(crate::routes::review_protected_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
         ));
 
-    // Admin routes (admin auth required)
+    // Accounting export routes (API key auth, exports scope required)
+    let accounting_routes = Router::new()
+        .merge(crate::routes::accounting_router())
+        .route_layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::routes::accounting::accounting_auth_middleware,
+        ));
+
+    // Admin routes (admin auth required).
+    // Note: admin_router() and the other admin routers already carry the
+    // "/admin" prefix in their route paths, so they are merged (not nested).
     let admin_routes = Router::new()
-        .nest("/admin", crate::routes::admin_router())
+        .merge(crate::routes::admin_router())
         .merge(crate::routes::product_admin_router())
+        .merge(crate::routes::review_admin_router())
         .merge(crate::routes::statistics_router())
         .merge(crate::routes::coupon_router())
         .route_layer(middleware::from_fn_with_state(app_state, admin_middleware));
@@ -903,6 +1041,7 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(accounting_routes)
         .merge(admin_routes)
 }
 

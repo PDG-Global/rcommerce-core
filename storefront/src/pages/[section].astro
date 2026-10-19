@@ -1,0 +1,21 @@
+---
+// Legacy top-level category URLs from the old WooCommerce site
+// (e.g. /wheels, /bearings) -> the canonical category page, unless the
+// brand maps the section to a specific target (e.g. an old landing page
+// that is now a single product's page).
+import { brand, content } from '../lib/brand';
+
+const { section } = Astro.params;
+
+const target = section ? content.sectionRedirects[section] : undefined;
+if (target) {
+  return Astro.redirect(target, 301);
+}
+
+const match = brand.menuCategories.find((c) => c.slug === section);
+if (match) {
+  return Astro.redirect(`/products/${match.slug}`, 301);
+}
+
+return new Response('Not found', { status: 404 });
+---

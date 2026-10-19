@@ -303,6 +303,9 @@ impl PaymentGateway for AliPayGateway {
                 .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
             payment_method: "alipay".to_string(),
             transaction_id: trade_response.trade_no.unwrap_or_default(),
+            client_secret: None,
+            card_brand: None,
+            card_last_four: None,
             captured_at: trade_response.send_pay_date.and_then(|d| {
                 chrono::NaiveDateTime::parse_from_str(&d, "%Y-%m-%d %H:%M:%S")
                     .ok()

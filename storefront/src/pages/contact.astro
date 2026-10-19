@@ -1,0 +1,11 @@
+---
+import { brand } from '../lib/brand';
+import { pageOverlay } from '../lib/brand/pageOverlays';
+
+// A store with a bespoke `<slug>-contact` page overlay serves /contact;
+// otherwise fall back to the generic /contact-us page.
+const Overlay = pageOverlay(`${brand.slug}-contact`);
+if (!Overlay) return Astro.redirect('/contact-us');
+---
+
+<Overlay />

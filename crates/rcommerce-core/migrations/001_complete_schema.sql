@@ -195,6 +195,8 @@ CREATE TABLE IF NOT EXISTS products (
     is_featured BOOLEAN NOT NULL DEFAULT false,
     seo_title VARCHAR(255),
     seo_description TEXT,
+    -- GTIN/UPC/EAN identifier (digits only, 8-14 chars); see migration 017
+    gtin VARCHAR(14),
     -- Subscription fields
     subscription_interval subscription_interval,
     subscription_interval_count INTEGER,
@@ -268,7 +270,7 @@ CREATE TABLE IF NOT EXISTS coupons (
 CREATE TABLE IF NOT EXISTS api_keys (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     customer_id UUID REFERENCES customers(id) ON DELETE CASCADE,
-    key_prefix VARCHAR(16) NOT NULL UNIQUE,
+    key_prefix VARCHAR(64) NOT NULL UNIQUE,
     key_hash VARCHAR(64) NOT NULL,
     name VARCHAR(100) NOT NULL DEFAULT 'API Key',
     scopes TEXT[] NOT NULL DEFAULT ARRAY['read'],
@@ -336,6 +338,8 @@ CREATE TABLE IF NOT EXISTS product_variants (
     weight_unit weight_unit,
     requires_shipping BOOLEAN NOT NULL DEFAULT true,
     is_active BOOLEAN NOT NULL DEFAULT true,
+    -- GTIN/UPC/EAN identifier for the variant SKU (digits only, 8-14 chars); see migration 018
+    gtin VARCHAR(14),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

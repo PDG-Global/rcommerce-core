@@ -1,0 +1,22 @@
+---
+import { brand, content } from '../lib/brand';
+import { pageOverlay } from '../lib/brand/pageOverlays';
+import GenericInfoPage from '../components/GenericInfoPage.astro';
+
+// Stores without an About page redirect to contact.
+if (!content.pages.about) return Astro.redirect('/contact-us');
+
+// Store-private overlay page if one exists, else the generic renderer.
+const Overlay = pageOverlay(`${brand.slug}-about`);
+---
+
+{Overlay ? <Overlay /> : (
+<GenericInfoPage
+  eyebrow="who we are"
+  title="About Us"
+  paragraphs={[
+    'This is a demo storefront running on rCommerce, a high-performance headless commerce platform.',
+    'Every store built on rCommerce gets its own branding, catalog, and content — everything you see here is data-driven.',
+  ]}
+/>
+)}

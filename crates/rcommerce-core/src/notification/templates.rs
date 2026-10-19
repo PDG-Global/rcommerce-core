@@ -45,6 +45,7 @@ impl NotificationTemplate {
             "low_stock_alert" => Ok(Self::low_stock_alert()),
             // HTML templates
             "order_confirmation_html" => Ok(Self::order_confirmation_html()),
+            "admin_new_order_html" => Ok(Self::admin_new_order_html()),
             "order_shipped_html" => Ok(Self::order_shipped_html()),
             "order_cancelled_html" => Ok(Self::order_cancelled_html()),
             "payment_successful_html" => Ok(Self::payment_successful_html()),
@@ -85,7 +86,34 @@ impl NotificationTemplate {
                 rendered = rendered.replace(&placeholder, value);
             }
 
-            Ok(Some(rendered))
+            let rendered = clean_unset_placeholders(&rendered);
+            Ok(Some(wrap_email_html(
+                &self.name,
+                &rendered,
+                &BrandingConfig::default(),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Render HTML wrapped in the brand shell with explicit branding
+    /// (config-aware callers use this; `render_html` uses the defaults).
+    pub fn render_html_with_brand(
+        &self,
+        variables: &TemplateVariables,
+        brand: &BrandingConfig,
+    ) -> Result<Option<String>> {
+        if let Some(ref html_template) = self.html_body {
+            let mut rendered = html_template.clone();
+
+            for (key, value) in variables.iter() {
+                let placeholder = format!("{{{{ {} }}}}", key);
+                rendered = rendered.replace(&placeholder, value);
+            }
+
+            let rendered = clean_unset_placeholders(&rendered);
+            Ok(Some(wrap_email_html(&self.name, &rendered, brand)))
         } else {
             Ok(None)
         }
@@ -107,11 +135,23 @@ impl NotificationTemplate {
     fn load_html_template(path: &str) -> Result<String> {
         match path {
             "invoice.html" => Ok(include_str!("templates/invoice.html").to_string()),
+            "order_confirmation.html" => {
+                Ok(include_str!("templates/order_confirmation.html").to_string())
+            }
             "order_shipped.html" => Ok(include_str!("templates/order_shipped.html").to_string()),
+            "admin_new_order.html" => {
+                Ok(include_str!("templates/admin_new_order.html").to_string())
+            }
             "payment_successful.html" => {
                 Ok(include_str!("templates/payment_successful.html").to_string())
             }
             "payment_failed.html" => Ok(include_str!("templates/payment_failed.html").to_string()),
+            "refund_processed.html" => {
+                Ok(include_str!("templates/refund_processed.html").to_string())
+            }
+            "order_cancelled.html" => {
+                Ok(include_str!("templates/order_cancelled.html").to_string())
+            }
             "subscription_created.html" => {
                 Ok(include_str!("templates/subscription_created.html").to_string())
             }
@@ -173,17 +213,21 @@ The R Commerce Team
             body: r#"
 Hello {{ customer_name }},
 
-Thank you for your order! Your order #{{ order_number }} has been confirmed.
+Thank you for your order! Your order {{ order_number }} has been confirmed.
 
 Order Details:
 ----------------
-Total: ${{ order_total }}
-Items: {{ item_count }}
+Subtotal: {{ subtotal }}
+{{ discount_line }}Shipping: {{ shipping_cost }}
+Tax: {{ tax }}
+Total: {{ order_total }}
+
+Your invoice is attached to this email as a PDF.
 
 We'll send you another email when your order ships.
 
 Best regards,
-The R Commerce Team
+The {{ company_name }} Team
         "#
             .to_string(),
             html_body: Some(
@@ -200,8 +244,12 @@ The R Commerce Team
                 "shipping_address".to_string(),
                 "billing_address".to_string(),
                 "subtotal".to_string(),
+                "discount_row".to_string(),
+                "discount_line".to_string(),
                 "shipping_cost".to_string(),
+                "shipping_method".to_string(),
                 "tax".to_string(),
+                "tax_row".to_string(),
                 "items".to_string(),
                 "company_name".to_string(),
                 "support_email".to_string(),
@@ -210,35 +258,9 @@ The R Commerce Team
     }
 
     fn get_default_html_template() -> String {
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Order Confirmation - R Commerce</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #f9fafb; margin: 0; padding: 20px; }
-        .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border: 1px solid #e5e7eb; }
-        .header { padding: 40px; text-align: center; border-bottom: 1px solid #f3f4f6; }
-        .content { padding: 40px; }
-        .footer { background-color: #0F0F0F; color: #9ca3af; padding: 40px; text-align: center; font-size: 12px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1 style="color: #EB4F27;">R COMMERCE</h1>
-        </div>
-        <div class="content">
-            <h1>Order Confirmed: {{ order_number }}</h1>
-            <p>Thank you for your order, {{ customer_name }}!</p>
-            <p><strong>Total:</strong> ${{ order_total }}</p>
-        </div>
-        <div class="footer">
-            <p>Questions? Contact us at <a href="mailto:{{ support_email }}">{{ support_email }}</a></p>
-            <p>© 2026 {{ company_name }}</p>
-        </div>
-    </div>
-</body>
-</html>"#.to_string()
+        r#"<h1 style="margin:0 0 8px 0;font-size:20px;line-height:1.3;color:#1a1a1a;">Order update</h1>
+<p style="margin:0;font-size:14px;line-height:1.6;color:#555555;">Hello {{ customer_name }}, your order {{ order_number }} has been updated.</p>
+<p style="margin:16px 0 0 0;font-size:14px;line-height:1.6;color:#555555;">Total: <strong style="color:#1a1a1a;">{{ order_total }}</strong></p>"#.to_string()
     }
 
     /// Order shipped template
@@ -248,17 +270,15 @@ The R Commerce Team
             name: "Order Shipped".to_string(),
             subject: "Your Order Has Shipped!".to_string(),
             body: r#"
-Great news! Your order #{{ order_number }} has been shipped.
+Hi {{ customer_name }},
 
-Tracking Information:
-{{#if tracking_number}}
+Great news! Your order {{ order_number }} has shipped.
+
 Tracking Number: {{ tracking_number }}
 Carrier: {{ carrier }}
-{{/if}}
-
-Estimated Delivery: {{ estimated_delivery }}
 
 Thank you for your business!
+{{ company_name }}
         "#
             .to_string(),
             html_body: None,
@@ -267,7 +287,6 @@ Thank you for your business!
                 "order_number".to_string(),
                 "tracking_number".to_string(),
                 "carrier".to_string(),
-                "estimated_delivery".to_string(),
             ],
         }
     }
@@ -311,7 +330,19 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "order_shipped_html".to_string(),
             name: "Order Shipped HTML".to_string(),
             subject: "Your Order Has Shipped: {{ order_number }}".to_string(),
-            body: "Your order has shipped.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Great news! Your order {{ order_number }} has shipped.
+
+Tracking Number: {{ tracking_number }}
+Carrier: {{ shipping_carrier }}
+
+Track your package: {{ tracking_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("order_shipped.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -324,7 +355,49 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
                 "tracking_number".to_string(),
                 "tracking_url".to_string(),
                 "shipping_carrier".to_string(),
-                "estimated_delivery".to_string(),
+                "company_name".to_string(),
+                "support_email".to_string(),
+            ],
+        }
+    }
+
+    /// Admin "new order" notification: branded like the customer confirmation,
+    /// with the customer identity and both address columns.
+    fn admin_new_order_html() -> Self {
+        Self {
+            id: "admin_new_order_html".to_string(),
+            name: "Admin New Order HTML".to_string(),
+            subject: "New order: {{ order_number }}".to_string(),
+            body: r#"
+New order {{ order_number }}
+
+Customer: {{ customer_name }} ({{ customer_email }})
+
+Order total: {{ order_total }}
+
+Shipping address:
+{{ shipping_address_text }}
+        "#
+            .to_string(),
+            html_body: Some(
+                Self::load_html_template("admin_new_order.html")
+                    .unwrap_or_else(|_| Self::get_default_html_template()),
+            ),
+            channel: crate::notification::NotificationChannel::Email,
+            variables: vec![
+                "order_number".to_string(),
+                "order_date".to_string(),
+                "order_total".to_string(),
+                "customer_name".to_string(),
+                "customer_email".to_string(),
+                "subtotal".to_string(),
+                "discount_row".to_string(),
+                "shipping_cost".to_string(),
+                "tax_row".to_string(),
+                "items".to_string(),
+                "shipping_address".to_string(),
+                "billing_address".to_string(),
+                "shipping_address_text".to_string(),
                 "company_name".to_string(),
                 "support_email".to_string(),
             ],
@@ -336,7 +409,19 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "order_cancelled_html".to_string(),
             name: "Order Cancelled HTML".to_string(),
             subject: "Order Cancelled: {{ order_number }}".to_string(),
-            body: "Your order has been cancelled.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your order {{ order_number }} has been cancelled.
+
+Reason: {{ cancellation_reason }}
+Refund Amount: {{ refund_amount }}
+
+If you have any questions, just reply to this email.
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("order_cancelled.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -359,7 +444,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "payment_successful_html".to_string(),
             name: "Payment Successful HTML".to_string(),
             subject: "Payment Confirmed: {{ order_number }}".to_string(),
-            body: "Your payment was successful.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your payment for order {{ order_number }} was successful.
+
+Amount: {{ amount }}
+Payment Method: {{ payment_method }}
+Payment Date: {{ payment_date }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("payment_successful.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -382,7 +478,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "payment_failed_html".to_string(),
             name: "Payment Failed HTML".to_string(),
             subject: "Payment Failed: {{ order_number }}".to_string(),
-            body: "Your payment failed.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+We couldn't process your payment of {{ amount }} for order {{ order_number }}.
+
+Error: {{ error_message }}
+
+Please try again: {{ retry_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("payment_failed.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -405,7 +512,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "refund_processed_html".to_string(),
             name: "Refund Processed HTML".to_string(),
             subject: "Refund Processed: {{ order_number }}".to_string(),
-            body: "Your refund has been processed.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your refund for order {{ order_number }} has been processed.
+
+Refund Amount: {{ refund_amount }}
+Refund Method: {{ refund_method }}
+Processing Time: {{ processing_time }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("refund_processed.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -428,7 +546,17 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "subscription_created_html".to_string(),
             name: "Subscription Created HTML".to_string(),
             subject: "Welcome to {{ plan_name }}".to_string(),
-            body: "Your subscription has been created.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your subscription to {{ plan_name }} is now active.
+
+Amount: {{ amount }} per {{ interval }}
+Next billing date: {{ next_billing_date }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("subscription_created.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -453,7 +581,19 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "subscription_renewal_html".to_string(),
             name: "Subscription Renewal HTML".to_string(),
             subject: "Subscription Renewed: {{ plan_name }}".to_string(),
-            body: "Your subscription has been renewed.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your subscription to {{ plan_name }} has been renewed.
+
+Amount: {{ amount }}
+Billing date: {{ billing_date }}
+Next billing date: {{ next_billing_date }}
+Invoice: {{ invoice_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("subscription_renewal.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -477,7 +617,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "subscription_cancelled_html".to_string(),
             name: "Subscription Cancelled HTML".to_string(),
             subject: "Subscription Cancelled: {{ plan_name }}".to_string(),
-            body: "Your subscription has been cancelled.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Your subscription to {{ plan_name }} has been cancelled.
+
+Cancellation date: {{ cancellation_date }}
+Access until: {{ access_until }}
+Reason: {{ reason }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("subscription_cancelled.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -501,7 +652,16 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "dunning_first_html".to_string(),
             name: "Dunning First HTML".to_string(),
             subject: "Payment Update Required: {{ order_number }}".to_string(),
-            body: "Please update your payment method.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+We were unable to process your payment of {{ amount }} for order {{ order_number }}.
+
+Please update your payment method to keep your order on track: {{ retry_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("dunning_first.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -525,7 +685,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "dunning_retry_html".to_string(),
             name: "Dunning Retry HTML".to_string(),
             subject: "Action Required: Payment Failed for {{ order_number }}".to_string(),
-            body: "Your payment failed again.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+We still couldn't process your payment of {{ amount }} for order {{ order_number }} (attempt {{ attempt_number }} of {{ max_attempts }}).
+
+Next retry date: {{ next_retry_date }}
+
+Please update your payment method: {{ update_payment_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("dunning_retry.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -550,7 +721,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "dunning_final_html".to_string(),
             name: "Dunning Final HTML".to_string(),
             subject: "Final Notice: Payment Required for {{ order_number }}".to_string(),
-            body: "Final notice for payment.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Final notice: your payment of {{ amount }} for order {{ order_number }} is still outstanding.
+
+Please pay by {{ final_date }} to avoid cancellation: {{ update_payment_url }}
+
+Questions? {{ contact_support_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("dunning_final.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -575,7 +757,17 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "welcome_html".to_string(),
             name: "Welcome HTML".to_string(),
             subject: "Welcome to {{ company_name }}!".to_string(),
-            body: "Welcome to our platform!".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+Welcome to {{ company_name }}! Your account is ready.
+
+Shop: {{ shop_url }}
+Sign in: {{ login_url }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("welcome.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -597,7 +789,18 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "password_reset_html".to_string(),
             name: "Password Reset HTML".to_string(),
             subject: "Password Reset Request".to_string(),
-            body: "Reset your password.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+We received a request to reset your password.
+
+Reset your password: {{ reset_url }}
+
+This link expires in {{ expires_in }}. If you didn't request this, you can ignore this email.
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("password_reset.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -619,7 +822,22 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
             id: "abandoned_cart_html".to_string(),
             name: "Abandoned Cart HTML".to_string(),
             subject: "You left something in your cart!".to_string(),
-            body: "Complete your purchase.".to_string(),
+            body: r#"
+Hi {{ customer_name }},
+
+You left something in your cart!
+
+Items:
+{{ cart_items }}
+
+Total: {{ cart_total }}
+
+Complete your order: {{ cart_url }}
+{{ discount_code }}
+
+{{ company_name }}
+        "#
+            .to_string(),
             html_body: Some(
                 Self::load_html_template("abandoned_cart.html")
                     .unwrap_or_else(|_| Self::get_default_html_template()),
@@ -640,6 +858,90 @@ Recommended Reorder Quantity: {{ reorder_quantity }}
 
 // TemplateVariables is defined in types.rs and re-exported from there
 pub use crate::notification::types::TemplateVariables;
+
+pub use crate::config::BrandingConfig;
+
+/// Shared brand settings for the email shell (legacy alias; prefer
+/// `BrandingConfig::default()`)
+pub const EMAIL_BRAND_NAME: &str = "rCommerce";
+pub const EMAIL_LOGO_URL: &str = "https://example.com/logo.png";
+pub const EMAIL_ACCENT_COLOR: &str = "#ff4d00";
+pub const EMAIL_SUPPORT_EMAIL: &str = "support@example.com";
+pub const EMAIL_SITE_URL: &str = "https://example.com";
+
+/// Remove any `{{ ... }}` placeholders that were not substituted.
+fn clean_unset_placeholders(rendered: &str) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    let mut rest = rendered;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("}}") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => {
+                rest = &rest[start..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Wrap a rendered template body fragment in the shared brand shell:
+/// logo header with accent border, 600px single-table layout, contact footer.
+/// Branding comes from `brand`; use `BrandingConfig::default()` for the
+/// built-in neutral (unbranded) identity.
+pub fn wrap_email_html(title: &str, body: &str, brand: &BrandingConfig) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f4f4;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f4f4f4;">
+  <tr>
+    <td align="center" style="padding:24px 12px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;background-color:#ffffff;border:1px solid #e6e6e6;">
+        <tr>
+          <td style="padding:24px 32px 18px 32px;border-bottom:3px solid {accent};">
+            <img src="{logo}" alt="{brand}" width="64" style="display:block;border:0;outline:none;text-decoration:none;max-height:64px;" />
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px 8px 32px;font-family:Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1a1a1a;">
+{body}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 32px 28px 32px;border-top:1px solid #eeeeee;font-family:Helvetica,Arial,sans-serif;font-size:12px;line-height:1.7;color:#888888;text-align:center;">
+            <p style="margin:0 0 4px 0;">Questions? <a href="mailto:{support}" style="color:{accent};text-decoration:none;">{support}</a> &nbsp;&middot;&nbsp; <a href="{site}" style="color:{accent};text-decoration:none;">{site_host}</a></p>
+            <p style="margin:0;">Payments are in USD. All sales are final.</p>
+            <p style="margin:4px 0 0 0;">&copy; 2026 {brand}</p>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>"#,
+        title = title,
+        accent = brand.accent_color,
+        logo = brand.logo_url,
+        brand = brand.name,
+        support = brand.support_email,
+        site = brand.site_url,
+        site_host = brand
+            .site_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/'),
+        body = body,
+    )
+}
 
 impl TemplateVariables {
     /// Add a key-value pair (convenience method for templates module)
@@ -686,9 +988,11 @@ impl TemplateVariables {
     }
 
     pub fn add_order_items(&mut self, items: &[crate::order::OrderItem]) {
-        // Create a simple items list for plain text emails
+        // Create a simple items list for plain text emails; bundle component
+        // lines ($0 stock-reservation rows) are internal only.
         let items_text = items
             .iter()
+            .filter(|item| item.is_bundle_component != Some(true))
             .map(|item| format!("{} x {} - ${}", item.quantity, item.name, item.price))
             .collect::<Vec<_>>()
             .join("\n");
@@ -821,8 +1125,46 @@ mod tests {
         let template = NotificationTemplate::load("order_confirmation_html").unwrap();
         assert!(template.html_body.is_some());
 
-        let html = template.html_body.unwrap();
-        assert!(html.contains("R COMMERCE"));
+        let html = template.html_body.as_ref().unwrap();
         assert!(html.contains("{{ order_number }}"));
+
+        // Rendering wraps the body fragment in the shared brand shell; the
+        // code-default brand is deliberately neutral (stores set [branding])
+        let rendered = template
+            .render_html(&TemplateVariables::new())
+            .unwrap()
+            .unwrap();
+        assert!(rendered.contains("Payments are in USD. All sales are final."));
+    }
+
+    #[test]
+    fn test_wrap_email_html_with_custom_brand() {
+        let brand = BrandingConfig {
+            name: "Custom Brand".to_string(),
+            support_email: "help@example.org".to_string(),
+            site_url: "https://example.org".to_string(),
+            logo_url: "https://example.org/images/logo.png".to_string(),
+            accent_color: "#0b6e4f".to_string(),
+        };
+        let html = wrap_email_html("Test", "<p>Hello</p>", &brand);
+        assert!(html.contains("https://example.org/images/logo.png"));
+        assert!(html.contains("help@example.org"));
+        assert!(html.contains("example.org"));
+        assert!(html.contains("#0b6e4f"));
+        assert!(html.contains("Custom Brand"));
+        // Default brand must not leak into a custom-branded shell
+        assert!(!html.contains("https://example.com/logo.png"));
+        assert!(html.contains(">example.org</a>"));
+        assert!(!html.contains("rCommerce"));
+    }
+
+    #[test]
+    fn test_clean_unset_placeholders() {
+        let html = "<p>Hi {{ name }},</p><p>{{ unset_thing }}</p>";
+        assert_eq!(clean_unset_placeholders(html), "<p>Hi ,</p><p></p>");
+        assert_eq!(
+            clean_unset_placeholders("no placeholders"),
+            "no placeholders"
+        );
     }
 }

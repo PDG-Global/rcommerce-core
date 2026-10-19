@@ -1,0 +1,22 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { brand } from '../../lib/brand';
+
+import Nav from '../../components/Nav.astro';
+import Footer from '../../components/Footer.astro';
+import RegisterForm from '../../islands/RegisterForm.tsx';
+---
+
+<Layout title={`Create Account | ${brand.titleSuffix}`}>
+  <Nav />
+  <main class="flex-1 py-16">
+    <div class="max-w-md mx-auto px-4 sm:px-6 lg:px-8">
+      <h1 class="text-3xl font-bold mb-8 text-center">Create Account</h1>
+      <RegisterForm client:load />
+      <p class="mt-6 text-center text-sm text-rcommerce-600">
+        Already have an account? <a href="/account/login" class="text-rcommerce-accent hover:underline">Sign in</a>
+      </p>
+    </div>
+  </main>
+  <Footer />
+</Layout>

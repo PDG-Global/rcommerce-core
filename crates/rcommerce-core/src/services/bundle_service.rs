@@ -211,7 +211,8 @@ impl BundleService {
                 p.subscription_min_cycles, p.subscription_max_cycles,
                 p.file_url, p.file_size, p.file_hash, p.download_limit,
                 p.license_key_enabled, p.download_expiry_days,
-                p.bundle_pricing_strategy, p.bundle_discount_percentage
+                p.bundle_pricing_strategy, p.bundle_discount_percentage,
+                p.gtin
             FROM bundle_components bc
             JOIN products p ON bc.component_product_id = p.id
             WHERE bc.bundle_product_id = $1
@@ -276,6 +277,7 @@ impl BundleService {
                 download_expiry_days: row.try_get("download_expiry_days")?,
                 bundle_pricing_strategy: row.try_get("bundle_pricing_strategy")?,
                 bundle_discount_percentage: row.try_get("bundle_discount_percentage")?,
+                gtin: row.try_get("gtin")?,
             };
 
             components.push(BundleComponentWithProduct {
@@ -412,6 +414,70 @@ impl BundleService {
         Ok(true)
     }
 
+    /// Sellable stock for a single bundle product (derived from components).
+    pub async fn available_stock(&self, bundle_product_id: Uuid) -> Result<i32> {
+        let own_stock =
+            sqlx::query_scalar::<_, i32>("SELECT inventory_quantity FROM products WHERE id = $1")
+                .bind(bundle_product_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .unwrap_or(0);
+
+        let components = self.get_bundle_components(bundle_product_id).await?;
+        let tuples: Vec<(i32, i32, bool)> = components
+            .iter()
+            .filter(|c| !c.component.is_optional)
+            .filter_map(|c| {
+                c.product.as_ref().map(|p| {
+                    (
+                        c.component.quantity,
+                        p.inventory_quantity,
+                        p.inventory_management,
+                    )
+                })
+            })
+            .collect();
+
+        Ok(derive_bundle_stock(&tuples, own_stock))
+    }
+
+    /// Derived sellable stock for many bundles in one query.
+    /// Bundles without managed required components are absent from the map;
+    /// callers fall back to the bundle's own static stock.
+    pub async fn available_stock_many(
+        &self,
+        bundle_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i32>> {
+        if bundle_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT bc.bundle_product_id,
+                   MIN(c.inventory_quantity / GREATEST(bc.quantity, 1))::int4 AS available
+            FROM bundle_components bc
+            JOIN products c ON bc.component_product_id = c.id
+            WHERE bc.bundle_product_id = ANY($1)
+              AND bc.is_optional = false
+              AND c.inventory_management = true
+            GROUP BY bc.bundle_product_id
+            "#,
+        )
+        .bind(bundle_ids)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut stock = std::collections::HashMap::new();
+        for row in rows {
+            let bundle_id: Uuid = row.try_get("bundle_product_id")?;
+            let available: i32 = row.try_get("available")?;
+            stock.insert(bundle_id, available);
+        }
+
+        Ok(stock)
+    }
+
     /// Update bundle product price based on strategy
     pub async fn update_bundle_price(&self, bundle_product_id: Uuid) -> Result<Product> {
         let bundle = sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = $1")
@@ -511,8 +577,70 @@ impl BundleService {
     }
 }
 
+/// Derive sellable stock for a bundle from its required components:
+/// the minimum over inventory-managed components of
+/// `floor(component_stock / component_qty)`. Components must already be
+/// filtered to required (non-optional) ones; each tuple is
+/// `(component_qty, component_stock, inventory_managed)`.
+/// Falls back to `own_stock` when no managed component qualifies.
+pub fn derive_bundle_stock(components: &[(i32, i32, bool)], own_stock: i32) -> i32 {
+    let per_component: Vec<i32> = components
+        .iter()
+        .filter(|(_, _, managed)| *managed)
+        .map(|(qty, stock, _)| stock.div_euclid(if *qty <= 0 { 1 } else { *qty }))
+        .collect();
+    if per_component.is_empty() {
+        own_stock
+    } else {
+        per_component.into_iter().min().unwrap_or(own_stock)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    // Tests would require a database connection
+    #[test]
+    fn test_derive_bundle_stock_normal_case() {
+        // Two required managed components: min(floor(10/2), floor(3/1)) = 3
+        let components = vec![(2, 10, true), (1, 3, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 3);
+    }
+
+    #[test]
+    fn test_derive_bundle_stock_zero_component_stock() {
+        let components = vec![(1, 0, true), (1, 50, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 0);
+    }
+
+    #[test]
+    fn test_derive_bundle_stock_empty_components_falls_back_to_own() {
+        let components: Vec<(i32, i32, bool)> = vec![];
+        assert_eq!(derive_bundle_stock(&components, 42), 42);
+    }
+
+    #[test]
+    fn test_derive_bundle_stock_zero_qty_guard() {
+        // qty <= 0 is treated as 1 to avoid division by zero
+        let components = vec![(0, 7, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 7);
+        let components = vec![(-3, 7, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 7);
+    }
+
+    #[test]
+    fn test_derive_bundle_stock_unmanaged_component_skipped() {
+        // Unmanaged components don't constrain stock; only managed ones left
+        let components = vec![(1, 0, false), (1, 5, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 5);
+        // All unmanaged -> fall back to own stock
+        let components = vec![(1, 0, false)];
+        assert_eq!(derive_bundle_stock(&components, 100), 100);
+    }
+
+    #[test]
+    fn test_derive_bundle_stock_uses_floor_division() {
+        let components = vec![(3, 10, true)];
+        assert_eq!(derive_bundle_stock(&components, 100), 3);
+    }
 }

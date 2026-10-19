@@ -14,7 +14,7 @@ use crate::payment::agnostic::*;
 use crate::Result;
 
 const AIRWALLEX_API_BASE_PROD: &str = "https://api.airwallex.com/api/v1";
-const AIRWALLEX_API_BASE_DEMO: &str = "https://api-demo.airwallex.com/api/v1";
+const AIRWALLEX_API_BASE_DEMO: &str = "https://api.sandbox.airwallex.com/api/v1";
 
 /// Airwallex Agnostic Gateway
 pub struct AirwallexAgnosticGateway {
@@ -250,16 +250,25 @@ impl AirwallexAgnosticGateway {
             order_id.to_string().split('-').next().unwrap_or("")
         );
 
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "order_id".to_string(),
+            serde_json::Value::String(order_id.to_string()),
+        );
+        if let Some(customer_id) = customer_id {
+            metadata.insert(
+                "customer_id".to_string(),
+                serde_json::Value::String(customer_id.to_string()),
+            );
+        }
+
         let payload = serde_json::json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "amount": amount_in_cents,
             "currency": currency,
             "descriptor": "R Commerce Payment",
             "merchant_order_id": merchant_order_id,
-            "metadata": {
-                "order_id": order_id.to_string(),
-                "customer_id": customer_id.map(|id| id.to_string()),
-            },
+            "metadata": metadata,
         });
 
         let response = self
@@ -272,18 +281,25 @@ impl AirwallexAgnosticGateway {
             .await
             .map_err(|e| crate::Error::network(format!("Airwallex API error: {}", e)))?;
 
-        if !response.status().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        if !status.is_success() {
             return Err(crate::Error::payment_error(format!(
-                "Airwallex error: {}",
-                error_text
+                "Airwallex error ({}): {}",
+                status, body
             )));
         }
 
-        let intent: AirwallexPaymentIntent = response.json().await.map_err(|e| {
+        let intent: AirwallexPaymentIntent = serde_json::from_str(&body).map_err(|e| {
+            tracing::error!(
+                "Failed to parse Airwallex intent response (HTTP {}): {} — body: {}",
+                status,
+                e,
+                body
+            );
             crate::Error::network(format!("Failed to parse Airwallex response: {}", e))
         })?;
 
@@ -542,18 +558,27 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
         payload: &[u8],
         headers: &[(String, String)],
     ) -> Result<WebhookEvent> {
-        // Extract signature from headers
+        // Extract signature from headers.
+        //
+        // Airwallex signs each webhook as HMAC-SHA256(secret, x-timestamp + raw_body)
+        // and sends the hex digest in the `x-signature` header; the send time (Unix
+        // ms) arrives in `x-timestamp`. See
+        // https://www.airwallex.com/docs/developer-tools/webhooks
         let signature = headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("X-Airwallex-Signature"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-signature"))
+            .map(|(_, v)| v.as_str());
 
         let timestamp = headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("X-Airwallex-Timestamp"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-timestamp"))
+            .map(|(_, v)| v.as_str());
+
+        let (Some(signature), Some(timestamp)) = (signature, timestamp) else {
+            return Err(crate::Error::validation(
+                "Missing x-signature or x-timestamp webhook header",
+            ));
+        };
 
         // Verify webhook signature using HMAC-SHA256
         use hmac::{Hmac, Mac};
@@ -561,10 +586,12 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
 
         type HmacSha256 = Hmac<Sha256>;
 
-        let message = format!("{}.{}", timestamp, String::from_utf8_lossy(payload));
+        // Signed message is the timestamp concatenated with the raw body
+        // (timestamp first, no separator).
         let mut mac = HmacSha256::new_from_slice(self.webhook_secret.as_bytes())
             .map_err(|e| crate::Error::validation(format!("Invalid webhook secret: {}", e)))?;
-        mac.update(message.as_bytes());
+        mac.update(timestamp.as_bytes());
+        mac.update(payload);
         let result = mac.finalize();
         let expected_signature = hex::encode(result.into_bytes());
 
@@ -791,7 +818,7 @@ impl AirwallexAgnosticGateway {
     ) -> Result<InitiatePaymentResponse> {
         match intent.status.as_str() {
             "SUCCEEDED" | "CAPTURED" => {
-                let _amount = Decimal::from(intent.amount) / dec!(100);
+                let _amount = Decimal::from_f64_retain(intent.amount);
                 let id = intent.id.clone();
                 Ok(InitiatePaymentResponse::Success {
                     payment_id: id.clone(),
@@ -908,10 +935,14 @@ struct AirwallexPaymentIntent {
     #[serde(rename = "client_secret")]
     client_secret: String,
     status: String,
-    amount: i64,
+    // Airwallex echoes amounts as JSON floats in major currency units
+    // regardless of the unit sent in the request.
+    amount: f64,
     currency: String,
     #[serde(default)]
-    metadata: std::collections::HashMap<String, String>,
+    // Airwallex echoes metadata back verbatim — keep this tolerant of any
+    // JSON value (e.g. nulls) since the echoed content is never read.
+    metadata: serde_json::Value,
     #[serde(default)]
     next_action: Option<serde_json::Value>,
 }
@@ -925,7 +956,9 @@ struct AirwallexRefund {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AirwallexWebhookEvent {
-    #[serde(rename = "type")]
+    /// Airwallex puts the event type in the `name` field; `type` is accepted
+    /// as an alias for compatibility with older payloads.
+    #[serde(rename = "name", alias = "type")]
     event_type: String,
     data: AirwallexWebhookData,
 }
@@ -980,7 +1013,9 @@ mod tests {
         );
 
         assert_eq!(gateway.client_id, "test_client_id");
-        assert!(gateway.base_url.contains("demo"));
+        // Demo mode targets the Airwallex sandbox API (the demo elements
+        // stack authenticates against sandbox, not the legacy api-demo host)
+        assert!(gateway.base_url.contains("sandbox"));
     }
 
     #[test]
@@ -1032,6 +1067,188 @@ mod tests {
         assert_eq!(
             AirwallexAgnosticGateway::map_refund_status("FAILED"),
             RefundStatus::Failed
+        );
+    }
+
+    /// Compute the value Airwallex would send in the `x-signature` header:
+    /// hex(HMAC-SHA256(secret, timestamp + raw_body)).
+    fn airwallex_signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn test_gateway() -> AirwallexAgnosticGateway {
+        AirwallexAgnosticGateway::new(
+            "test_client_id".to_string(),
+            "test_api_key".to_string(),
+            "test_webhook_secret".to_string(),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_webhook_verifies_real_airwallex_scheme() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "id": "evt_123",
+            "name": "payment_intent.succeeded",
+            "data": { "object": { "id": "int_xxx", "status": "SUCCEEDED" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let event = gateway
+            .handle_webhook(body.as_bytes(), &headers)
+            .await
+            .expect("webhook should verify");
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentSucceeded);
+        assert_eq!(event.payment_id, "int_xxx");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_accepts_legacy_type_field() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "id": "evt_124",
+            "type": "payment_intent.failed",
+            "data": { "object": { "id": "int_yyy", "status": "FAILED" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("X-Timestamp".to_string(), timestamp.to_string()),
+            ("X-Signature".to_string(), signature),
+        ];
+
+        let event = gateway
+            .handle_webhook(body.as_bytes(), &headers)
+            .await
+            .expect("webhook should verify");
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentFailed);
+        assert_eq!(event.payment_id, "int_yyy");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_rejects_tampered_body() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "payment_intent.succeeded",
+            "data": { "object": { "id": "int_xxx", "status": "SUCCEEDED" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let tampered = body.replace("int_xxx", "int_evil");
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let result = gateway.handle_webhook(tampered.as_bytes(), &headers).await;
+        assert!(result.is_err(), "tampered body must fail verification");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_rejects_wrong_secret() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "payment_intent.succeeded",
+            "data": { "object": { "id": "int_xxx", "status": "SUCCEEDED" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("wrong_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let result = gateway.handle_webhook(body.as_bytes(), &headers).await;
+        assert!(result.is_err(), "signature from wrong secret must fail");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_rejects_missing_headers() {
+        let gateway = test_gateway();
+        let body = serde_json::json!({
+            "name": "payment_intent.succeeded",
+            "data": { "object": { "id": "int_xxx", "status": "SUCCEEDED" } }
+        })
+        .to_string();
+
+        let result = gateway.handle_webhook(body.as_bytes(), &[]).await;
+        assert!(result.is_err(), "missing signature headers must fail");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_refund_succeeded_maps_transaction_id() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "refund.succeeded",
+            "data": {
+                "object": {
+                    "id": "ref_zzz",
+                    "payment_intent_id": "int_xxx",
+                    "status": "SUCCEEDED"
+                }
+            }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let event = gateway
+            .handle_webhook(body.as_bytes(), &headers)
+            .await
+            .expect("refund webhook should verify");
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentRefunded);
+        assert_eq!(event.payment_id, "ref_zzz");
+        assert_eq!(event.transaction_id.as_deref(), Some("int_xxx"));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_rejects_unsupported_event() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "payment_consent.verified",
+            "data": { "object": { "id": "pc_123" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let result = gateway.handle_webhook(body.as_bytes(), &headers).await;
+        assert!(
+            result.is_err(),
+            "unsupported event types should be rejected"
         );
     }
 }

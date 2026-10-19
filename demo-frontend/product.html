@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Product - R Commerce Demo</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <nav class="nav">
+                <a href="index.html" class="logo">R Commerce</a>
+                <div class="nav-links">
+                    <a href="index.html" class="nav-link">Products</a>
+                    <a href="cart.html" class="nav-link cart-link">
+                        Cart
+                        <span class="cart-count" id="cartCount">0</span>
+                    </a>
+                    <span id="authSection">
+                        <a href="#" class="nav-link" onclick="showLoginModal(); return false;">Login</a>
+                        <a href="#" class="nav-link" onclick="showRegisterModal(); return false;">Register</a>
+                    </span>
+                </div>
+            </nav>
+        </div>
+    </header>
+
+    <main class="main">
+        <section class="product-detail">
+            <div class="container">
+                <div id="productDetail">
+                    <p class="loading">Loading product...</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="container">
+            <p>R Commerce Demo - Built with vanilla HTML/JS</p>
+        </div>
+    </footer>
+
+    <!-- Login Modal -->
+    <div id="loginModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideModal('loginModal')">&times;</span>
+            <h2>Login</h2>
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label for="loginEmail">Email</label>
+                    <input type="email" id="loginEmail" required placeholder="your@email.com">
+                </div>
+                <div class="form-group">
+                    <label for="loginPassword">Password</label>
+                    <input type="password" id="loginPassword" required placeholder="••••••••">
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">Login</button>
+            </form>
+            <p style="text-align: center; margin-top: 1rem;">
+                Don't have an account? 
+                <a href="#" onclick="hideModal('loginModal'); showRegisterModal(); return false;">Register</a>
+            </p>
+        </div>
+    </div>
+
+    <!-- Register Modal -->
+    <div id="registerModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideModal('registerModal')">&times;</span>
+            <h2>Create Account</h2>
+            <form id="registerForm" onsubmit="handleRegister(event)">
+                <div class="form-group">
+                    <label for="regFirstName">First Name</label>
+                    <input type="text" id="regFirstName" required placeholder="John">
+                </div>
+                <div class="form-group">
+                    <label for="regLastName">Last Name</label>
+                    <input type="text" id="regLastName" required placeholder="Doe">
+                </div>
+                <div class="form-group">
+                    <label for="regEmail">Email</label>
+                    <input type="email" id="regEmail" required placeholder="your@email.com">
+                </div>
+                <div class="form-group">
+                    <label for="regPassword">Password</label>
+                    <input type="password" id="regPassword" required placeholder="••••••••" minlength="8">
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">Create Account</button>
+            </form>
+            <p style="text-align: center; margin-top: 1rem;">
+                Already have an account? 
+                <a href="#" onclick="hideModal('registerModal'); showLoginModal(); return false;">Login</a>
+            </p>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script src="auth.js"></script>
+    <script>
+        async function loadProduct() {
+            const params = new URLSearchParams(window.location.search);
+            const productId = params.get('id');
+            
+            if (!productId) {
+                window.location.href = 'index.html';
+                return;
+            }
+
+            const container = document.getElementById('productDetail');
+            
+            // Check authentication first
+            if (!isAuthenticated()) {
+                container.innerHTML = `
+                    <div class="auth-required">
+                        <p>Please login to view product details</p>
+                        <button class="btn btn-primary" onclick="showLoginModal()">Login</button>
+                    </div>`;
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/products/${productId}`, {
+                    headers: {
+                        'Authorization': `Bearer ${getToken()}`
+                    }
+                });
+                
+                if (response.status === 401) {
+                    logout();
+                    container.innerHTML = `
+                        <div class="auth-required">
+                            <p>Session expired. Please login again.</p>
+                            <button class="btn btn-primary" onclick="showLoginModal()">Login</button>
+                        </div>`;
+                    return;
+                }
+                
+                if (!response.ok) {
+                    throw new Error('Product not found');
+                }
+                
+                const data = await response.json();
+                const product = data.product || data.data || data;
+                
+                container.innerHTML = `
+                    <div class="product-detail-grid">
+                        <div class="product-detail-image">${getEmoji(product.title)}</div>
+                        <div class="product-detail-info">
+                            <h1>${escape(product.title)}</h1>
+                            <p class="product-detail-price">$${parseFloat(product.price).toFixed(2)}</p>
+                            <p class="product-detail-description">${escape(product.description)}</p>
+                            
+                            <div class="quantity-selector">
+                                <button class="quantity-btn" onclick="changeQty(-1)">-</button>
+                                <input type="number" class="quantity-input" id="qty" value="1" min="1">
+                                <button class="quantity-btn" onclick="changeQty(1)">+</button>
+                            </div>
+                            
+                            <button class="btn btn-primary" onclick="addCurrentProduct()" style="width: 100%;">
+                                Add to Cart
+                            </button>
+                            
+                            <a href="index.html" class="btn btn-secondary" style="width: 100%; margin-top: 1rem;">
+                                Back to Products
+                            </a>
+                        </div>
+                    </div>
+                `;
+                
+                window.currentProduct = product;
+            } catch (error) {
+                container.innerHTML = `
+                    <div class="error-message">
+                        <p>Product not found.</p>
+                        <a href="index.html" class="btn btn-primary">Back to Products</a>
+                    </div>
+                `;
+            }
+        }
+        
+        function changeQty(delta) {
+            const input = document.getElementById('qty');
+            const newVal = parseInt(input.value) + delta;
+            if (newVal >= 1) input.value = newVal;
+        }
+        
+        function addCurrentProduct() {
+            const qty = parseInt(document.getElementById('qty').value);
+            const p = window.currentProduct;
+            addToCart(p.id, p.title, p.price, qty);
+        }
+
+        async function handleLogin(event) {
+            event.preventDefault();
+            const email = document.getElementById('loginEmail').value;
+            const password = document.getElementById('loginPassword').value;
+            await login(email, password);
+        }
+
+        async function handleRegister(event) {
+            event.preventDefault();
+            const customerData = {
+                first_name: document.getElementById('regFirstName').value,
+                last_name: document.getElementById('regLastName').value,
+                email: document.getElementById('regEmail').value,
+                password: document.getElementById('regPassword').value
+            };
+            await register(customerData);
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            initCart();
+            updateAuthUI();
+            loadProduct();
+        });
+    </script>
+</body>
+</html>

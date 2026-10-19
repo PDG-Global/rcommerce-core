@@ -5,7 +5,8 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,11 +15,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::state::AppState;
-use rcommerce_core::config::TlsConfig;
+use rcommerce_core::config::{RateLimitConfig, TlsConfig};
 use rcommerce_core::services::AuthService;
 
 pub mod api_key_auth;
 pub mod scopes;
+pub mod wc_auth;
 
 pub use api_key_auth::{
     api_key_auth_middleware, combined_auth_middleware, ApiKeyAuth, AuthContext, JwtAuth,
@@ -206,15 +208,155 @@ pub async fn optional_auth_middleware(
     next.run(request).await
 }
 
-/// Rate limiting middleware
+/// Outcome of a rate limit check for a single client
+pub enum RateLimitCheck {
+    /// Request allowed; carries the number of requests remaining in the window
+    Allowed(u32),
+    /// Client IP is on the blocklist
+    Blocked,
+    /// Rate limit exceeded; carries the seconds until the client may retry
+    Limited(u64),
+}
+
+/// In-memory sliding-window rate limiter (per client IP)
+///
+/// Tracks request timestamps per client key over a fixed window and rejects
+/// requests once `max_requests` have been recorded within the window.
+/// Not shared across server instances; see `[rate_limiting] use_redis` in the
+/// configuration for the distributed variant (not yet implemented).
+#[derive(Clone)]
+pub struct RateLimiter {
+    max_requests: u32,
+    window: Duration,
+    allowlist: Vec<String>,
+    blocklist: Vec<String>,
+    expose_headers: bool,
+    store: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+impl RateLimiter {
+    /// Create a limiter from the `[rate_limiting]` configuration section
+    pub fn new(config: &RateLimitConfig) -> Self {
+        Self {
+            max_requests: config.requests_per_minute.max(1),
+            window: Duration::from_secs(60),
+            allowlist: config.allowlist.clone(),
+            blocklist: config.blocklist.clone(),
+            expose_headers: config.expose_headers,
+            store: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Max requests allowed per window (for X-RateLimit-Limit header)
+    pub fn max_requests(&self) -> u32 {
+        self.max_requests
+    }
+
+    /// Whether to expose X-RateLimit-* headers on responses
+    pub fn expose_headers(&self) -> bool {
+        self.expose_headers
+    }
+
+    /// Check whether a request from `key` (a client IP) is allowed
+    pub async fn check(&self, key: &str) -> RateLimitCheck {
+        if self.blocklist.iter().any(|ip| ip == key) {
+            return RateLimitCheck::Blocked;
+        }
+        if self.allowlist.iter().any(|ip| ip == key) {
+            return RateLimitCheck::Allowed(self.max_requests);
+        }
+
+        let mut store = self.store.lock().await;
+        let now = Instant::now();
+
+        let timestamps = store.entry(key.to_string()).or_default();
+        timestamps.retain(|t| now.duration_since(*t) < self.window);
+
+        if timestamps.len() as u32 >= self.max_requests {
+            let oldest = timestamps[0];
+            let retry_after = self
+                .window
+                .saturating_sub(now.duration_since(oldest))
+                .as_secs()
+                + 1;
+            return RateLimitCheck::Limited(retry_after);
+        }
+
+        timestamps.push(now);
+        RateLimitCheck::Allowed(self.max_requests - timestamps.len() as u32)
+    }
+
+    /// Drop entries with no activity inside the current window
+    pub async fn cleanup(&self) {
+        let mut store = self.store.lock().await;
+        let now = Instant::now();
+        store.retain(|_, timestamps| {
+            timestamps.retain(|t| now.duration_since(*t) < self.window);
+            !timestamps.is_empty()
+        });
+    }
+}
+
+/// Resolve the client IP, honoring X-Forwarded-For when behind a reverse proxy
+fn client_ip(request: &Request<Body>) -> String {
+    let addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+    request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string())
+}
+
+/// Rate limiting middleware - enforces the `[rate_limiting]` config per client IP
 pub async fn rate_limit_middleware(
-    State(_state): State<AppState>,
+    State(limiter): State<RateLimiter>,
     request: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
-    // TODO: Implement proper rate limiting with Redis
-    // For now, pass through all requests
-    Ok(next.run(request).await)
+) -> Response {
+    let ip = client_ip(&request);
+
+    match limiter.check(&ip).await {
+        RateLimitCheck::Allowed(remaining) => {
+            let mut response = next.run(request).await;
+            if limiter.expose_headers() {
+                let headers = response.headers_mut();
+                if let Ok(v) = HeaderValue::from_str(&limiter.max_requests().to_string()) {
+                    headers.insert("X-RateLimit-Limit", v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
+                    headers.insert("X-RateLimit-Remaining", v);
+                }
+            }
+            response
+        }
+        RateLimitCheck::Blocked => {
+            tracing::warn!("Rate limiter: blocked IP attempted access: {}", ip);
+            StatusCode::FORBIDDEN.into_response()
+        }
+        RateLimitCheck::Limited(retry_after) => {
+            tracing::warn!("Rate limit exceeded for IP: {}", ip);
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after": retry_after,
+                })),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert("Retry-After", v);
+            }
+            response
+        }
+    }
 }
 
 /// Admin-only middleware
@@ -307,4 +449,112 @@ pub async fn security_headers_middleware(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(requests_per_minute: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            requests_per_minute,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_within_limit() {
+        let limiter = RateLimiter::new(&test_config(3));
+
+        let mut remaining_expectations = [2u32, 1, 0];
+        for expected in remaining_expectations.iter_mut() {
+            match limiter.check("10.0.0.1").await {
+                RateLimitCheck::Allowed(remaining) => assert_eq!(remaining, *expected),
+                RateLimitCheck::Blocked => panic!("expected Allowed, got Blocked"),
+                RateLimitCheck::Limited(_) => panic!("expected Allowed, got Limited"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_blocks_over_limit() {
+        let limiter = RateLimiter::new(&test_config(2));
+
+        assert!(matches!(
+            limiter.check("10.0.0.1").await,
+            RateLimitCheck::Allowed(_)
+        ));
+        assert!(matches!(
+            limiter.check("10.0.0.1").await,
+            RateLimitCheck::Allowed(_)
+        ));
+        match limiter.check("10.0.0.1").await {
+            RateLimitCheck::Limited(retry_after) => {
+                assert!(retry_after > 0 && retry_after <= 60);
+            }
+            _ => panic!("expected Limited"),
+        }
+
+        // A different IP is not affected
+        assert!(matches!(
+            limiter.check("10.0.0.2").await,
+            RateLimitCheck::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_blocklist_and_allowlist() {
+        let config = RateLimitConfig {
+            requests_per_minute: 1,
+            blocklist: vec!["192.0.2.1".to_string()],
+            allowlist: vec!["192.0.2.2".to_string()],
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(&config);
+
+        assert!(matches!(
+            limiter.check("192.0.2.1").await,
+            RateLimitCheck::Blocked
+        ));
+
+        // Allowlisted IP is never limited, even past the request limit
+        assert!(matches!(
+            limiter.check("192.0.2.2").await,
+            RateLimitCheck::Allowed(_)
+        ));
+        assert!(matches!(
+            limiter.check("192.0.2.2").await,
+            RateLimitCheck::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_cleanup() {
+        let limiter = RateLimiter::new(&test_config(1));
+
+        assert!(matches!(
+            limiter.check("10.0.0.1").await,
+            RateLimitCheck::Allowed(_)
+        ));
+        assert_eq!(limiter.store.lock().await.len(), 1);
+
+        // Simulate an expired window by backdating the stored timestamp
+        {
+            let mut store = limiter.store.lock().await;
+            store
+                .get_mut("10.0.0.1")
+                .unwrap()
+                .iter_mut()
+                .for_each(|t| *t = *t - Duration::from_secs(120));
+        }
+
+        limiter.cleanup().await;
+        assert_eq!(limiter.store.lock().await.len(), 0);
+
+        // IP can request again after cleanup
+        assert!(matches!(
+            limiter.check("10.0.0.1").await,
+            RateLimitCheck::Allowed(_)
+        ));
+    }
 }

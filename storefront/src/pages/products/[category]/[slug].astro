@@ -1,0 +1,507 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import Nav from '../../../components/Nav.astro';
+import Footer from '../../../components/Footer.astro';
+import AddToCartButton from '../../../islands/AddToCartButton.tsx';
+import ProductCard from '../../../components/ProductCard.astro';
+import StarRating from '../../../components/StarRating.astro';
+import ProductReviews from '../../../islands/ProductReviews.tsx';
+import type { PackOption, Product, ReviewSummary } from '../../../lib/types';
+import { API_BASE } from '../../../lib/api';
+import { productUrl } from '../../../lib/url';
+import { brand, content } from '../../../lib/brand';
+import { stripHtml, stripHtmlTruncated } from '../../../lib/html';
+
+const { slug } = Astro.params;
+let product: Product | null = null;
+let related: Product[] = [];
+let reviewSummary: ReviewSummary | null = null;
+let packOptions: PackOption[] = [];
+let error: string | null = null;
+
+try {
+  const res = await fetch(`${API_BASE}/products/${slug}`);
+  if (!res.ok) throw new Error(`API returned ${res.status}`);
+  const data = await res.json();
+  // The API answers 200 with {"error": ...} for missing/inactive products.
+  product = data.product ?? null;
+} catch (e: any) {
+  error = e.message || 'Failed to load product';
+}
+
+// Missing or inactive product: redirect merged/discontinued slugs, else 404.
+if (!product || product.is_active === false) {
+  const target = slug ? content.productRedirects[slug] : undefined;
+  if (target) return Astro.redirect(target, 301);
+  return new Response('Not found', { status: 404 });
+}
+
+// Stores that sell variants as distinct configurations (e.g. a deck as
+// "deck only" vs "complete") can pre-select a sensible default variant
+// (title match, falling back to the cheapest) instead of forcing an explicit
+// choice on every visit. Enabled per store via the brand config flag.
+const defaultVariantId =
+  brand.autoSelectDefaultVariant && product.variants.length > 0
+    ? (product.variants.find((v) => /deck/i.test(v.title) && !/complete/i.test(v.title)) ??
+       product.variants.reduce((a, b) => (parseFloat(a.price) <= parseFloat(b.price) ? a : b))).id
+    : undefined;
+
+if (product) {
+  try {
+    const res = await fetch(`${API_BASE}/products`);
+    if (res.ok) {
+      const data = await res.json();
+      related = (data.products || [])
+        .filter((p: Product) => p.is_active && p.product_type !== 'bundle' && p.slug !== product!.slug)
+        .slice(0, 4);
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/products/${product.id}/pack-options`);
+    if (res.ok) {
+      const data = await res.json();
+      packOptions = data.options || [];
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/products/${product.id}/reviews`);
+    if (res.ok) {
+      reviewSummary = await res.json();
+    }
+  } catch {
+    // ignore
+  }
+}
+
+const images = product?.images ?? [];
+const outOfStock = (product?.inventory_quantity ?? 0) <= 0;
+const onSale =
+  !!product?.compare_at_price &&
+  parseFloat(product.compare_at_price) > parseFloat(product.price);
+const productImage = product?.images?.[0]?.src;
+const primaryCategory = product?.categories?.[0];
+const seoDescription = product
+  ? stripHtmlTruncated(product.seo_description || product.description, 160) || undefined
+  : undefined;
+// Merchant listings require a description — generate one from title/brand/
+// catalog line when the product carries no usable copy at all.
+const jsonLdDescription = product
+  ? stripHtmlTruncated(product.description || product.seo_description, 5000) ||
+    `Buy ${stripHtml(product.title)} at ${brand.name}. ${primaryCategory?.name ?? content.catalog.line}.`
+  : undefined;
+const seoUrl = product ? `${Astro.url.origin}${productUrl(product)}` : undefined;
+
+const averageRating = reviewSummary?.average_rating ?? 0;
+const totalReviews = reviewSummary?.total_reviews ?? 0;
+
+const specRows: [string, string][] = [];
+if (product) {
+  if (product.sku) specRows.push(['SKU', product.sku]);
+  if (product.weight && parseFloat(product.weight) > 0) {
+    specRows.push(['Weight', `${product.weight} ${product.weight_unit || 'kg'}`]);
+  }
+  for (const option of product.options ?? []) {
+    const values = [...new Set(option.values.map((v) => v.value))];
+    if (values.length > 0) specRows.push([option.name, values.join(', ')]);
+  }
+}
+---
+
+<Layout
+  title={product ? product.title : 'Product'}
+  description={seoDescription}
+  image={productImage}
+  url={seoUrl}
+  type="product"
+>
+  {product && (
+    <Fragment slot="head">
+      <script type="application/ld+json" set:html={JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'Product',
+        name: stripHtml(product.title),
+        description: jsonLdDescription,
+        image: productImage,
+        url: seoUrl,
+        sku: product.sku,
+        // Google's merchant listings want a global identifier: emit the GTIN
+        // under its length-specific key when the catalog carries one, else
+        // the SKU doubles as the manufacturer part number.
+        ...(() => {
+          const gtin = (product.gtin ?? '').replace(/\D/g, '');
+          const key = gtin.length === 8 ? 'gtin8' : gtin.length === 12 ? 'gtin12' : gtin.length === 13 ? 'gtin13' : gtin.length === 14 ? 'gtin14' : null;
+          return key ? { [key]: gtin } : {};
+        })(),
+        ...(product.sku && { mpn: product.sku }),
+        brand: {
+          '@type': 'Brand',
+          name: brand.name,
+        },
+        offers: {
+          '@type': 'Offer',
+          url: seoUrl,
+          priceCurrency: product.currency,
+          price: product.price,
+          availability: outOfStock ? 'https://schema.org/OutOfStock' : 'https://schema.org/InStock',
+          itemCondition: 'https://schema.org/NewCondition',
+          // Merchant-listings requirements: shipping destinations/rates from
+          // the store's real carrier zones, plus the returns policy.
+          shippingDetails: content.seo.shipping.map((dest) => ({
+            '@type': 'OfferShippingDetails',
+            shippingDestination: {
+              '@type': 'DefinedRegion',
+              addressCountry: dest.country,
+            },
+            shippingRate: {
+              '@type': 'MonetaryAmount',
+              value: dest.price,
+              currency: product.currency,
+            },
+            deliveryTime: {
+              '@type': 'ShippingDeliveryTime',
+              handlingTime: {
+                '@type': 'QuantitativeValue',
+                value: 1,
+                unitCode: 'DAY',
+              },
+              transitTime: {
+                '@type': 'QuantitativeValue',
+                minValue: 5,
+                maxValue: 14,
+                unitCode: 'DAY',
+              },
+            },
+          })),
+          hasMerchantReturnPolicy: {
+            '@type': 'MerchantReturnPolicy',
+            applicableCountry: content.seo.shipping.map((d) => d.country),
+            returnPolicyCategory: 'https://schema.org/MerchantReturnFiniteReturnWindow',
+            merchantReturnDays: content.seo.returnDays,
+            returnMethod: 'https://schema.org/ReturnByMail',
+            returnFees: content.seo.returnFees,
+          },
+        },
+        ...(totalReviews > 0 && {
+          aggregateRating: {
+            '@type': 'AggregateRating',
+            ratingValue: Math.round(averageRating * 10) / 10,
+            bestRating: 5,
+            worstRating: 1,
+            reviewCount: totalReviews,
+          },
+          review: (reviewSummary?.reviews ?? []).slice(0, 5).map((r) => ({
+            '@type': 'Review',
+            author: { '@type': 'Person', name: r.author_name },
+            datePublished: r.created_at,
+            ...(r.title && { name: r.title }),
+            reviewBody: stripHtml(r.content),
+            reviewRating: {
+              '@type': 'Rating',
+              ratingValue: r.rating,
+              bestRating: 5,
+              worstRating: 1,
+            },
+          })),
+        }),
+        ...(primaryCategory && {
+          category: primaryCategory.name,
+        }),
+      })} />
+    </Fragment>
+  )}
+  <Nav />
+  <main class="flex-1">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+      {error && (
+        <div class="p-4 bg-rcommerce-danger/10 text-rcommerce-danger">{error}</div>
+      )}
+
+      {product && (
+        <>
+          <nav class="text-sm text-rcommerce-500 mb-8" aria-label="Breadcrumb">
+            <a href="/" class="hover:text-rcommerce-accent">Home</a>
+            <span class="mx-2">/</span>
+            <a href="/products" class="hover:text-rcommerce-accent">Products</a>
+            {primaryCategory && (
+              <>
+                <span class="mx-2">/</span>
+                <a href={`/products/${primaryCategory.slug}`} class="hover:text-rcommerce-accent">{primaryCategory.name}</a>
+              </>
+            )}
+            <span class="mx-2">/</span>
+            <span class="text-rcommerce-900">{product.title}</span>
+          </nav>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-10 lg:gap-16" data-product={JSON.stringify(product)}>
+            <div>
+              <div
+                id="product-gallery"
+                class="aspect-square bg-rcommerce-100 overflow-hidden relative cursor-zoom-in"
+                data-gallery={JSON.stringify(images.map((img) => ({ src: img.src, alt: img.alt_text || product.title })))}
+              >
+                {images.length > 0 ? (
+                  <img
+                    id="main-product-image"
+                    data-index="0"
+                    src={images[0].src}
+                    alt={images[0].alt_text || product.title}
+                    class="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div class="w-full h-full flex items-center justify-center text-rcommerce-400">No image</div>
+                )}
+                {images.length > 0 && (
+                  <span
+                    aria-hidden="true"
+                    class="absolute bottom-4 right-4 w-10 h-10 bg-white/90 flex items-center justify-center text-rcommerce-900 pointer-events-none"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="8" />
+                      <path d="m21 21-4.3-4.3" />
+                      <path d="M11 8v6M8 11h6" />
+                    </svg>
+                  </span>
+                )}
+                {outOfStock && (
+                  <span class="absolute top-4 left-4 bg-rcommerce-900 text-white text-[11px] font-semibold uppercase tracking-button px-3 py-1.5">
+                    Sold out
+                  </span>
+                )}
+                {onSale && !outOfStock && (
+                  <span class="absolute top-4 left-4 bg-rcommerce-highlight text-rcommerce-900 text-[11px] font-semibold uppercase tracking-button px-3 py-1.5">
+                    On sale
+                  </span>
+                )}
+              </div>
+              {images.length > 1 && (
+                <div class="mt-4 grid grid-cols-5 gap-3">
+                  {images.slice(0, 5).map((img, i) => (
+                    <button
+                      type="button"
+                      data-thumb={img.src}
+                      class={`aspect-square bg-rcommerce-100 overflow-hidden border-2 transition-colors ${i === 0 ? 'border-rcommerce-900' : 'border-transparent hover:border-rcommerce-300'}`}
+                    >
+                      <img src={img.src} alt={img.alt_text || `${product.title} ${i + 1}`} class="w-full h-full object-cover" loading="lazy" />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div class="flex flex-col">
+              <h1 class="font-serif text-3xl md:text-4xl font-semibold text-rcommerce-900 leading-tight">{product.title}</h1>
+
+              <div class="mt-4 flex items-baseline gap-4">
+                <span id="product-price" class="font-serif text-2xl text-rcommerce-900">
+                  {product.currency} {product.price}
+                </span>
+                {onSale && (
+                  <span id="product-compare-price" class="text-lg text-rcommerce-400 line-through">
+                    {product.currency} {product.compare_at_price}
+                  </span>
+                  )}
+              </div>
+
+              {totalReviews > 0 && (
+                <a href="#reviews" class="mt-2 inline-flex items-center gap-1.5 text-sm text-rcommerce-600 hover:text-rcommerce-accent transition-colors">
+                  <StarRating rating={averageRating} size={14} />
+                  <span class="sr-only">Rated {averageRating} out of 5. </span>
+                  <span data-review-average>{averageRating.toFixed(1)}</span>
+                  <span class="text-rcommerce-400">·</span>
+                  <span class="link-underline">
+                    <span data-review-count>{totalReviews}</span> {totalReviews === 1 ? 'review' : 'reviews'}
+                  </span>
+                </a>
+              )}
+
+              {/* Short description (imported from WooCommerce short_description) leads,
+                  full description (which may hold FAQ content) follows below it. */}
+              {product.seo_description && (
+                <div class="mt-6 text-[15px] text-rcommerce-600 leading-relaxed prose max-w-none" set:html={product.seo_description}></div>
+              )}
+              {product.description && stripHtml(product.description) && (
+                <div class:list={["text-[15px] text-rcommerce-600 leading-relaxed prose max-w-none", product.seo_description ? 'mt-6 pt-6 border-t border-rcommerce-200' : 'mt-6']} set:html={product.description}></div>
+              )}
+
+              <AddToCartButton product={product} disabled={outOfStock} packOptions={packOptions} defaultVariantId={defaultVariantId} client:load />
+
+              <div class="mt-8 pt-6 border-t border-rcommerce-200 space-y-1.5 text-sm text-rcommerce-500">
+                <p><span class="text-rcommerce-900 font-medium">SKU:</span> {product.sku || 'N/A'}</p>
+                <p>
+                  <span class="text-rcommerce-900 font-medium">Availability:</span>{' '}
+                  {product.inventory_quantity > 0 ? 'In stock and ready to ship' : 'Out of stock'}
+                </p>
+                {product.weight && parseFloat(product.weight) > 0 && (
+                  <p>
+                    <span class="text-rcommerce-900 font-medium">Weight:</span>{' '}
+                    {product.weight} {product.weight_unit || 'kg'}
+                  </p>
+                )}
+                <p><span class="text-rcommerce-900 font-medium">Shipping:</span> Calculated at checkout</p>
+              </div>
+            </div>
+          </div>
+
+          {specRows.length > 0 && (
+            <section class="mt-16">
+              <h2 class="font-serif text-2xl md:text-3xl font-semibold text-rcommerce-900 mb-8">Additional information</h2>
+              <table class="w-full max-w-3xl text-sm border-collapse">
+                <tbody>
+                  {specRows.map(([label, value]) => (
+                    <tr class="border-b border-rcommerce-200">
+                      <th scope="row" class="py-3.5 pr-6 text-left font-semibold uppercase tracking-button text-[12px] text-rcommerce-900 w-48 align-top">
+                        {label}
+                      </th>
+                      <td class="py-3.5 text-rcommerce-600">{value}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          <section id="reviews" class="mt-16 scroll-mt-24">
+            <h2 class="font-serif text-2xl md:text-3xl font-semibold text-rcommerce-900 mb-8">Reviews</h2>
+            <ProductReviews
+              client:load
+              productId={product.id}
+              initialReviews={reviewSummary?.reviews ?? []}
+              initialAverage={averageRating}
+              initialTotal={totalReviews}
+            />
+          </section>
+
+          {related.length > 0 && (
+            <section class="mt-24">
+              <div class="flex items-end justify-between mb-8">
+                <h2 class="font-serif text-2xl md:text-3xl font-semibold text-rcommerce-900">You may also like</h2>
+                <a href="/products" class="hidden sm:inline-block text-[13px] font-semibold uppercase tracking-button text-rcommerce-900 link-underline">View all</a>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-10">
+                {related.map((p) => (
+                  <ProductCard product={p} />
+                ))}
+              </div>
+            </section>
+          )}
+        </>
+      )}
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<script>
+  const galleryImages: { src: string; alt: string }[] = (() => {
+    try {
+      return JSON.parse(document.getElementById('product-gallery')?.getAttribute('data-gallery') || '[]');
+    } catch {
+      return [];
+    }
+  })();
+
+  document.querySelectorAll('[data-thumb]').forEach((btn, i) => {
+    btn.addEventListener('click', () => {
+      const src = btn.getAttribute('data-thumb');
+      const main = document.getElementById('main-product-image') as HTMLImageElement | null;
+      if (src && main) {
+        main.src = src;
+        main.setAttribute('data-index', String(i));
+        document.querySelectorAll('[data-thumb]').forEach((b) => {
+          b.classList.remove('border-rcommerce-900');
+          b.classList.add('border-transparent');
+        });
+        btn.classList.remove('border-transparent');
+        btn.classList.add('border-rcommerce-900');
+      }
+    });
+  });
+
+  // Lightbox
+  const gallery = document.getElementById('product-gallery');
+  const mainImage = document.getElementById('main-product-image') as HTMLImageElement | null;
+  let lightbox: HTMLDivElement | null = null;
+  let lightboxImg: HTMLImageElement | null = null;
+  let lightboxIndex = 0;
+
+  const renderLightbox = () => {
+    const item = galleryImages[lightboxIndex];
+    if (!lightbox || !lightboxImg || !item) return;
+    lightboxImg.src = item.src;
+    lightboxImg.alt = item.alt;
+  };
+
+  const closeLightbox = () => {
+    if (!lightbox) return;
+    lightbox.remove();
+    lightbox = null;
+    document.removeEventListener('keydown', onKeydown);
+    document.body.style.overflow = '';
+  };
+
+  const showLightbox = (index: number) => {
+    if (galleryImages.length === 0) return;
+    lightboxIndex = index;
+    lightbox = document.createElement('div');
+    lightbox.id = 'product-lightbox';
+    lightbox.className = 'fixed inset-0 z-50 bg-rcommerce-900/95 flex items-center justify-center';
+    lightbox.innerHTML = `
+      <button type="button" data-lb-close aria-label="Close" class="absolute top-4 right-4 p-3 text-white/80 hover:text-white transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+      <button type="button" data-lb-prev aria-label="Previous image" class="absolute left-2 sm:left-6 top-1/2 -translate-y-1/2 p-3 text-white/80 hover:text-white transition-colors ${galleryImages.length < 2 ? 'hidden' : ''}">
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+      <button type="button" data-lb-next aria-label="Next image" class="absolute right-2 sm:right-6 top-1/2 -translate-y-1/2 p-3 text-white/80 hover:text-white transition-colors ${galleryImages.length < 2 ? 'hidden' : ''}">
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
+      <img class="max-h-[85vh] max-w-[90vw] object-contain" alt="" />
+    `;
+    lightboxImg = lightbox.querySelector('img');
+    renderLightbox();
+    document.body.appendChild(lightbox);
+    document.body.style.overflow = 'hidden';
+    document.addEventListener('keydown', onKeydown);
+
+    lightbox.addEventListener('click', (e) => {
+      if (e.target === lightbox) {
+        closeLightbox();
+        return;
+      }
+      const target = e.target as HTMLElement;
+      if (target.closest('[data-lb-close]')) closeLightbox();
+      if (target.closest('[data-lb-prev]')) {
+        lightboxIndex = (lightboxIndex - 1 + galleryImages.length) % galleryImages.length;
+        renderLightbox();
+      }
+      if (target.closest('[data-lb-next]')) {
+        lightboxIndex = (lightboxIndex + 1) % galleryImages.length;
+        renderLightbox();
+      }
+    });
+  };
+
+  function onKeydown(e: KeyboardEvent) {
+    if (!lightbox) return;
+    if (e.key === 'Escape') closeLightbox();
+    if (e.key === 'ArrowLeft' && galleryImages.length > 1) {
+      lightboxIndex = (lightboxIndex - 1 + galleryImages.length) % galleryImages.length;
+      renderLightbox();
+    }
+    if (e.key === 'ArrowRight' && galleryImages.length > 1) {
+      lightboxIndex = (lightboxIndex + 1) % galleryImages.length;
+      renderLightbox();
+    }
+  }
+
+  gallery?.addEventListener('click', () => {
+    const idx = parseInt(mainImage?.getAttribute('data-index') || '0', 10);
+    showLightbox(Number.isNaN(idx) ? 0 : idx);
+  });
+</script>

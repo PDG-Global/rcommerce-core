@@ -63,5 +63,13 @@ storefront/dist/
 storefront/.env.cloudflare
 storefront/wrangler.toml
 
+# Wrangler local state
+.wrangler/
+storefront/.wrangler/
+
+# Local tooling / environments
+docs-website/venv/
+.mimocode/
+
 # Public repo keeps Cargo.lock for reproducible builds
 # Cargo.lock is intentionally tracked here

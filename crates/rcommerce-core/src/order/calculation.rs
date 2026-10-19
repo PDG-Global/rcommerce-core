@@ -316,6 +316,8 @@ mod tests {
             name: "Test Item".to_string(),
             variant_name: None,
             weight: Some(dec!(0.5)),
+            weight_unit: None,
+            is_bundle_component: None,
             metadata: serde_json::json!({}),
             created_at: Utc::now(),
         }];

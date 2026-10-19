@@ -1,10 +1,14 @@
 //! PostgreSQL repository implementations
 
 pub mod customer_repository;
+pub mod newsletter_repository;
 pub mod product_repository;
+pub mod review_repository;
 
 pub use customer_repository::PostgresCustomerRepository;
+pub use newsletter_repository::PostgresNewsletterRepository;
 pub use product_repository::PostgresProductRepository;
+pub use review_repository::PostgresProductReviewRepository;
 
 use sqlx::{Pool, Postgres};
 

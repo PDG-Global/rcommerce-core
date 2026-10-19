@@ -1,0 +1,65 @@
+---
+import type { Product } from '../lib/types';
+import { productUrl } from '../lib/url';
+import { brand } from '../lib/brand';
+import StarRating from './StarRating.astro';
+
+interface Props {
+  product: Product;
+}
+
+const { product } = Astro.props;
+const image = product.image ?? product.images?.[0]?.src ?? '/placeholder-product.svg';
+const altText = product.images?.[0]?.alt_text || product.title;
+const outOfStock = product.inventory_quantity <= 0;
+const onSale = !!product.compare_at_price && parseFloat(product.compare_at_price) > parseFloat(product.price);
+const reviewCount = product.review_count ?? 0;
+const averageRating = product.average_rating ?? 0;
+// Optional soft-card styling hooks (see brand config); default markup stays byte-identical.
+const themedClass = (cls: string) => (brand.softCards ? cls : '');
+---
+
+<a
+  href={productUrl(product)}
+  class={`group block bg-white ${themedClass('product-card ')}${outOfStock ? 'opacity-70' : ''}`}
+>
+  <div class="aspect-square bg-rcommerce-100 overflow-hidden relative">
+    <img
+      src={image}
+      alt={altText}
+      class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+      loading="lazy"
+    />
+    {outOfStock && (
+      <span class="absolute top-3 left-3 bg-rcommerce-900 text-white text-[11px] font-semibold uppercase tracking-button px-3 py-1.5">
+        Sold out
+      </span>
+    )}
+    {onSale && !outOfStock && (
+      <span class="absolute top-3 left-3 bg-rcommerce-highlight text-rcommerce-900 text-[11px] font-semibold uppercase tracking-button px-3 py-1.5">
+        On sale
+      </span>
+    )}
+  </div>
+  <div class="pt-4 pb-2 text-center">
+    <h3 class="font-serif text-[17px] leading-snug text-rcommerce-900 group-hover:text-rcommerce-accent transition-colors line-clamp-2 px-2">
+      {product.title}
+    </h3>
+    <div class="mt-2 flex items-center justify-center gap-3">
+      {onSale && (
+        <span class="text-sm text-rcommerce-400 line-through">
+          {product.currency} {product.compare_at_price}
+        </span>
+      )}
+      <span class={`text-[15px] font-medium text-rcommerce-900${themedClass(' product-price')}`}>
+        {product.currency} {product.price}
+      </span>
+    </div>
+    {reviewCount > 0 && (
+      <div class="mt-1.5 flex items-center justify-center gap-1.5">
+        <StarRating rating={averageRating} size={13} />
+        <span class="text-xs text-rcommerce-500">({reviewCount})</span>
+      </div>
+    )}
+  </div>
+</a>

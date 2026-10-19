@@ -1,0 +1,35 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import { brand, content } from '../lib/brand';
+
+interface Props {
+  eyebrow: string;
+  title: string;
+  heading?: string;
+  paragraphs?: string[];
+}
+
+const { eyebrow, title, heading, paragraphs = [] } = Astro.props;
+---
+
+<Layout title={`${title} | ${brand.name}`} description={content.tagline}>
+  <Nav />
+  <main class="flex-1">
+    <div class="bg-rcommerce-50 border-b border-rcommerce-200">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14 text-center">
+        <p class="eyebrow text-xl">{eyebrow}</p>
+        <h1 class="font-serif text-4xl md:text-5xl font-semibold text-rcommerce-900 mt-1">{heading ?? title}</h1>
+      </div>
+    </div>
+    <div class="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+      <div class="space-y-5 text-rcommerce-600 leading-relaxed">
+        {paragraphs.map((paragraph) => (
+          <p>{paragraph}</p>
+        ))}
+      </div>
+    </div>
+  </main>
+  <Footer />
+</Layout>

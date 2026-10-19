@@ -1,3 +1,4 @@
+pub mod accounting;
 pub mod cache;
 pub mod common;
 pub mod config;
@@ -5,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod import;
 pub mod inventory;
+pub mod invoice;
 pub mod jobs;
 pub mod media;
 pub mod middleware;
@@ -21,7 +23,10 @@ pub mod traits;
 pub mod websocket;
 
 // Re-export commonly used types
-pub use config::{Config, DunningConfig, DunningEmailTemplates, GatewayDunningConfig};
+pub use config::{
+    BrandingConfig, Config, DunningConfig, DunningEmailTemplates, GatewayDunningConfig,
+    OrdersConfig,
+};
 pub use db::migrate::{auto_migrate, DbStatus, Migrator};
 pub use error::{Error, Result};
 pub use inventory::{

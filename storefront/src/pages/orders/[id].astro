@@ -1,0 +1,292 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { brand, content } from '../../lib/brand';
+
+import Nav from '../../components/Nav.astro';
+import Footer from '../../components/Footer.astro';
+import { API_BASE } from '../../lib/api';
+
+const { id } = Astro.params;
+---
+
+<Layout title={`Order | ${brand.titleSuffix}`}>
+  <Nav />
+  <main class="flex-1 bg-rcommerce-50">
+    <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+      <a href="/account" class="inline-flex items-center gap-2 text-sm text-rcommerce-600 hover:text-rcommerce-accent mb-6 transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        Back to account
+      </a>
+      <div id="order-detail" data-order-id={id} data-support-email={content.checkoutSupportEmail}>
+        <div class="animate-pulse space-y-6">
+          <div class="h-8 bg-rcommerce-200 rounded w-48"></div>
+          <div class="h-64 bg-rcommerce-200 rounded"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+  <Footer />
+
+  <script>
+    import html2pdf from 'html2pdf.js';
+
+    const container = document.getElementById('order-detail');
+    const orderId = container?.dataset.orderId;
+    const supportEmail = container?.dataset.supportEmail || 'support@example.com';
+    const token = localStorage.getItem('rcommerce_token');
+
+    function statusColor(status: string) {
+      const s = (status || '').toLowerCase();
+      if (s === 'completed' || s === 'paid' || s === 'delivered') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+      if (s === 'processing' || s === 'confirmed') return 'bg-blue-50 text-blue-700 border-blue-200';
+      if (s === 'pending') return 'bg-amber-50 text-amber-700 border-amber-200';
+      if (s === 'cancelled' || s === 'refunded' || s === 'failed') return 'bg-red-50 text-red-700 border-red-200';
+      return 'bg-rcommerce-100 text-rcommerce-700 border-rcommerce-200';
+    }
+
+    function money(currency: string, amount: any) {
+      const value = parseFloat(amount);
+      return `${currency} ${Number.isNaN(value) ? amount : value.toFixed(2)}`;
+    }
+
+    function capitalize(s: string) {
+      return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+    }
+
+    function addressHtml(addr: any, label: string) {
+      if (!addr || (!addr.address_1 && !addr.city)) {
+        return `
+          <div class="bg-white border border-rcommerce-200 rounded-lg p-5">
+            <h4 class="text-xs font-semibold text-rcommerce-500 uppercase tracking-wide mb-3">${label}</h4>
+            <p class="text-sm text-rcommerce-400 italic">No address on file</p>
+          </div>
+        `;
+      }
+      const lines = [
+        addr.first_name || addr.last_name ? `${addr.first_name || ''} ${addr.last_name || ''}`.trim() : null,
+        addr.company,
+        addr.address_1,
+        addr.address2 || addr.address_2,
+        [addr.city, addr.state || addr.province].filter(Boolean).join(', ') + (addr.postcode || addr.zip ? ` ${addr.postcode || addr.zip}` : ''),
+        addr.country,
+        addr.phone ? `Phone: ${addr.phone}` : null,
+      ].filter(Boolean);
+      return `
+        <div class="bg-white border border-rcommerce-200 rounded-lg p-5">
+          <h4 class="text-xs font-semibold text-rcommerce-500 uppercase tracking-wide mb-3">${label}</h4>
+          ${lines.map(l => `<p class="text-sm text-rcommerce-900 leading-relaxed">${l}</p>`).join('')}
+        </div>
+      `;
+    }
+
+    // Expose fetchInvoice globally for inline onclick
+    (globalThis as any).fetchInvoice = function(orderId: string, token: string) {
+      fetch(`${API_BASE}/orders/${orderId}/invoice`, {
+        headers: { authorization: `Bearer ${token}` }
+      })
+      .then((res: Response) => {
+        if (!res.ok) throw new Error('Failed to load invoice');
+        return res.text();
+      })
+      .then((html: string) => {
+        const win = window.open('', '_blank');
+        if (win) {
+          win.document.write(html);
+          win.document.close();
+        }
+      })
+      .catch((e: Error) => {
+        alert('Failed to load invoice: ' + e.message);
+      });
+    };
+
+    // Render the invoice HTML into a hidden iframe and export a true A4 PDF
+    (globalThis as any).downloadInvoicePdf = async function(orderId: string, orderNumber: string, token: string, btn: HTMLButtonElement) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Preparing PDF…';
+      const iframe = document.createElement('iframe');
+      try {
+        const res = await fetch(`${API_BASE}/orders/${orderId}/invoice`, {
+          headers: { authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error('Failed to load invoice');
+        const html = await res.text();
+
+        iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;';
+        document.body.appendChild(iframe);
+        await new Promise<void>((resolve, reject) => {
+          iframe.onload = () => resolve();
+          iframe.onerror = () => reject(new Error('Failed to render invoice'));
+          iframe.srcdoc = html;
+        });
+        const doc = iframe.contentDocument;
+        if (!doc || !doc.querySelector('.invoice')) throw new Error('Invoice rendered unexpectedly');
+        await (doc as any).fonts?.ready;
+
+        const element = doc.querySelector('.invoice') as HTMLElement;
+        await html2pdf()
+          .set({
+            margin: 0,
+            filename: `invoice-${orderNumber}.pdf`,
+            image: { type: 'jpeg', quality: 0.98 },
+            html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff', windowWidth: 800 },
+            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+            pagebreak: { mode: ['css', 'legacy'] },
+          })
+          .from(element)
+          .save();
+      } catch (e: any) {
+        alert('Failed to generate PDF: ' + (e?.message || e));
+      } finally {
+        iframe.remove();
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    };
+
+    if (!orderId || !token) {
+      window.location.href = '/account/login?redirect=' + encodeURIComponent(window.location.pathname);
+    } else {
+      fetch(`${API_BASE}/orders/${orderId}`, { headers: { authorization: `Bearer ${token}` } })
+        .then((res) => {
+          if (!res.ok) throw new Error('Failed to load order');
+          return res.json();
+        })
+        .then((order: any) => {
+          document.title = `Order ${order.order_number} | rCommerce`;
+
+          const items = (order.items || []).filter((item: any) => !isBundleComponent(item)).map((item: any) => `
+            <div class="flex items-start gap-4 py-4 border-b border-rcommerce-100 last:border-b-0">
+              <div class="flex-1 min-w-0">
+                <p class="font-medium text-rcommerce-900 text-sm">${item.name || 'Unknown product'}</p>
+                ${item.variant_title ? `<p class="text-xs text-rcommerce-accent mt-1">${item.variant_title}</p>` : ''}
+                ${item.sku ? `<p class="text-xs text-rcommerce-500 mt-1">SKU: ${item.sku}</p>` : ''}
+              </div>
+              <div class="text-right shrink-0">
+                <p class="text-sm text-rcommerce-900">${money(order.currency, item.price)} × ${item.quantity}</p>
+                <p class="font-semibold text-rcommerce-900 mt-1">${money(order.currency, item.total)}</p>
+              </div>
+            </div>
+          `).join('');
+
+          // Payment info
+          const payments = order.payments || [];
+          const discountValue = parseFloat(order.discount_total);
+          const discountRow = Number.isFinite(discountValue) && discountValue > 0
+            ? `<div class="flex justify-between text-sm">
+                 <span class="text-rcommerce-600">${order.coupon_code ? `Discount (${order.coupon_code})` : 'Discount'}</span>
+                 <span class="text-rcommerce-900">${money(order.currency, -Math.abs(discountValue))}</span>
+               </div>`
+            : '';
+          let paymentHtml = '';
+          if (payments.length > 0) {
+            const p = payments[0];
+            const method = p.card_brand && p.card_last_four
+              ? `${capitalize(p.card_brand)} ending in ${p.card_last_four}`
+              : capitalize(p.gateway || 'Payment');
+            paymentHtml = `
+              <div class="bg-white border border-rcommerce-200 rounded-lg overflow-hidden">
+                <div class="px-5 py-4 border-b border-rcommerce-200">
+                  <h2 class="font-semibold text-rcommerce-900">Payment</h2>
+                </div>
+                <div class="px-5 py-4">
+                  <p class="text-sm text-rcommerce-900">${method}</p>
+                  <span class="inline-block mt-2 capitalize px-2 py-0.5 rounded text-xs font-medium border ${statusColor(p.status)}">${p.status}</span>
+                </div>
+              </div>
+            `;
+          }
+
+          container.innerHTML = `
+            <div class="mb-8">
+              <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+                <div>
+                  <p class="eyebrow text-lg">Order confirmed</p>
+                  <h1 class="font-serif text-3xl md:text-4xl font-semibold text-rcommerce-900 mt-1">${order.order_number}</h1>
+                  <p class="text-sm text-rcommerce-600 mt-2">Placed on ${new Date(order.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</p>
+                </div>
+                <span class="inline-flex self-start capitalize px-4 py-2 rounded-md text-sm font-medium border ${statusColor(order.status)}">${order.status}</span>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <!-- Main column -->
+              <div class="lg:col-span-2 space-y-6">
+                <div class="bg-white border border-rcommerce-200 rounded-lg overflow-hidden">
+                  <div class="px-5 py-4 border-b border-rcommerce-200">
+                    <h2 class="font-semibold text-rcommerce-900">Items</h2>
+                  </div>
+                  <div class="px-5">
+                    ${items || '<p class="py-6 text-sm text-rcommerce-500">No items in this order.</p>'}
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  ${addressHtml(order.shipping_address || order.billing_address, 'Shipping address')}
+                  ${addressHtml(order.billing_address || order.shipping_address, 'Billing address')}
+                </div>
+
+                ${paymentHtml}
+              </div>
+
+              <!-- Summary sidebar -->
+              <div class="lg:col-span-1">
+                <div class="bg-white border border-rcommerce-200 rounded-lg overflow-hidden">
+                  <div class="px-5 py-4 border-b border-rcommerce-200">
+                    <h2 class="font-semibold text-rcommerce-900">Order summary</h2>
+                  </div>
+                  <div class="px-5 py-4 space-y-3">
+                    <div class="flex justify-between text-sm">
+                      <span class="text-rcommerce-600">Subtotal</span>
+                      <span class="text-rcommerce-900">${money(order.currency, order.subtotal)}</span>
+                    </div>
+                    ${discountRow}
+                    <div class="flex justify-between text-sm">
+                      <span class="text-rcommerce-600">Shipping</span>
+                      <span class="text-rcommerce-900">${money(order.currency, order.shipping_total)}</span>
+                    </div>
+                    <div class="flex justify-between text-sm">
+                      <span class="text-rcommerce-600">Tax</span>
+                      <span class="text-rcommerce-900">${money(order.currency, order.tax_total)}</span>
+                    </div>
+                    <div class="flex justify-between text-lg font-semibold text-rcommerce-900 pt-4 mt-4 border-t border-rcommerce-200">
+                      <span>Total</span>
+                      <span>${money(order.currency, order.total)}</span>
+                    </div>
+                  </div>
+                  <div class="px-5 py-4 border-t border-rcommerce-200 space-y-3">
+                    <button type="button" onclick="downloadInvoicePdf('${order.id}', '${order.order_number}', '${token}', this)" class="block w-full text-center rounded-md bg-rcommerce-900 px-4 py-3 text-sm font-semibold text-white hover:bg-rcommerce-accent transition-colors cursor-pointer disabled:opacity-50">
+                      Download Invoice (PDF)
+                    </button>
+                    <button type="button" onclick="fetchInvoice('${order.id}', '${token}')" class="block w-full text-center rounded-md border border-rcommerce-300 px-4 py-2.5 text-xs font-medium text-rcommerce-600 hover:border-rcommerce-900 hover:text-rcommerce-900 transition-colors cursor-pointer">
+                      View printable version
+                    </button>
+                    <p class="text-xs text-rcommerce-500 text-center">Need help? <a href="mailto:${supportEmail}" class="text-rcommerce-accent hover:underline">${supportEmail}</a></p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .catch((e) => {
+          container.innerHTML = `
+            <div class="text-center py-16">
+              <p class="text-rcommerce-danger mb-4">${e.message}</p>
+              <a href="/account" class="btn-secondary">Back to account</a>
+            </div>
+          `;
+        });
+    }
+  </script>
+{brand.titleSuffix !== 'rCommerce' && (
+  <script is:inline>
+    // The order-detail island rewrites the tab title with a "| rCommerce"
+    // suffix after loading; swap in this store's name (from og:site_name).
+    window.addEventListener('load', () => {
+      const siteName = document.querySelector('meta[property="og:site_name"]')?.getAttribute('content');
+      if (siteName) document.title = document.title.replace('rCommerce', siteName);
+    });
+  </script>
+)}
+</Layout>

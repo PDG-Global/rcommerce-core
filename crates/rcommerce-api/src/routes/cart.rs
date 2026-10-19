@@ -48,16 +48,17 @@ pub async fn create_guest_cart(
 }
 
 /// Get or create customer cart
+///
+/// Requires authentication (mounted behind JWT auth); the customer is taken
+/// from the verified token.
 pub async fn get_customer_cart(
     State(state): State<AppState>,
-    Extension(auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<JwtAuth>,
 ) -> Result<Json<CartWithItems>, Error> {
-    let jwt_auth = auth.ok_or_else(|| Error::unauthorized("Authentication required"))?;
-
     // Get or create cart for authenticated customer
     let cart = state
         .cart_service
-        .get_or_create_cart(CartIdentifier::Customer(jwt_auth.customer_id), "USD")
+        .get_or_create_cart(CartIdentifier::Customer(auth.customer_id), "USD")
         .await?;
 
     // Return cart with items
@@ -153,29 +154,36 @@ pub async fn add_item_to_cart(
             requires_shipping: product_detail.product.requires_shipping,
             components: components
                 .into_iter()
-                .map(|c| rcommerce_core::services::cart_service::BundleComponentDetails {
-                    product_id: c.component.component_product_id,
-                    quantity: c.component.quantity,
-                    unit_price: c.product.as_ref().map(|p| p.price).unwrap_or_default(),
-                    sku: c.product.as_ref().and_then(|p| p.sku.clone()),
-                    title: c
-                        .product
-                        .as_ref()
-                        .map(|p| p.title.clone())
-                        .unwrap_or_else(|| "Bundle Component".to_string()),
-                    image_url: None,
-                    requires_shipping: c
-                        .product
-                        .as_ref()
-                        .map(|p| p.requires_shipping)
-                        .unwrap_or(true),
-                })
+                .map(
+                    |c| rcommerce_core::services::cart_service::BundleComponentDetails {
+                        product_id: c.component.component_product_id,
+                        quantity: c.component.quantity,
+                        unit_price: c.product.as_ref().map(|p| p.price).unwrap_or_default(),
+                        sku: c.product.as_ref().and_then(|p| p.sku.clone()),
+                        title: c
+                            .product
+                            .as_ref()
+                            .map(|p| p.title.clone())
+                            .unwrap_or_else(|| "Bundle Component".to_string()),
+                        image_url: None,
+                        requires_shipping: c
+                            .product
+                            .as_ref()
+                            .map(|p| p.requires_shipping)
+                            .unwrap_or(true),
+                    },
+                )
                 .collect(),
         };
 
         let items = state
             .cart_service
-            .add_bundle_item(cart_id, request.product_id, request.quantity, bundle_details)
+            .add_bundle_item(
+                cart_id,
+                request.product_id,
+                request.quantity,
+                bundle_details,
+            )
             .await?;
 
         // Return the parent cart item (first item in the expanded list).
@@ -186,32 +194,52 @@ pub async fn add_item_to_cart(
             .ok_or_else(|| Error::validation("Failed to add bundle to cart"));
     }
 
-    // Determine the entity (product or variant) being added and validate stock
-    let (target_product_id, _target_variant_id, _available_quantity) = if let Some(variant_id) = request.variant_id {
-        let variant = product_detail
-            .variants
-            .iter()
-            .find(|v| v.id == variant_id)
-            .ok_or_else(|| Error::not_found("Product variant not found"))?;
-        (
-            request.product_id,
-            Some(variant_id),
-            variant.inventory_quantity,
-        )
-    } else {
-        (
-            request.product_id,
-            None,
-            product_detail.product.inventory_quantity,
-        )
-    };
+    // Variable products only exist as variants: a missing variant_id (stale
+    // cached storefront page, API client omitting the field) would silently
+    // order the product with no option selection, so refuse it here.
+    if request.variant_id.is_none()
+        && product_detail.product.product_type == rcommerce_core::models::ProductType::Variable
+    {
+        return Err(Error::validation(
+            "Please select an option before adding to cart",
+        ));
+    }
 
-    // Check real-time inventory availability
-    let inventory = state
-        .inventory_service
-        .get_product_inventory(target_product_id)
-        .await?;
-    let total_available = inventory.total_available;
+    // Determine the entity (product or variant) being added and validate stock
+    let (target_product_id, _target_variant_id, _available_quantity) =
+        if let Some(variant_id) = request.variant_id {
+            let variant = product_detail
+                .variants
+                .iter()
+                .find(|v| v.id == variant_id)
+                .ok_or_else(|| Error::not_found("Product variant not found"))?;
+            (
+                request.product_id,
+                Some(variant_id),
+                variant.inventory_quantity,
+            )
+        } else {
+            (
+                request.product_id,
+                None,
+                product_detail.product.inventory_quantity,
+            )
+        };
+
+    // Check real-time inventory availability. When a variant is selected,
+    // validate against that variant's stock only — never another variant's.
+    let total_available = if let Some(variant_id) = request.variant_id {
+        state
+            .inventory_service
+            .get_available_stock_for_product(request.product_id, Some(variant_id))
+            .await?
+    } else {
+        state
+            .inventory_service
+            .get_product_inventory(target_product_id)
+            .await?
+            .total_available
+    };
     let requested_total = request.quantity;
 
     if total_available <= 0 {
@@ -343,17 +371,17 @@ pub struct MergeCartRequest {
 }
 
 /// Merge guest cart into customer cart
+///
+/// Requires authentication (mounted behind JWT auth).
 pub async fn merge_carts(
     State(state): State<AppState>,
-    Extension(auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<MergeCartRequest>,
 ) -> Result<Json<CartWithItems>, Error> {
-    let jwt_auth = auth.ok_or_else(|| Error::unauthorized("Authentication required"))?;
-
     // Merge carts via service
     let cart = state
         .cart_service
-        .merge_carts(&request.session_token, jwt_auth.customer_id)
+        .merge_carts(&request.session_token, auth.customer_id)
         .await?;
 
     // Return merged cart with items
@@ -445,6 +473,8 @@ pub fn protected_router() -> Router<AppState> {
     Router::new()
         // Customer cart - requires auth
         .route("/carts/me", get(get_customer_cart))
+        // Merge guest cart into the authenticated customer's cart
+        .route("/carts/merge", post(merge_carts))
         // Cart modification - requires auth
         .route("/carts/:cart_id", delete(delete_cart))
 }

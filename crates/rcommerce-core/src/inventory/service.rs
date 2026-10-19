@@ -82,7 +82,11 @@ impl InventoryService {
     pub async fn reserve_stock(&self, reservation: StockReservation) -> Result<StockReservation> {
         // Check if enough stock is available
         let available = self
-            .get_available_stock(reservation.product_id, reservation.location_id)
+            .get_available_stock(
+                reservation.product_id,
+                reservation.location_id,
+                reservation.variant_id,
+            )
             .await?;
 
         if available < reservation.quantity {
@@ -142,11 +146,13 @@ impl InventoryService {
             SET available_quantity = available_quantity - $1,
                 reserved_quantity = reserved_quantity + $1
             WHERE product_id = $2 AND location_id = $3
+                AND variant_id IS NOT DISTINCT FROM $4
             "#,
         )
         .bind(reservation.quantity)
         .bind(reservation.product_id)
         .bind(reservation.location_id)
+        .bind(reservation.variant_id)
         .execute(self.db.pool())
         .await?;
 
@@ -155,6 +161,19 @@ impl InventoryService {
             .bind(reservation_id)
             .execute(self.db.pool())
             .await?;
+
+        if result.rows_affected() == 0 {
+            tracing::warn!(
+                reservation_id = %reservation_id,
+                product_id = %reservation.product_id,
+                variant_id = ?reservation.variant_id,
+                location_id = %reservation.location_id,
+                quantity = reservation.quantity,
+                "commit_reservation matched no inventory_levels row; \
+                 reservation committed but stock was not decremented \
+                 (e.g. NULL-variant reservation on a variants-only product)"
+            );
+        }
 
         Ok(result.rows_affected() > 0)
     }
@@ -167,21 +186,37 @@ impl InventoryService {
         quantity: i32,
         cost_per_unit: Option<Decimal>,
     ) -> Result<StockMovement> {
-        // Update inventory levels
-        let _level = sqlx::query_as::<_, InventoryLevel>(
+        // Update inventory levels: UPDATE first, INSERT only if no row exists.
+        // (An ON CONFLICT target cannot match NULL variant_id rows, so an
+        // upsert silently never conflicts for simple products.)
+        let updated = sqlx::query(
             r#"
-            INSERT INTO inventory_levels (product_id, location_id, available_quantity, incoming_quantity)
-            VALUES ($1, $2, $3, 0)
-            ON CONFLICT (product_id, location_id) 
-            DO UPDATE SET available_quantity = inventory_levels.available_quantity + EXCLUDED.available_quantity
-            RETURNING *
-            "#
+            UPDATE inventory_levels 
+            SET available_quantity = available_quantity + $3,
+                updated_at = NOW()
+            WHERE product_id = $1 AND location_id = $2 AND variant_id IS NULL
+            "#,
         )
         .bind(product_id)
         .bind(location_id)
         .bind(quantity)
-        .fetch_one(self.db.pool())
+        .execute(self.db.pool())
         .await?;
+
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO inventory_levels (id, product_id, location_id, available_quantity, incoming_quantity)
+                VALUES ($1, $2, $3, $4, 0)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(product_id)
+            .bind(location_id)
+            .bind(quantity)
+            .execute(self.db.pool())
+            .await?;
+        }
 
         // Create stock movement record
         let movement_id = uuid::Uuid::new_v4();
@@ -258,21 +293,47 @@ impl InventoryService {
         Ok(released_count)
     }
 
-    /// Helper: Get available stock
+    /// Helper: Get available stock for a product/variant at a location.
+    ///
+    /// Sums across matching rows (legacy databases may hold duplicate rows per
+    /// key) and filters by variant so a variant purchase is never validated
+    /// against another variant's stock.
     async fn get_available_stock(
         &self,
         product_id: uuid::Uuid,
         location_id: uuid::Uuid,
+        variant_id: Option<uuid::Uuid>,
     ) -> Result<i32> {
-        let level = sqlx::query_as::<_, InventoryLevel>(
-            "SELECT * FROM inventory_levels WHERE product_id = $1 AND location_id = $2",
+        let available: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(available_quantity), 0) FROM inventory_levels \
+             WHERE product_id = $1 AND location_id = $2 \
+             AND variant_id IS NOT DISTINCT FROM $3",
         )
         .bind(product_id)
         .bind(location_id)
-        .fetch_optional(self.db.pool())
+        .bind(variant_id)
+        .fetch_one(self.db.pool())
         .await?;
 
-        Ok(level.map(|l| l.available_quantity).unwrap_or(0))
+        Ok(i32::try_from(available).unwrap_or(i32::MAX))
+    }
+
+    /// Get available stock for a product (optionally a specific variant) across all locations.
+    pub async fn get_available_stock_for_product(
+        &self,
+        product_id: uuid::Uuid,
+        variant_id: Option<uuid::Uuid>,
+    ) -> Result<i32> {
+        let available: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(available_quantity), 0) FROM inventory_levels \
+             WHERE product_id = $1 AND variant_id IS NOT DISTINCT FROM $2",
+        )
+        .bind(product_id)
+        .bind(variant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(i32::try_from(available).unwrap_or(i32::MAX))
     }
 
     /// Helper: Get location name

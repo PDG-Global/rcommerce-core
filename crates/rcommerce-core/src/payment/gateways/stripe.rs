@@ -166,6 +166,9 @@ impl PaymentGateway for StripeGateway {
                 .and_then(|id| uuid::Uuid::parse_str(id).ok()),
             payment_method: "card".to_string(), // TODO: Map from payment method details
             transaction_id: stripe_payment.id,
+            client_secret: Some(stripe_payment.client_secret),
+            card_brand: None,
+            card_last_four: None,
             captured_at: None,
             created_at: chrono::Utc::now(),
         })
@@ -272,6 +275,7 @@ impl PaymentGateway for StripeGateway {
                 payment_id
             ))
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .query(&[("expand[]", "latest_charge")])
             .send()
             .await
             .map_err(|e| Error::network(format!("Stripe API error: {}", e)))?;
@@ -292,6 +296,16 @@ impl PaymentGateway for StripeGateway {
             .await
             .map_err(|e| Error::Network(format!("Failed to parse Stripe response: {}", e)))?;
 
+        let charge = stripe_payment
+            .latest_charge
+            .as_ref()
+            .or_else(|| stripe_payment.charges.data.first());
+        let (card_brand, card_last_four) = charge
+            .and_then(|c| c.payment_method_details.as_ref())
+            .and_then(|d| d.card.as_ref())
+            .map(|c| (Some(c.brand.clone()), Some(c.last4.clone())))
+            .unwrap_or((None, None));
+
         Ok(Payment {
             id: format!("pay_{}", uuid::Uuid::new_v4()),
             gateway: self.id().to_string(),
@@ -311,6 +325,9 @@ impl PaymentGateway for StripeGateway {
                 .and_then(|id| uuid::Uuid::parse_str(id).ok()),
             payment_method: "card".to_string(),
             transaction_id: stripe_payment.id,
+            client_secret: Some(stripe_payment.client_secret),
+            card_brand,
+            card_last_four,
             captured_at: stripe_payment.charges.data.first().and_then(|c| {
                 c.captured_at
                     .map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or(chrono::Utc::now()))
@@ -395,6 +412,8 @@ struct StripePaymentIntent {
     metadata: std::collections::HashMap<String, String>,
     #[serde(default)]
     charges: StripeList<StripeCharge>,
+    #[serde(default)]
+    latest_charge: Option<StripeCharge>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -431,6 +450,22 @@ struct StripeCharge {
     captured_at: Option<i64>,
     #[serde(default)]
     payment_intent: String,
+    #[serde(default)]
+    payment_method_details: Option<StripePaymentMethodDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct StripePaymentMethodDetails {
+    #[serde(default)]
+    card: Option<StripeCardDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct StripeCardDetails {
+    #[serde(default)]
+    brand: String,
+    #[serde(default)]
+    last4: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

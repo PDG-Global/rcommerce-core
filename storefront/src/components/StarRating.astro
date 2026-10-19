@@ -1,0 +1,26 @@
+---
+interface Props {
+  rating: number;
+  size?: number;
+  class?: string;
+}
+
+const { rating, size = 16, class: className = '' } = Astro.props;
+const full = Math.round(Math.max(0, Math.min(5, rating)));
+const label = (Math.round(rating * 10) / 10).toFixed(1);
+---
+
+<span class={`inline-flex items-center gap-0.5 ${className}`} role="img" aria-label={`Rated ${label} out of 5 stars`}>
+  {Array.from({ length: 5 }, (_, i) => (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      class={i < full ? 'fill-rcommerce-accent' : 'fill-rcommerce-200'}
+      aria-hidden="true"
+    >
+      <path d="M12 17.3l-6.2 3.6 1.7-7L2 9.2l7.1-.6L12 2l2.9 6.6 7.1.6-5.4 4.7 1.6 7z" />
+    </svg>
+  ))}
+</span>

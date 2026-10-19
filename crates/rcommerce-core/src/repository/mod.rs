@@ -40,7 +40,8 @@ pub use tag_repository::{PostgresTagRepository, TagRepository};
 // PostgreSQL exports
 pub use postgres::{
     create_pool, PostgresCustomerRepository as CustomerRepository, PostgresDb as Database,
-    PostgresProductRepository as ProductRepository,
+    PostgresNewsletterRepository, PostgresProductRepository as ProductRepository,
+    PostgresProductReviewRepository,
 };
 
 // Re-export traits

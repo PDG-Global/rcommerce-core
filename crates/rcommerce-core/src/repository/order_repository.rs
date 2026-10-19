@@ -231,7 +231,7 @@ impl OrderRepository for PostgresOrderRepository {
         .bind(order.discount_total)
         .bind(order.total)
         .bind(order.notes.as_ref())
-        .bind(&order.tags)
+        .bind(order.tags.clone().unwrap_or_default())
         .bind(&order.metadata)
         .fetch_one(&self.db)
         .await
@@ -275,7 +275,7 @@ impl OrderRepository for PostgresOrderRepository {
         .bind(order.discount_total)
         .bind(order.total)
         .bind(order.notes.as_ref())
-        .bind(&order.tags)
+        .bind(order.tags.clone().unwrap_or_default())
         .bind(&order.metadata)
         .bind(order.id)
         .fetch_one(&self.db)
@@ -287,7 +287,7 @@ impl OrderRepository for PostgresOrderRepository {
 
     async fn update_status(&self, id: Uuid, status: OrderStatus) -> Result<Order> {
         let order = sqlx::query_as::<_, Order>(
-            "UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+            "UPDATE orders SET status = $1::order_status, updated_at = NOW() WHERE id = $2 RETURNING *",
         )
         .bind(format!("{:?}", status).to_lowercase())
         .bind(id)

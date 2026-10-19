@@ -7,8 +7,10 @@ pub mod coupon_service;
 pub mod customer_service;
 pub mod digital_product_service;
 pub mod dunning_service;
+pub mod newsletter_service;
 pub mod order_service;
 pub mod product_service;
+pub mod review_service;
 pub mod statistics_service;
 pub mod subscription_service;
 
@@ -31,8 +33,10 @@ pub use digital_product_service::DigitalProductService;
 pub use dunning_service::{
     DunningHistory, DunningService, RetryProcessingResult, RetryableInvoice,
 };
+pub use newsletter_service::NewsletterService;
 pub use order_service::OrderService;
 pub use product_service::ProductService;
+pub use review_service::ReviewService;
 pub use statistics_service::{FullDashboardData, SalesReport, StatisticsService};
 pub use subscription_service::SubscriptionService;
 

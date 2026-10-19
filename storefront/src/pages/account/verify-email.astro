@@ -1,0 +1,19 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { brand } from '../../lib/brand';
+
+import Nav from '../../components/Nav.astro';
+import Footer from '../../components/Footer.astro';
+import VerifyEmailForm from '../../islands/VerifyEmailForm.tsx';
+---
+
+<Layout title={`Verify Email | ${brand.titleSuffix}`}>
+  <Nav />
+  <main class="flex-1 py-16">
+    <div class="max-w-md mx-auto px-4 sm:px-6 lg:px-8">
+      <h1 class="text-3xl font-bold mb-8 text-center">Verify Email</h1>
+      <VerifyEmailForm client:load />
+    </div>
+  </main>
+  <Footer />
+</Layout>

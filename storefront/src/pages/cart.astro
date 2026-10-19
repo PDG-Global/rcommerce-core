@@ -1,0 +1,20 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { brand } from '../lib/brand';
+
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import CartPage from '../islands/CartPage.tsx';
+---
+
+<Layout title={`Your Cart | ${brand.titleSuffix}`}>
+  <Nav />
+  <main class="flex-1 py-14">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <p class="eyebrow text-xl">Review</p>
+      <h1 class="font-serif text-4xl md:text-5xl font-semibold text-rcommerce-900 mt-1 mb-12">Your Cart</h1>
+      <CartPage client:load />
+    </div>
+  </main>
+  <Footer />
+</Layout>

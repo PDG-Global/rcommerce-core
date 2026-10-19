@@ -24,11 +24,7 @@ mod notification_integration_tests {
         assert_eq!(template.channel, NotificationChannel::Email);
 
         // Verify template has expected content
-        let html_content = template.html_body.unwrap();
-        assert!(
-            html_content.contains("R COMMERCE"),
-            "Template should contain branding"
-        );
+        let html_content = template.html_body.as_ref().unwrap();
         assert!(
             html_content.contains("{{ order_number }}"),
             "Template should have order_number placeholder"
@@ -40,6 +36,28 @@ mod notification_integration_tests {
         assert!(
             html_content.contains("{{ order_total }}"),
             "Template should have order_total placeholder"
+        );
+
+        // Rendering wraps the body in the shared brand shell; pass an explicit
+        // brand (code defaults are deliberately neutral)
+        let brand = crate::config::BrandingConfig {
+            name: "Example Store".to_string(),
+            support_email: "support@example.com".to_string(),
+            site_url: "https://example.com".to_string(),
+            logo_url: "https://example.com/images/logo.png".to_string(),
+            accent_color: "#ff4d00".to_string(),
+        };
+        let rendered = template
+            .render_html_with_brand(&TemplateVariables::new(), &brand)
+            .unwrap()
+            .unwrap();
+        assert!(
+            rendered.contains("logo.png"),
+            "Rendered template should include the brand logo"
+        );
+        assert!(
+            rendered.contains("Thank you for your order"),
+            "Rendered template should include the greeting"
         );
     }
 
@@ -53,7 +71,15 @@ mod notification_integration_tests {
         variables.insert("order_total", "99.99");
         variables.insert("order_date", "Jan 25, 2026");
         variables.insert("company_name", "R Commerce");
-        variables.insert("support_email", "support@rcommerce.app");
+        variables.insert("support_email", "support@example.com");
+        variables.insert(
+            "shipping_address",
+            "<strong>John Doe</strong><br>123 Main St<br>San Francisco, CA 94102<br>US",
+        );
+        variables.insert(
+            "billing_address",
+            "<strong>John Doe</strong><br>123 Main St<br>San Francisco, CA 94102<br>US",
+        );
 
         // Test plain text rendering
         let template = NotificationTemplate::load("order_confirmation").unwrap();
@@ -80,10 +106,10 @@ mod notification_integration_tests {
             html.contains("John Doe"),
             "HTML should contain customer name"
         );
-        assert!(html.contains("$99.99"), "HTML should contain order total");
+        assert!(html.contains("99.99"), "HTML should contain order total");
         assert!(
-            html.contains("R Commerce"),
-            "HTML should contain company name"
+            html.contains("123 Main St"),
+            "HTML should contain shipping address"
         );
     }
 
@@ -185,21 +211,16 @@ mod notification_integration_tests {
         let template = NotificationTemplate::load("order_confirmation_html").unwrap();
         let html = template.html_body.unwrap();
 
-        // List of all expected placeholders
+        // List of all expected placeholders — must match the variables that
+        // EmailNotificationFactory::order_confirmation actually populates.
         let expected_placeholders = vec![
             "order_number",
             "order_date",
             "order_total",
             "customer_name",
-            "shipping_street",
-            "shipping_city_state_zip",
-            "shipping_country",
-            "billing_company",
-            "billing_street",
-            "billing_city",
-            "billing_country",
-            "company_name",
-            "support_email",
+            "items",
+            "shipping_address",
+            "billing_address",
         ];
 
         for placeholder in expected_placeholders {

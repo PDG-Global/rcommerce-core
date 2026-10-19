@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>R Commerce Demo Store</title>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Martian+Mono:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- Libraries -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['Martian Mono', 'monospace'],
+                    },
+                    colors: {
+                        rust: '#EB4F27',
+                        dark: '#0F0F0F',
+                        gray: { 50: '#F9FAFB', 100: '#F3F4F6', 800: '#1F2937', 900: '#111827' }
+                    },
+                    animation: {
+                        'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'slide-up': 'slideUp 0.3s ease-out forwards',
+                    },
+                    keyframes: {
+                        slideUp: {
+                            '0%': { transform: 'translateY(20px)', opacity: '0' },
+                            '100%': { transform: 'translateY(0)', opacity: '1' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body { background-color: #ffffff; color: #0F0F0F; }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        
+        /* Loader */
+        .loader {
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #EB4F27;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        /* Modal backdrop */
+        .modal-backdrop {
+            background-color: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(4px);
+        }
+        
+        /* Toast notifications */
+        .toast-container {
+            position: fixed;
+            top: 80px;
+            right: 20px;
+            z-index: 60;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .toast {
+            background: white;
+            border-left: 4px solid #EB4F27;
+            padding: 16px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            animation: slideInRight 0.3s ease-out;
+            max-width: 300px;
+        }
+        
+        .toast.success { border-left-color: #22c55e; }
+        .toast.error { border-left-color: #ef4444; }
+        
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        
+        /* Product card hover effect */
+        .product-card {
+            transition: all 0.3s ease;
+        }
+        .product-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 24px rgba(0,0,0,0.1);
+        }
+        
+        /* Button press effect */
+        .btn-press:active {
+            transform: scale(0.98);
+        }
+    </style>
+</head>
+<body class="font-sans antialiased min-h-screen flex flex-col bg-gray-50">
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
+
+    <!-- API Telemetry Console (Fixed Bottom) -->
+    <div id="telemetry" class="fixed bottom-4 right-4 z-50 w-80 pointer-events-none flex flex-col gap-2 items-end">
+        <!-- Logs injected here -->
+    </div>
+
+    <!-- Navigation -->
+    <nav class="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-gray-200">
+        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+            <!-- Logo -->
+            <a href="#" onclick="app.router('home'); return false;" class="flex items-center gap-3 group">
+                 <svg viewBox="0 0 848 848" class="w-8 h-8 text-black group-hover:text-rust transition-colors" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <g transform="matrix(1,0,0,1,-981.69,-347.171)">
+                        <g transform="matrix(0.99996,0,0,1.00835,-10.514,-9.34551)">
+                            <path d="M1839.58,505.224L1839.58,1042.69C1839.58,1126.12 1771.28,1193.85 1687.15,1193.85L1145.17,1193.85C1061.05,1193.85 992.743,1126.12 992.743,1042.69L992.743,505.224C992.743,421.795 1061.05,354.062 1145.17,354.062L1687.15,354.062C1771.28,354.062 1839.58,421.795 1839.58,505.224Z" stroke="currentColor" stroke-width="60"/>
+                        </g>
+                        <g transform="matrix(1,0,0,1,20.899,-0.15612)">
+                            <g transform="matrix(1.09709,0,0,1,-130.201,-5.8933)">
+                                <rect x="1245.19" y="542.021" width="111.19" height="470.199" fill="currentColor"/>
+                            </g>
+                            <g transform="matrix(1,0,0,1,-6.81494,-1.30258)">
+                                <circle cx="1493.65" cy="622.083" r="84.653" fill="currentColor"/>
+                            </g>
+                        </g>
+                    </g>
+                </svg>
+                <span class="font-bold text-lg tracking-tight font-mono text-black uppercase hidden sm:block">RCOMMERCE</span>
+            </a>
+
+            <!-- Search -->
+            <div class="flex-1 max-w-md mx-4 sm:mx-8">
+                <div class="relative group">
+                    <input type="text" id="search-input" placeholder="Search products..." 
+                           class="w-full bg-gray-100 border-none rounded-md py-2 pl-10 pr-4 text-sm font-mono focus:ring-2 focus:ring-rust focus:bg-white transition-all"
+                           onkeyup="app.handleSearch(event)">
+                    <i data-lucide="search" class="absolute left-3 top-2.5 w-4 h-4 text-gray-400 group-focus-within:text-rust"></i>
+                </div>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex items-center gap-2 sm:gap-6">
+                <!-- User -->
+                <div class="relative group" id="user-menu">
+                    <!-- Injected by JS -->
+                </div>
+
+                <!-- Cart -->
+                <button onclick="app.router('cart')" class="relative p-2 hover:bg-gray-100 rounded-md transition-colors group">
+                    <i data-lucide="shopping-bag" class="w-5 h-5 text-gray-600 group-hover:text-black"></i>
+                    <span id="cart-count" class="absolute top-0 right-0 bg-rust text-white text-[10px] font-bold font-mono px-1.5 py-0.5 rounded-full hidden">0</span>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main App Container -->
+    <div id="app" class="flex-grow w-full max-w-7xl mx-auto px-4 py-8">
+        <!-- Content injected here -->
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-white border-t border-gray-200 py-12 mt-auto">
+        <div class="max-w-7xl mx-auto px-4 text-center">
+            <div class="flex justify-center items-center gap-2 mb-4 opacity-50">
+                 <svg viewBox="0 0 848 848" class="w-6 h-6 text-black" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <g transform="matrix(1,0,0,1,-981.69,-347.171)">
+                        <g transform="matrix(0.99996,0,0,1.00835,-10.514,-9.34551)">
+                            <path d="M1839.58,505.224L1839.58,1042.69C1839.58,1126.12 1771.28,1193.85 1687.15,1193.85L1145.17,1193.85C1061.05,1193.85 992.743,1126.12 992.743,1042.69L992.743,505.224C992.743,421.795 1061.05,354.062 1145.17,354.062L1687.15,354.062C1771.28,354.062 1839.58,421.795 1839.58,505.224Z" stroke="currentColor" stroke-width="60"/>
+                        </g>
+                        <g transform="matrix(1,0,0,1,20.899,-0.15612)">
+                            <g transform="matrix(1.09709,0,0,1,-130.201,-5.8933)">
+                                <rect x="1245.19" y="542.021" width="111.19" height="470.199" fill="currentColor"/>
+                            </g>
+                            <g transform="matrix(1,0,0,1,-6.81494,-1.30258)">
+                                <circle cx="1493.65" cy="622.083" r="84.653" fill="currentColor"/>
+                            </g>
+                        </g>
+                    </g>
+                </svg>
+                <span class="font-mono font-bold text-sm tracking-widest">RCOMMERCE DEMO</span>
+            </div>
+            <p class="text-gray-500 text-xs font-mono">
+                Powered by R Commerce API v1.0. <br class="sm:hidden">
+                Open Source & Self-Hosted.
+            </p>
+        </div>
+    </footer>
+
+    <!-- Application Logic -->
+    <script src="api.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,80 @@
+---
+import CartDrawer from '../islands/CartDrawer.tsx';
+import { brand, content } from '../lib/brand';
+
+interface Props {
+  title: string;
+  description?: string;
+  image?: string;
+  url?: string;
+  type?: string;
+}
+
+const {
+  title,
+  description = content.tagline,
+  image,
+  url,
+  type = 'website',
+} = Astro.props;
+
+const canonical = url || `${Astro.url.origin}${Astro.url.pathname}`;
+const siteName = brand.name;
+const ogImage = image
+  ? image.startsWith('http')
+    ? image
+    : new URL(image, Astro.url.origin).href
+  : undefined;
+const fullTitle = title.includes(siteName) ? title : `${title} | ${siteName}`;
+const schemaOrg = {
+  '@context': 'https://schema.org',
+  '@type': 'WebSite',
+  name: siteName,
+  url: Astro.url.origin,
+  potentialAction: {
+    '@type': 'SearchAction',
+    target: `${Astro.url.origin}/products?q={search_term_string}`,
+    'query-input': 'required name=search_term_string',
+  },
+};
+---
+
+<!doctype html>
+<html lang="en" class={brand.htmlClass}>
+  <head>
+    {brand.themeStylesheet && <link rel="stylesheet" href={brand.themeStylesheet} />}
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    {brand.favicons && (
+      <>
+        <link rel="icon" href={brand.favicons.any} sizes="any" />
+        <link rel="icon" type="image/png" sizes="32x32" href={brand.favicons.png32} />
+        <link rel="icon" type="image/png" sizes="16x16" href={brand.favicons.png16} />
+        <link rel="apple-touch-icon" href={brand.favicons.apple} />
+      </>
+    )}
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta property="og:type" content={type} />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content={siteName} />
+    {ogImage && <meta property="og:image" content={ogImage} />}
+    <meta name="twitter:card" content={ogImage ? 'summary_large_image' : 'summary'} />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    {ogImage && <meta name="twitter:image" content={ogImage} />}
+    <slot name="head" />
+    <title>{fullTitle}</title>
+    <script type="application/ld+json" set:html={JSON.stringify(schemaOrg)} />
+  </head>
+  <body class="min-h-screen flex flex-col">
+    <slot />
+    <CartDrawer client:load />
+  </body>
+</html>
+
+<style is:global>
+  @import '../styles/global.css';
+</style>

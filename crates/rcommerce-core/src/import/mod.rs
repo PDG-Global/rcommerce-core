@@ -55,6 +55,18 @@ pub trait PlatformImporter: Send + Sync {
         progress: &(dyn Fn(ImportProgress) + Send + Sync),
     ) -> ImportResult<ImportStats>;
 
+    /// Import product reviews from the platform.
+    ///
+    /// Not all platforms expose reviews; the default implementation is a
+    /// no-op so existing importers keep compiling.
+    async fn import_reviews(
+        &self,
+        _config: &ImportConfig,
+        _progress: &(dyn Fn(ImportProgress) + Send + Sync),
+    ) -> ImportResult<ImportStats> {
+        Ok(ImportStats::default())
+    }
+
     /// Import all data (products, customers, orders)
     async fn import_all(
         &self,

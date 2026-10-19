@@ -231,12 +231,12 @@ impl ProductRepository {
                 title, slug, description, sku, product_type, price, compare_at_price, cost_price,
                 currency, inventory_quantity, inventory_policy, inventory_management,
                 continues_selling_when_out_of_stock, weight, weight_unit, requires_shipping,
-                is_active, is_featured, seo_title, seo_description,
+                is_active, is_featured, seo_title, seo_description, gtin,
                 file_url, file_size, file_hash, download_limit, license_key_enabled, download_expiry_days,
                 bundle_pricing_strategy, bundle_discount_percentage
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                    $21, $22, $23, $24, $25, $26, $27, $28)
+                    $21, $22, $23, $24, $25, $26, $27, $28, $29)
             RETURNING *
             "#
         )
@@ -260,6 +260,7 @@ impl ProductRepository {
         .bind(request.is_featured)
         .bind(request.seo_title)
         .bind(request.seo_description)
+        .bind(request.gtin)
         // Digital product fields
         .bind(request.file_url)
         .bind(request.file_size)
@@ -285,6 +286,7 @@ impl ProductRepository {
         let has_title = request.title.is_some();
         let has_slug = request.slug.is_some();
         let has_description = request.description.is_some();
+        let has_gtin = request.gtin.is_some();
         let has_price = request.price.is_some();
         let has_currency = request.currency.is_some();
         let has_is_active = request.is_active.is_some();
@@ -309,6 +311,10 @@ impl ProductRepository {
         if has_description {
             param_count += 1;
             sets.push(format!("description = ${}", param_count));
+        }
+        if has_gtin {
+            param_count += 1;
+            sets.push(format!("gtin = ${}", param_count));
         }
         if has_price {
             param_count += 1;
@@ -382,6 +388,9 @@ impl ProductRepository {
         if let Some(description) = request.description {
             query_builder = query_builder.bind(description);
         }
+        if let Some(gtin) = request.gtin {
+            query_builder = query_builder.bind(gtin);
+        }
         if let Some(price) = request.price {
             query_builder = query_builder.bind(price);
         }
@@ -442,8 +451,16 @@ impl ProductRepository {
         let mut query = String::from("SELECT COUNT(*) FROM products WHERE 1=1");
         
         // Add same filters as find_with_filter
-        if let Some(_status) = filter.status {
-            // TODO: Add status filtering
+        if let Some(status) = filter.status {
+            match status {
+                super::super::models::product::ProductStatus::Active => {
+                    query.push_str(" AND is_active = true");
+                }
+                super::super::models::product::ProductStatus::Draft => {
+                    query.push_str(" AND is_active = false AND published_at IS NULL");
+                }
+                super::super::models::product::ProductStatus::Archived => {}
+            }
         }
         
         if filter.category_id.is_some() {

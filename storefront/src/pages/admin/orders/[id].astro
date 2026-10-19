@@ -1,0 +1,18 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import Nav from '../../../components/Nav.astro';
+import Footer from '../../../components/Footer.astro';
+import AdminOrderDetail from '../../../islands/AdminOrderDetail.tsx';
+
+const { id } = Astro.params;
+---
+
+<Layout title="Admin · Order | rCommerce">
+  <Nav />
+  <main class="flex-1 py-14">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+      <AdminOrderDetail orderId={id ?? ''} client:load />
+    </div>
+  </main>
+  <Footer />
+</Layout>

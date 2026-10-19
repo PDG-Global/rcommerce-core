@@ -306,10 +306,15 @@ mod tests {
         let pool = RedisPool::new(config).await;
 
         if let Ok(pool) = pool {
-            // Reset any existing rate limit
-            let conn = pool.get().await.unwrap();
-            let key = "test:rate:limit:192.168.1.1/minute/0".to_string();
-            let _ = conn.del(&key).await;
+            // Unique identifier per run: the rate-limit key embeds the current
+            // time bucket, and the previous hardcoded "delete first" key never
+            // matched it, so shared state from earlier runs made the usage
+            // assertion below flaky.
+            let identifier = format!(
+                "10.255.{}.{}",
+                std::process::id() % 256,
+                uuid::Uuid::new_v4().simple()
+            );
 
             let limiter = RedisRateLimiter::new(pool, RedisConfig::default())
                 .await
@@ -317,14 +322,14 @@ mod tests {
 
             // First request should be allowed
             let allowed = limiter
-                .check_rate_limit(CacheNamespace::RateLimit, "192.168.1.1", "minute", 5)
+                .check_rate_limit(CacheNamespace::RateLimit, &identifier, "minute", 5)
                 .await
                 .unwrap();
             assert!(allowed);
 
             // Get usage
             let usage = limiter
-                .get_usage(CacheNamespace::RateLimit, "192.168.1.1", "minute")
+                .get_usage(CacheNamespace::RateLimit, &identifier, "minute")
                 .await
                 .unwrap();
             assert_eq!(usage, Some(1));

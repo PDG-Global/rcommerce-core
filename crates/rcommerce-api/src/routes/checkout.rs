@@ -5,7 +5,12 @@
 //! - POST /checkout/shipping - Select shipping method
 //! - POST /checkout/complete - Complete checkout, create order and process payment
 
-use axum::{extract::State, http::StatusCode, routing::post, Extension, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Extension, Json, Router,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,7 +21,8 @@ use crate::state::AppState;
 // Import core checkout types
 use rcommerce_core::models::Address;
 use rcommerce_core::notification::{
-    service::NotificationService, Notification, NotificationChannel, NotificationPriority,
+    service::NotificationService, Address as EmailAddress, Notification, NotificationChannel,
+    NotificationPriority, OrderConfirmationParams, OrderItem,
 };
 use rcommerce_core::payment::{CardDetails, PaymentMethod};
 use rcommerce_core::services::{
@@ -54,6 +60,10 @@ pub struct CompleteCheckoutApiRequest {
     pub vat_id: Option<String>,
     pub notes: Option<String>,
     pub selected_shipping_rate: ShippingRateResponse,
+    /// Mark this order as a test order (accounting spec 2.2). Exported with
+    /// test=true so accounting can book it to a suspense account.
+    #[serde(default)]
+    pub test: Option<bool>,
 }
 
 /// Request to confirm checkout after client-side payment confirmation
@@ -201,6 +211,8 @@ pub struct CheckoutSummaryResponse {
     pub tax_breakdown: Vec<TaxBreakdownResponse>,
     pub vat_id_valid: Option<bool>,
     pub publishable_key: Option<String>,
+    pub airwallex_client_id: Option<String>,
+    pub airwallex_env: Option<String>,
 }
 
 impl From<CheckoutSummary> for CheckoutSummaryResponse {
@@ -248,6 +260,8 @@ impl From<CheckoutSummary> for CheckoutSummaryResponse {
                 .collect(),
             vat_id_valid: summary.vat_id_valid,
             publishable_key: summary.publishable_key,
+            airwallex_client_id: summary.airwallex_client_id,
+            airwallex_env: summary.airwallex_env,
         }
     }
 }
@@ -354,6 +368,21 @@ pub async fn initiate_checkout(
     Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<InitiateCheckoutApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+    if let Some(ref billing) = request.billing_address {
+        super::require_address_phone(&billing.phone).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+    }
+
     // Build the core request
     let currency = request
         .currency
@@ -393,6 +422,13 @@ pub async fn select_shipping(
     Extension(_auth): Extension<Option<JwtAuth>>,
     Json(request): Json<SelectShippingApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+
     // Convert shipping rate and create package estimate
     let shipping_rate: rcommerce_core::shipping::ShippingRate = request.shipping_rate.into();
 
@@ -446,34 +482,20 @@ pub async fn complete_checkout(
         ));
     }
 
-    // Authenticated customers must have a verified email to check out.
-    if let Some(ref auth) = auth {
-        let customer = state
-            .customer_service
-            .find_by_id(auth.customer_id)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "Customer not found"})),
-                )
-            })?;
-
-        if !customer.email_verified {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "Please verify your email before checking out.",
-                    "code": "email_verification_required"
-                })),
-            ));
-        }
+    // Phone is required on the shipping address (and billing, when supplied).
+    super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+    if let Some(ref billing) = request.billing_address {
+        super::require_address_phone(&billing.phone).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
     }
 
     // Authenticated customers must have a verified email to check out.
@@ -517,12 +539,17 @@ pub async fn complete_checkout(
         vat_id: request.vat_id,
         notes: request.notes,
         selected_shipping_rate: request.selected_shipping_rate.into(),
+        test: request.test,
     };
 
     // Call checkout service
     match state.checkout_service.complete_checkout(core_request).await {
         Ok(result) => {
             let response: CheckoutResultResponse = result.into();
+            // No admin notification here: orders that still require payment
+            // confirmation are not real orders yet. The shop operator is
+            // emailed exactly when payment confirms (webhook or /checkout/confirm).
+
             // Fire-and-forget order confirmation email if SMTP configured
             if !response.requires_confirmation {
                 if let Some(ref svc) = state.notification_service {
@@ -530,18 +557,34 @@ pub async fn complete_checkout(
                     let customer_email = response.order.customer_email.clone();
                     let order_service = state.order_service.clone();
                     let customer_service = state.customer_service.clone();
+                    let db = state.db.clone();
+                    let branding = state.branding.clone();
                     let svc = svc.clone();
                     tokio::spawn(async move {
                         if let Err(e) = send_order_confirmation_email(
                             &svc,
                             &order_service,
                             &customer_service,
+                            &db,
+                            &branding,
                             order_id,
                             &customer_email,
                         )
                         .await
                         {
                             tracing::error!("Failed to send order confirmation email: {}", e);
+                        }
+                    });
+                }
+
+                // Fire-and-forget Xero invoice sync for paid orders
+                if let Some(ref xero) = state.xero_client {
+                    let xero = xero.clone();
+                    let order_service = state.order_service.clone();
+                    let order_id = response.order.id;
+                    tokio::spawn(async move {
+                        if let Err(e) = sync_order_to_xero(&xero, &order_service, order_id).await {
+                            tracing::error!("Failed to sync order {} to Xero: {}", order_id, e);
                         }
                     });
                 }
@@ -572,29 +615,64 @@ pub async fn confirm_checkout(
         cart_id: request.cart_id,
     };
 
+    // Remember whether this call is the one transitioning the order: only a
+    // pending order is a real payment-confirmation transition; a racing
+    // duplicate (webhook beating us, or a client retry) must not re-notify.
+    let was_pending = matches!(
+        sqlx::query_scalar::<_, String>("SELECT status::text FROM orders WHERE id = $1")
+            .bind(request.order_id)
+            .fetch_optional(state.db.pool())
+            .await,
+        Ok(Some(s)) if s == "pending"
+    );
+
     match state.checkout_service.confirm_checkout(core_request).await {
         Ok(result) => {
             let response: CheckoutResultResponse = result.into();
-            // Fire-and-forget order confirmation email if SMTP configured
-            if let Some(ref svc) = state.notification_service {
-                let order_id = response.order.id;
-                let customer_email = response.order.customer_email.clone();
-                let order_service = state.order_service.clone();
-                let customer_service = state.customer_service.clone();
-                let svc = svc.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = send_order_confirmation_email(
-                        &svc,
-                        &order_service,
-                        &customer_service,
-                        order_id,
-                        &customer_email,
-                    )
-                    .await
-                    {
-                        tracing::error!("Failed to send order confirmation email: {}", e);
-                    }
-                });
+            // Only a pending order is a real payment-confirmation transition. A
+            // racing duplicate (webhook beating us, or a client retry) must not
+            // re-notify: the admin email, customer confirmation and Xero sync
+            // all fire exactly once per order.
+            if was_pending {
+                super::email_helpers::send_admin_order_email(&state, response.order.id).await;
+
+                // Fire-and-forget order confirmation email if SMTP configured
+                if let Some(ref svc) = state.notification_service {
+                    let order_id = response.order.id;
+                    let customer_email = response.order.customer_email.clone();
+                    let order_service = state.order_service.clone();
+                    let customer_service = state.customer_service.clone();
+                    let db = state.db.clone();
+                    let branding = state.branding.clone();
+                    let svc = svc.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = send_order_confirmation_email(
+                            &svc,
+                            &order_service,
+                            &customer_service,
+                            &db,
+                            &branding,
+                            order_id,
+                            &customer_email,
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to send order confirmation email: {}", e);
+                        }
+                    });
+                }
+
+                // Fire-and-forget Xero invoice sync for paid orders
+                if let Some(ref xero) = state.xero_client {
+                    let xero = xero.clone();
+                    let order_service = state.order_service.clone();
+                    let order_id = response.order.id;
+                    tokio::spawn(async move {
+                        if let Err(e) = sync_order_to_xero(&xero, &order_service, order_id).await {
+                            tracing::error!("Failed to sync order {} to Xero: {}", order_id, e);
+                        }
+                    });
+                }
             }
             Ok((StatusCode::OK, Json(response)))
         }
@@ -612,6 +690,8 @@ async fn send_order_confirmation_email(
     notification_service: &NotificationService,
     order_service: &OrderService,
     customer_service: &CustomerService,
+    db: &rcommerce_core::repository::Database,
+    branding: &rcommerce_core::BrandingConfig,
     order_id: Uuid,
     customer_email: &str,
 ) -> rcommerce_core::Result<()> {
@@ -620,7 +700,7 @@ async fn send_order_confirmation_email(
         None => return Ok(()),
     };
 
-    let _customer = match order_detail.order.customer_id {
+    let customer = match order_detail.order.customer_id {
         Some(id) => {
             let detail = customer_service.get_customer(id).await?;
             detail.map(|d| d.customer)
@@ -628,29 +708,258 @@ async fn send_order_confirmation_email(
         None => None,
     };
 
-    let notification = Notification::new(
-        NotificationChannel::Email,
-        customer_email.to_string(),
-        format!("Order Confirmation: {}", order_detail.order.order_number),
-        format!(
-            "Thank you for your order!\n\nOrder Number: {}\nTotal: {} {}\nStatus: {:?}\n\nWe'll send you another email when your order ships.",
-            order_detail.order.order_number,
-            order_detail.order.total,
-            order_detail.order.currency,
-            order_detail.order.status
+    // Load the full order row for the JSON address snapshot (works for guest
+    // orders where customer_id is NULL) and the shipping method label.
+    let invoice_order = super::payment::fetch_invoice_order(db, order_id).await.ok();
+
+    let json_first_name = invoice_order
+        .as_ref()
+        .and_then(|(order, _)| {
+            order
+                .shipping_address
+                .as_ref()
+                .and_then(|v| v.get("first_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.is_empty());
+    let customer_name = customer
+        .as_ref()
+        .filter(|c| !c.first_name.is_empty())
+        .map(|c| c.first_name.clone())
+        .or(json_first_name)
+        .unwrap_or_else(|| "there".to_string());
+
+    // Convert order items to email template format
+    let email_items: Vec<rcommerce_core::notification::OrderItem> = order_detail
+        .items
+        .iter()
+        .map(|item| rcommerce_core::notification::OrderItem {
+            name: item.name.clone(),
+            variant_title: item.variant_name.clone(),
+            sku: item.sku.clone().unwrap_or_default(),
+            quantity: item.quantity,
+            price: format!(
+                "{:.2}",
+                item.price * rust_decimal::Decimal::from(item.quantity)
+            ),
+            is_bundle_component: item.is_bundle_component == Some(true),
+        })
+        .collect();
+
+    // Prefer the order's JSON address snapshot; fall back to the customer's
+    // address book for registered customers.
+    let json_shipping = invoice_order.as_ref().and_then(|(order, _)| {
+        order
+            .shipping_address
+            .as_ref()
+            .and_then(super::payment::email_address_from_json)
+            .or_else(|| {
+                order
+                    .billing_address
+                    .as_ref()
+                    .and_then(super::payment::email_address_from_json)
+            })
+    });
+    let json_billing = invoice_order.as_ref().and_then(|(order, _)| {
+        order
+            .billing_address
+            .as_ref()
+            .and_then(super::payment::email_address_from_json)
+            .or_else(|| {
+                order
+                    .shipping_address
+                    .as_ref()
+                    .and_then(super::payment::email_address_from_json)
+            })
+    });
+
+    let full_name = customer
+        .as_ref()
+        .map(|c| format!("{} {}", c.first_name, c.last_name))
+        .filter(|n| !n.trim().is_empty());
+
+    let shipping_addr = match json_shipping {
+        Some(addr) => addr,
+        None => {
+            let from_book = if let (Some(addr_id), Some(cust_id)) = (
+                order_detail.order.shipping_address_id,
+                order_detail.order.customer_id,
+            ) {
+                sqlx::query_as::<_, rcommerce_core::common::Address>(
+                    "SELECT * FROM addresses WHERE id = $1 AND customer_id = $2",
+                )
+                .bind(addr_id)
+                .bind(cust_id)
+                .fetch_optional(db.pool())
+                .await?
+                .map(|a| rcommerce_core::notification::Address {
+                    name: format!("{} {}", a.first_name, a.last_name),
+                    street: a.address1,
+                    city: a.city,
+                    state: a.state.unwrap_or_default(),
+                    zip: a.zip,
+                    country: a.country,
+                })
+            } else {
+                None
+            };
+            from_book.unwrap_or_else(|| rcommerce_core::notification::Address {
+                name: full_name.clone().unwrap_or_else(|| "there".to_string()),
+                street: String::new(),
+                city: String::new(),
+                state: String::new(),
+                zip: String::new(),
+                country: String::new(),
+            })
+        }
+    };
+    let billing_addr = json_billing.unwrap_or_else(|| shipping_addr.clone());
+
+    let shipping_method = invoice_order
+        .as_ref()
+        .and_then(|(order, _)| order.shipping_method.clone())
+        .map(|m| rcommerce_core::invoice::display_shipping_method(&m))
+        .unwrap_or_default();
+
+    let params = rcommerce_core::notification::OrderConfirmationParams {
+        recipient_email: customer_email,
+        customer_name: &customer_name,
+        order_number: &order_detail.order.order_number,
+        order_date: &order_detail
+            .order
+            .created_at
+            .format("%B %d, %Y")
+            .to_string(),
+        order_total: &format!(
+            "{} {:.2}",
+            order_detail.order.currency, order_detail.order.total
         ),
-    )
-    .with_priority(NotificationPriority::High)
-    .with_html_body(format!(
-        "<h1>Thank you for your order!</h1><p><strong>Order Number:</strong> {}</p><p><strong>Total:</strong> {} {}</p><p><strong>Status:</strong> {:?}</p><p>We'll send you another email when your order ships.</p>",
-        order_detail.order.order_number,
-        order_detail.order.total,
-        order_detail.order.currency,
-        order_detail.order.status
-    ));
+        subtotal: &format!("${:.2}", order_detail.order.subtotal),
+        discount_total: &format!("${:.2}", order_detail.order.discount_total),
+        discount_code: order_detail.order.coupon_code.as_deref(),
+        shipping_total: &format!("${:.2}", order_detail.order.shipping_total),
+        shipping_method: &shipping_method,
+        tax_total: &format!("${:.2}", order_detail.order.tax_total),
+        items: &email_items,
+        shipping_address: &shipping_addr,
+        billing_address: &billing_addr,
+        branding,
+    };
+
+    let notification =
+        rcommerce_core::notification::EmailNotificationFactory::order_confirmation(params)?;
 
     notification_service.send(&notification).await?;
     Ok(())
+}
+
+/// Sync a paid order to Xero: create an ACCREC invoice and reconcile it
+/// with a matching payment. Runs fire-and-forget after checkout completes.
+async fn sync_order_to_xero(
+    xero: &rcommerce_core::accounting::XeroClient,
+    order_service: &OrderService,
+    order_id: Uuid,
+) -> rcommerce_core::Result<()> {
+    use rcommerce_core::accounting::{XeroInvoiceLine, XeroInvoiceParams};
+    use rust_decimal::Decimal;
+
+    let order_detail = match order_service.get_order(order_id).await? {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let order = &order_detail.order;
+
+    // Build invoice lines from order items
+    let mut lines: Vec<XeroInvoiceLine> = order_detail
+        .items
+        .iter()
+        .map(|item| XeroInvoiceLine {
+            description: format!(
+                "{}{}",
+                item.name,
+                item.sku
+                    .as_ref()
+                    .map(|s| format!(" ({})", s))
+                    .unwrap_or_default()
+            ),
+            quantity: Decimal::from(item.quantity),
+            unit_amount: item.price,
+            account_code: "200".to_string(),
+        })
+        .collect();
+
+    // Add shipping as a separate line item
+    if order.shipping_total > Decimal::ZERO {
+        lines.push(XeroInvoiceLine {
+            description: "Shipping".to_string(),
+            quantity: Decimal::ONE,
+            unit_amount: order.shipping_total,
+            account_code: "200".to_string(),
+        });
+    }
+
+    // Add tax as a separate line item (LineAmountTypes is Inclusive, so tax
+    // is reported as part of line amounts in Xero — this line keeps the
+    // invoice total aligned with the order when tax applies)
+    if order.tax_total > Decimal::ZERO {
+        lines.push(XeroInvoiceLine {
+            description: "Tax / VAT".to_string(),
+            quantity: Decimal::ONE,
+            unit_amount: order.tax_total,
+            account_code: "200".to_string(),
+        });
+    }
+
+    // Apply discount as a negative line item
+    if order.discount_total > Decimal::ZERO {
+        lines.push(XeroInvoiceLine {
+            description: "Discount".to_string(),
+            quantity: Decimal::ONE,
+            unit_amount: -order.discount_total,
+            account_code: "200".to_string(),
+        });
+    }
+
+    let params = XeroInvoiceParams {
+        order_id: order.id,
+        // The Xero invoice number must match the accounting export's order_id
+        // (store-prefixed reference like "88-1024", spec 2.3).
+        order_number: order
+            .invoice_number
+            .clone()
+            .unwrap_or_else(|| order.order_number.clone()),
+        customer_name: order
+            .customer_email
+            .split('@')
+            .next()
+            .unwrap_or("Customer")
+            .to_string(),
+        customer_email: order.customer_email.clone(),
+        currency: order.currency.clone(),
+        lines,
+        total: order.total,
+        date: order.created_at.format("%Y-%m-%d").to_string(),
+        reference: format!("rCommerce order {}", order.order_number),
+    };
+
+    let invoice_id = xero.sync_paid_order(&params).await?;
+
+    tracing::info!(
+        "Order {} synced to Xero invoice {}",
+        order.order_number,
+        invoice_id
+    );
+
+    Ok(())
+}
+
+/// GET /api/v1/shipping/countries - public list of shippable country codes
+/// (the storefront filters its country selector to these).
+pub async fn shipping_countries() -> Json<serde_json::Value> {
+    let provider = rcommerce_core::shipping::carriers::WeightBasedProvider::new();
+    Json(serde_json::json!({ "countries": provider.shippable_countries() }))
 }
 
 /// Router for checkout routes
@@ -660,4 +969,5 @@ pub fn router() -> Router<AppState> {
         .route("/checkout/shipping", post(select_shipping))
         .route("/checkout/complete", post(complete_checkout))
         .route("/checkout/confirm", post(confirm_checkout))
+        .route("/shipping/countries", get(shipping_countries))
 }

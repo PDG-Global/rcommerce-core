@@ -1,12 +1,15 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::get,
+    response::IntoResponse,
+    routing::{get, post, put},
     Json, Router,
 };
 use rust_decimal::Decimal;
 
+use rcommerce_core::order::OrderStatus as LifecycleOrderStatus;
 use rcommerce_core::tax::TaxService;
+use rcommerce_core::Error;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,9 +52,39 @@ pub struct OrderResponse {
     pub subtotal: Decimal,
     pub tax_total: Decimal,
     pub shipping_total: Decimal,
+    pub discount_total: Decimal,
+    pub coupon_code: Option<String>,
     pub total: Decimal,
     pub items: Vec<OrderItemResponse>,
+    pub payments: Vec<OrderPaymentResponse>,
+    pub billing_address: Option<serde_json::Value>,
+    pub shipping_address: Option<serde_json::Value>,
+    pub notes: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrderPaymentResponse {
+    pub id: Uuid,
+    pub amount: Decimal,
+    pub currency: String,
+    pub status: String,
+    pub gateway: String,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
+    pub processed_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PaymentRow {
+    id: Uuid,
+    amount: Decimal,
+    currency_text: String,
+    status_text: String,
+    gateway: String,
+    card_brand: Option<String>,
+    card_last_four: Option<String>,
+    processed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,9 +107,15 @@ pub async fn list_orders(
     Extension(auth): Extension<JwtAuth>,
 ) -> Json<serde_json::Value> {
     let query = if auth.is_admin() {
-        format!("SELECT {} FROM orders ORDER BY created_at DESC LIMIT 50", ORDER_COLUMNS)
+        format!(
+            "SELECT {} FROM orders ORDER BY created_at DESC LIMIT 50",
+            ORDER_COLUMNS
+        )
     } else {
-        format!("SELECT {} FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50", ORDER_COLUMNS)
+        format!(
+            "SELECT {} FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50",
+            ORDER_COLUMNS
+        )
     };
 
     let result = if auth.is_admin() {
@@ -106,8 +145,14 @@ pub async fn list_orders(
                     subtotal: o.subtotal,
                     tax_total: o.tax_total,
                     shipping_total: o.shipping_total,
+                    discount_total: o.discount_total,
+                    coupon_code: o.coupon_code.clone(),
                     total: o.total,
                     items: vec![], // Will be populated separately
+                    payments: vec![],
+                    billing_address: o.billing_address.clone(),
+                    shipping_address: o.shipping_address.clone(),
+                    notes: o.notes.clone(),
                     created_at: o.created_at.to_rfc3339(),
                 })
                 .collect();
@@ -141,9 +186,10 @@ pub async fn get_order(
     Extension(auth): Extension<JwtAuth>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<OrderResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(
-        &format!("SELECT {} FROM orders WHERE id = $1", ORDER_COLUMNS),
-    )
+    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(&format!(
+        "SELECT {} FROM orders WHERE id = $1",
+        ORDER_COLUMNS
+    ))
     .bind(id)
     .fetch_optional(state.db.pool())
     .await
@@ -204,11 +250,46 @@ pub async fn get_order(
         })
         .collect();
 
+    // Get payment records for the order
+    let payment_rows = match sqlx::query_as::<_, PaymentRow>(
+        r#"
+        SELECT id, amount, currency::text AS currency_text, status::text AS status_text,
+               gateway, card_brand, card_last_four, processed_at
+        FROM payments
+        WHERE order_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(id)
+    .fetch_all(state.db.pool())
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("Failed to load payments for order {}: {}", id, e);
+            vec![]
+        }
+    };
+
+    let payment_responses: Vec<OrderPaymentResponse> = payment_rows
+        .into_iter()
+        .map(|p| OrderPaymentResponse {
+            id: p.id,
+            amount: p.amount,
+            currency: p.currency_text,
+            status: p.status_text,
+            gateway: p.gateway,
+            card_brand: p.card_brand,
+            card_last_four: p.card_last_four,
+            processed_at: p.processed_at.map(|t| t.to_rfc3339()),
+        })
+        .collect();
+
     Ok(Json(OrderResponse {
         id: order.id,
         order_number: order.order_number,
         customer_id: order.customer_id,
-                    customer_email: order.customer_email,
+        customer_email: order.customer_email,
         status: format!("{:?}", order.status).to_lowercase(),
         payment_status: format!("{:?}", order.payment_status).to_lowercase(),
         fulfillment_status: format!("{:?}", order.fulfillment_status).to_lowercase(),
@@ -216,8 +297,14 @@ pub async fn get_order(
         subtotal: order.subtotal,
         tax_total: order.tax_total,
         shipping_total: order.shipping_total,
+        discount_total: order.discount_total,
+        coupon_code: order.coupon_code.clone(),
         total: order.total,
         items: item_responses,
+        payments: payment_responses,
+        billing_address: order.billing_address.clone(),
+        shipping_address: order.shipping_address.clone(),
+        notes: order.notes.clone(),
         created_at: order.created_at.to_rfc3339(),
     }))
 }
@@ -565,7 +652,7 @@ pub async fn create_order(
         id: order.id,
         order_number: order.order_number,
         customer_id: order.customer_id,
-                    customer_email: order.customer_email,
+        customer_email: order.customer_email,
         status: format!("{:?}", order.status).to_lowercase(),
         payment_status: format!("{:?}", order.payment_status).to_lowercase(),
         fulfillment_status: format!("{:?}", order.fulfillment_status).to_lowercase(),
@@ -573,8 +660,14 @@ pub async fn create_order(
         subtotal: order.subtotal,
         tax_total: order.tax_total,
         shipping_total: order.shipping_total,
+        discount_total: order.discount_total,
+        coupon_code: order.coupon_code.clone(),
         total: order.total,
         items: item_responses,
+        payments: vec![],
+        billing_address: order.billing_address.clone(),
+        shipping_address: order.shipping_address.clone(),
+        notes: order.notes.clone(),
         created_at: order.created_at.to_rfc3339(),
     };
 
@@ -589,9 +682,345 @@ async fn generate_order_number() -> String {
     format!("{}{}{:05}", prefix, timestamp % 100000, random % 10000)
 }
 
+/// GET /orders/:id/invoice - Generate PDF invoice for an order
+async fn get_invoice(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let order = sqlx::query_as::<_, rcommerce_core::models::Order>(
+        "SELECT id, order_number, customer_id, customer_email, currency::text AS currency_text, order_type, subtotal, tax_total, shipping_total, discount_total, total, status, payment_status, fulfillment_status, billing_address_id, shipping_address_id, payment_method, shipping_method, notes, tags, draft, subscription_id, billing_cycle, coupon_code, coupon_id, ip_address, user_agent, metadata, shipping_address, billing_address, created_at, updated_at, completed_at, cancelled_at FROM orders WHERE id = $1"
+    )
+    .bind(id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"})))
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Order not found"}))))?;
+
+    // Check access
+    if order.customer_id != Some(auth.customer_id) && !auth.is_admin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Access denied"})),
+        ));
+    }
+
+    // Get order items
+    let items = sqlx::query_as::<_, rcommerce_core::order::OrderItem>(
+        "SELECT * FROM order_items WHERE order_id = $1",
+    )
+    .bind(id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Database error"})),
+        )
+    })?;
+
+    // Build invoice data
+    let data = super::invoice::invoice_data_from_order(&order, &items, &state.branding);
+
+    match super::invoice::generate_invoice_html(&data) {
+        Ok(html) => {
+            let headers: [(axum::http::HeaderName, axum::http::HeaderValue); 1] = [(
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".parse().unwrap(),
+            )];
+            Ok((headers, html).into_response())
+        }
+        Err(e) => {
+            tracing::error!("Failed to generate invoice: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to generate invoice"})),
+            ))
+        }
+    }
+}
+
+/// Cancel order request
+#[derive(Debug, Deserialize)]
+pub struct CancelOrderRequest {
+    pub reason: Option<String>,
+}
+
+/// POST /orders/:id/cancel - Cancel a pending/confirmed order
+///
+/// Releases inventory reservations and voids/refunds any payment via the
+/// order service. Admin can cancel any order; customers can cancel their own.
+pub async fn cancel_order(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CancelOrderRequest>,
+) -> Result<Json<OrderResponse>, Error> {
+    // Access check: admin or the order's owner
+    let customer_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT customer_id FROM orders WHERE id = $1")
+            .bind(id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| Error::not_found("Order not found"))?;
+
+    if customer_id != Some(auth.customer_id) && !auth.is_admin() {
+        return Err(Error::forbidden("Access denied"));
+    }
+
+    let reason = request
+        .reason
+        .unwrap_or_else(|| "Canceled via API".to_string());
+
+    let order_before = fetch_order(&state, id).await?;
+    let payment_captured = matches!(
+        order_before.payment_status,
+        rcommerce_core::models::PaymentStatus::Paid
+    );
+
+    state.order_service.cancel_order(id, reason).await?;
+
+    let order = fetch_order(&state, id).await?;
+    if !order.customer_email.is_empty() {
+        let notification =
+            super::email_helpers::build_order_cancelled_notification(&order, payment_captured);
+        super::email_helpers::spawn_send(&state, notification, "order-cancelled email");
+    }
+    Ok(Json(build_order_response(&state, order).await?))
+}
+
+/// Refund order request
+#[derive(Debug, Deserialize)]
+pub struct RefundOrderRequest {
+    /// Optional partial refund amount; full refund when omitted
+    pub amount: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// POST /orders/:id/refund - Refund a paid order through the payment gateway (admin only)
+///
+/// Refunds via the gateway using the recorded payment transaction id, restocks
+/// the ordered items, and sets the order status to 'refunded'.
+pub async fn refund_order(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<RefundOrderRequest>,
+) -> Result<Json<OrderResponse>, Error> {
+    if !auth.is_admin() {
+        return Err(Error::forbidden("Admin access required"));
+    }
+
+    let amount = match request.amount {
+        Some(amt_str) => Some(
+            amt_str
+                .parse::<Decimal>()
+                .map_err(|_| Error::validation("Invalid amount format"))?,
+        ),
+        None => None,
+    };
+
+    let reason = request
+        .reason
+        .unwrap_or_else(|| "Refunded via API".to_string());
+
+    let order_before = fetch_order(&state, id).await?;
+    let refund_amount = amount.unwrap_or(order_before.total);
+
+    state.order_service.refund_order(id, amount, reason).await?;
+
+    let order = fetch_order(&state, id).await?;
+    if !order.customer_email.is_empty() {
+        super::email_helpers::send_order_refunded_email(&state, id, refund_amount).await;
+    }
+    Ok(Json(build_order_response(&state, order).await?))
+}
+
+/// Update order status request
+#[derive(Debug, Deserialize)]
+pub struct UpdateOrderStatusRequest {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+/// PUT /orders/:id/status - Admin order status transition (admin only)
+///
+/// The requested transition is validated against the allowed transitions in
+/// `order::lifecycle::OrderStatus::can_transition_to`.
+pub async fn update_order_status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateOrderStatusRequest>,
+) -> Result<Json<OrderResponse>, Error> {
+    if !auth.is_admin() {
+        return Err(Error::forbidden("Admin access required"));
+    }
+
+    let new_status = parse_order_status(&request.status)
+        .ok_or_else(|| Error::validation(format!("Invalid order status: {}", request.status)))?;
+
+    // The consolidated schema has no 'shipped'/'delivered' order_status labels;
+    // shipping progress is tracked via fulfillments
+    if matches!(
+        new_status,
+        LifecycleOrderStatus::Shipped | LifecycleOrderStatus::Delivered
+    ) {
+        return Err(Error::validation(
+            "Status not supported for orders; use the fulfillments API instead",
+        ));
+    }
+
+    let order = fetch_order(&state, id).await?;
+    let current_status = map_models_status(order.status);
+
+    if !current_status.can_transition_to(new_status) {
+        return Err(Error::validation(format!(
+            "Invalid status transition from {:?} to {:?}",
+            current_status, new_status
+        )));
+    }
+
+    state
+        .order_service
+        .update_order_status(id, new_status)
+        .await?;
+
+    let order = fetch_order(&state, id).await?;
+    Ok(Json(build_order_response(&state, order).await?))
+}
+
+/// Fetch an order by id (models::Order shape used by the response builders)
+async fn fetch_order(state: &AppState, id: Uuid) -> Result<rcommerce_core::models::Order, Error> {
+    sqlx::query_as::<_, rcommerce_core::models::Order>(&format!(
+        "SELECT {} FROM orders WHERE id = $1",
+        ORDER_COLUMNS
+    ))
+    .bind(id)
+    .fetch_optional(state.db.pool())
+    .await?
+    .ok_or_else(|| Error::not_found("Order not found"))
+}
+
+/// Build an order response with items and payment records loaded
+async fn build_order_response(
+    state: &AppState,
+    order: rcommerce_core::models::Order,
+) -> Result<OrderResponse, Error> {
+    let items = sqlx::query_as::<_, rcommerce_core::models::OrderItem>(
+        "SELECT * FROM order_items WHERE order_id = $1",
+    )
+    .bind(order.id)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    let item_responses: Vec<OrderItemResponse> = items
+        .into_iter()
+        .map(|i| OrderItemResponse {
+            id: i.id,
+            product_id: i.product_id,
+            variant_id: i.variant_id,
+            name: i.title,
+            sku: i.sku,
+            quantity: i.quantity,
+            price: i.price,
+            total: i.total,
+        })
+        .collect();
+
+    let payment_rows = sqlx::query_as::<_, PaymentRow>(
+        r#"
+        SELECT id, amount, currency::text AS currency_text, status::text AS status_text,
+               gateway, card_brand, card_last_four, processed_at
+        FROM payments
+        WHERE order_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(order.id)
+    .fetch_all(state.db.pool())
+    .await
+    .unwrap_or_default();
+
+    let payment_responses: Vec<OrderPaymentResponse> = payment_rows
+        .into_iter()
+        .map(|p| OrderPaymentResponse {
+            id: p.id,
+            amount: p.amount,
+            currency: p.currency_text,
+            status: p.status_text,
+            gateway: p.gateway,
+            card_brand: p.card_brand,
+            card_last_four: p.card_last_four,
+            processed_at: p.processed_at.map(|t| t.to_rfc3339()),
+        })
+        .collect();
+
+    Ok(OrderResponse {
+        id: order.id,
+        order_number: order.order_number,
+        customer_id: order.customer_id,
+        customer_email: order.customer_email,
+        status: format!("{:?}", order.status).to_lowercase(),
+        payment_status: format!("{:?}", order.payment_status).to_lowercase(),
+        fulfillment_status: format!("{:?}", order.fulfillment_status).to_lowercase(),
+        currency: order.currency.to_string(),
+        subtotal: order.subtotal,
+        tax_total: order.tax_total,
+        shipping_total: order.shipping_total,
+        discount_total: order.discount_total,
+        coupon_code: order.coupon_code.clone(),
+        total: order.total,
+        items: item_responses,
+        payments: payment_responses,
+        billing_address: order.billing_address.clone(),
+        shipping_address: order.shipping_address.clone(),
+        notes: order.notes.clone(),
+        created_at: order.created_at.to_rfc3339(),
+    })
+}
+
+/// Parse a status string into the lifecycle order status enum.
+/// Accepts both 'cancelled' (database spelling) and 'canceled'.
+fn parse_order_status(status: &str) -> Option<LifecycleOrderStatus> {
+    match status.to_lowercase().as_str() {
+        "pending" => Some(LifecycleOrderStatus::Pending),
+        "confirmed" => Some(LifecycleOrderStatus::Confirmed),
+        "processing" => Some(LifecycleOrderStatus::Processing),
+        "on_hold" => Some(LifecycleOrderStatus::OnHold),
+        "shipped" => Some(LifecycleOrderStatus::Shipped),
+        "delivered" => Some(LifecycleOrderStatus::Delivered),
+        "completed" => Some(LifecycleOrderStatus::Completed),
+        "cancelled" | "canceled" => Some(LifecycleOrderStatus::Canceled),
+        "refunded" => Some(LifecycleOrderStatus::Refunded),
+        _ => None,
+    }
+}
+
+/// Map the models order status (as read from the database) to the lifecycle enum
+fn map_models_status(status: rcommerce_core::models::OrderStatus) -> LifecycleOrderStatus {
+    match status {
+        rcommerce_core::models::OrderStatus::Pending => LifecycleOrderStatus::Pending,
+        rcommerce_core::models::OrderStatus::Confirmed => LifecycleOrderStatus::Confirmed,
+        rcommerce_core::models::OrderStatus::Processing => LifecycleOrderStatus::Processing,
+        rcommerce_core::models::OrderStatus::OnHold => LifecycleOrderStatus::OnHold,
+        rcommerce_core::models::OrderStatus::Completed => LifecycleOrderStatus::Completed,
+        rcommerce_core::models::OrderStatus::Cancelled => LifecycleOrderStatus::Canceled,
+        rcommerce_core::models::OrderStatus::Refunded => LifecycleOrderStatus::Refunded,
+    }
+}
+
 /// Router for order routes
 pub fn router() -> Router<AppState> {
     axum::Router::new()
         .route("/orders", get(list_orders).post(create_order))
         .route("/orders/:id", get(get_order))
+        .route("/orders/:id/invoice", get(get_invoice))
+        .route("/orders/:id/cancel", post(cancel_order))
+        .route("/orders/:id/refund", post(refund_order))
+        .route("/orders/:id/status", put(update_order_status))
 }

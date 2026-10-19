@@ -89,7 +89,7 @@ mod html_template_integration {
         variables.add_customer(&customer);
         variables.add_addresses(&shipping, &billing);
         variables.add_totals(&order);
-        variables.add_company_info("PDG Global Limited", "support@rcommerce.app");
+        variables.add_company_info("Example Company", "support@example.com");
         
         // Check that all required variables are present
         let required_vars = vec![

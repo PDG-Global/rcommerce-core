@@ -1,0 +1,35 @@
+---
+// Legacy WooCommerce product permalink: /product/<slug>/ -> canonical product URL
+import type { Product } from '../../lib/types';
+import { API_BASE } from '../../lib/api';
+import { productUrl } from '../../lib/url';
+import { content } from '../../lib/brand';
+
+const { slug } = Astro.params;
+
+// Static old-slug map (renamed/merged products) takes precedence over the API.
+// Astro decodes percent-encoded params, while the map keys carry the raw
+// WooCommerce-encoded post_name forms; compare in normalized encoded form.
+const enc = encodeURIComponent(slug ?? '').toLowerCase();
+const mapped = content.wooRedirects.find(([old]) => old === enc);
+if (mapped) {
+  return Astro.redirect(mapped[1], 301);
+}
+
+let product: Product | null = null;
+try {
+  const res = await fetch(`${API_BASE}/products/${encodeURIComponent(slug || '')}`);
+  if (res.ok) {
+    const data = await res.json();
+    product = data.product ?? null;
+  }
+} catch {
+  // fall through to 404
+}
+
+if (product) {
+  return Astro.redirect(productUrl(product), 301);
+}
+
+return new Response('Not found', { status: 404 });
+---

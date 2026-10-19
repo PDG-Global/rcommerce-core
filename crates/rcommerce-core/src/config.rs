@@ -48,6 +48,71 @@ pub struct Config {
 
     #[serde(default)]
     pub tax: TaxConfig,
+
+    #[serde(default)]
+    pub accounting: AccountingConfig,
+
+    /// Store branding (email shell, invoice header/footer, notification vars)
+    #[serde(default)]
+    pub branding: BrandingConfig,
+
+    #[serde(default)]
+    pub orders: OrdersConfig,
+}
+
+/// Order lifecycle settings
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OrdersConfig {
+    /// Automatically cancel orders that stay in `pending` status with an
+    /// unfinished payment after this many minutes. Releases the held
+    /// inventory. None (the default) disables the sweeper.
+    pub auto_cancel_pending_minutes: Option<u64>,
+}
+
+fn default_brand_name() -> String {
+    "Store".to_string()
+}
+fn default_brand_support_email() -> String {
+    "support@example.com".to_string()
+}
+fn default_brand_site_url() -> String {
+    "http://localhost:3000".to_string()
+}
+fn default_brand_logo_url() -> String {
+    String::new()
+}
+fn default_brand_accent_color() -> String {
+    "#ff4d00".to_string()
+}
+
+/// Store branding used across customer-facing emails and invoices.
+/// All fields default to neutral placeholder values so unconfigured
+/// installs render generic branding; set `[branding]` in the config file
+/// to customize.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrandingConfig {
+    #[serde(default = "default_brand_name")]
+    pub name: String,
+    #[serde(default = "default_brand_support_email")]
+    pub support_email: String,
+    #[serde(default = "default_brand_site_url")]
+    pub site_url: String,
+    #[serde(default = "default_brand_logo_url")]
+    pub logo_url: String,
+    #[serde(default = "default_brand_accent_color")]
+    pub accent_color: String,
+}
+
+impl Default for BrandingConfig {
+    fn default() -> Self {
+        Self {
+            name: default_brand_name(),
+            support_email: default_brand_support_email(),
+            site_url: default_brand_site_url(),
+            logo_url: default_brand_logo_url(),
+            accent_color: default_brand_accent_color(),
+        }
+    }
 }
 
 impl Config {
@@ -181,7 +246,7 @@ pub struct CorsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    #[serde(default)]
+    #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
 
     #[serde(default)]
@@ -201,7 +266,7 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            allowed_origins: vec!["*".to_string()],
+            allowed_origins: default_allowed_origins(),
             allowed_methods: vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
                 .into_iter()
                 .map(String::from)
@@ -214,6 +279,13 @@ impl Default for CorsConfig {
             max_age: Some(3600),
         }
     }
+}
+
+/// Default CORS origins: restrictive single-origin local development default.
+/// The wildcard "*" must be opted into explicitly in configuration; the server
+/// logs a security warning at startup when "*" is used.
+fn default_allowed_origins() -> Vec<String> {
+    vec!["http://localhost:3000".to_string()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +668,11 @@ pub struct NotificationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Recipient for shop-operator notifications (e.g. new-order alerts).
+    /// Falls back to the configured sender address when unset.
+    #[serde(default)]
+    pub admin_email: Option<String>,
+
     #[serde(default)]
     pub email: EmailConfig,
 
@@ -607,6 +684,7 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            admin_email: None,
             email: EmailConfig::default(),
             sms: SmsConfig::default(),
         }
@@ -624,6 +702,10 @@ pub struct EmailConfig {
     pub from_email: Option<String>,
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    /// Postmark server API token (if using Postmark instead of SMTP)
+    pub postmark_token: Option<String>,
+    /// Postmark message stream (default: "outbound")
+    pub postmark_stream: Option<String>,
 }
 
 impl Default for EmailConfig {
@@ -636,6 +718,8 @@ impl Default for EmailConfig {
             from_name: None,
             from_email: None,
             smtp_tls: true,
+            postmark_token: None,
+            postmark_stream: None,
         }
     }
 }
@@ -1439,6 +1523,10 @@ pub struct ShippingConfig {
     #[serde(default)]
     pub fedex: FedExConfig,
 
+    /// Weight-based (zone table) provider configuration
+    #[serde(default)]
+    pub weight_based: WeightBasedConfig,
+
     /// UPS configuration
     #[serde(default)]
     pub ups: UpsConfig,
@@ -1450,6 +1538,68 @@ pub struct ShippingConfig {
 
 fn default_shipping_provider() -> String {
     "manual".to_string()
+}
+
+/// Accounting configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountingConfig {
+    /// Xero integration
+    #[serde(default)]
+    pub xero: XeroConfig,
+
+    /// Short store code used in invoice/order references and provider
+    /// metadata, e.g. "88" produces invoice numbers like "88-1024".
+    /// One rcommerce deployment (database) serves one store.
+    #[serde(default)]
+    pub store_code: Option<String>,
+
+    /// Store name as it should appear in accounting exports.
+    #[serde(default)]
+    pub store_name: Option<String>,
+
+    /// Public site URL embedded in payment-provider metadata (spec 2.1).
+    #[serde(default)]
+    pub site_url: Option<String>,
+}
+
+/// Xero integration configuration (custom connection / client credentials)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct XeroConfig {
+    /// Enable Xero invoice creation on paid orders
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Xero app client ID (from Xero developer portal custom connection)
+    pub client_id: Option<String>,
+
+    /// Xero app client secret
+    pub client_secret: Option<String>,
+
+    /// Xero tenant (organisation) ID
+    pub tenant_id: Option<String>,
+
+    /// Revenue account code for product sales (default "200")
+    #[serde(default = "default_xero_sales_account")]
+    pub sales_account_code: String,
+
+    /// Account code for shipping income (default "200")
+    #[serde(default = "default_xero_sales_account")]
+    pub shipping_account_code: String,
+
+    /// Bank account code used to record payments (reconciliation)
+    pub bank_account_code: Option<String>,
+
+    /// Invoice status: "AUTHORISED" (awaiting payment) or "DRAFT"
+    #[serde(default = "default_xero_invoice_status")]
+    pub invoice_status: String,
+}
+
+fn default_xero_sales_account() -> String {
+    "200".to_string()
+}
+
+fn default_xero_invoice_status() -> String {
+    "AUTHORISED".to_string()
 }
 
 /// Shipping origin address configuration
@@ -1479,6 +1629,15 @@ impl Default for ShippingOriginConfig {
             phone: None,
         }
     }
+}
+
+/// DHL Express configuration
+/// Weight-based shipping provider configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WeightBasedConfig {
+    /// Carrier name shown on shipping rates and order records. Falls back to
+    /// the store's branding name when unset.
+    pub carrier_name: Option<String>,
 }
 
 /// DHL Express configuration
@@ -1565,6 +1724,77 @@ pub struct UspsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_branding_defaults_when_section_absent() {
+        // Code defaults are deliberately neutral; stores set their identity
+        // via [branding] (see the production configs).
+        let toml_str = r#"
+[server]
+port = 8080
+"#;
+        let config: Config = toml::from_str(toml_str).expect("config parses");
+        assert_eq!(config.branding.name, "Store");
+        assert_eq!(config.branding.support_email, "support@example.com");
+        assert_eq!(config.branding.site_url, "http://localhost:3000");
+        assert_eq!(config.branding.logo_url, "");
+        assert_eq!(config.branding.accent_color, "#ff4d00");
+    }
+
+    #[test]
+    fn test_branding_custom_values() {
+        let toml_str = r##"
+[branding]
+name = "Custom Brand"
+support_email = "help@example.org"
+site_url = "https://example.org"
+logo_url = "https://example.org/images/logo.png"
+accent_color = "#0b6e4f"
+"##;
+        let config: Config = toml::from_str(toml_str).expect("config parses");
+        assert_eq!(config.branding.name, "Custom Brand");
+        assert_eq!(config.branding.support_email, "help@example.org");
+        assert_eq!(config.branding.site_url, "https://example.org");
+        assert_eq!(
+            config.branding.logo_url,
+            "https://example.org/images/logo.png"
+        );
+        assert_eq!(config.branding.accent_color, "#0b6e4f");
+    }
+
+    #[test]
+    fn test_weight_based_carrier_name_config() {
+        let config: Config = toml::from_str(
+            "[server]
+port = 8080
+",
+        )
+        .unwrap();
+        assert_eq!(config.shipping.weight_based.carrier_name, None);
+
+        let config: Config = toml::from_str(
+            r##"[shipping.weight_based]
+carrier_name = "Example Carrier"
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            config.shipping.weight_based.carrier_name.as_deref(),
+            Some("Example Carrier")
+        );
+    }
+
+    #[test]
+    fn test_orders_auto_cancel_config() {
+        // Absent section -> disabled
+        let config: Config = toml::from_str("[server]\nport = 8080\n").unwrap();
+        assert_eq!(config.orders.auto_cancel_pending_minutes, None);
+
+        // Explicit value
+        let config: Config =
+            toml::from_str("[orders]\nauto_cancel_pending_minutes = 120\n").unwrap();
+        assert_eq!(config.orders.auto_cancel_pending_minutes, Some(120));
+    }
 
     #[test]
     fn test_default_config() {

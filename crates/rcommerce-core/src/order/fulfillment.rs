@@ -27,8 +27,11 @@ pub enum FulfillmentStatus {
     Shipped,    // Order has been shipped
     Delivered,  // Order has been delivered
     Partial,    // Partial fulfillment (some items shipped)
-    Canceled,   // Fulfillment canceled
-    Returned,   // Order returned
+    // The Postgres enum uses British spelling; sqlx's snake_case rename
+    // would map this variant to "canceled", which is not a database value.
+    #[sqlx(rename = "cancelled")]
+    Canceled, // Fulfillment canceled
+    Returned, // Order returned
 }
 
 impl FulfillmentStatus {
@@ -167,12 +170,20 @@ impl FulfillmentService {
         let updated = sqlx::query_as::<_, Fulfillment>(
             r#"
             UPDATE fulfillments 
-            SET status = $1, shipped_at = $2, delivered_at = $3, updated_at = NOW()
+            SET status = $1::fulfillment_status, shipped_at = $2, delivered_at = $3, updated_at = NOW()
             WHERE id = $4
             RETURNING *
             "#,
         )
-        .bind(format!("{:?}", new_status))
+        .bind(match new_status {
+            FulfillmentStatus::Pending => "pending",
+            FulfillmentStatus::Processing => "processing",
+            FulfillmentStatus::Shipped => "shipped",
+            FulfillmentStatus::Delivered => "delivered",
+            FulfillmentStatus::Partial => "partial",
+            FulfillmentStatus::Canceled => "cancelled",
+            FulfillmentStatus::Returned => "returned",
+        })
         .bind(shipped_at)
         .bind(delivered_at)
         .bind(fulfillment_id)

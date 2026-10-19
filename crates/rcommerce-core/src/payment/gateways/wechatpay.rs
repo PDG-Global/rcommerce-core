@@ -276,6 +276,9 @@ impl PaymentGateway for WeChatPayGateway {
                 .and_then(|p| uuid::Uuid::parse_str(&p.openid).ok()),
             payment_method: "wechatpay".to_string(),
             transaction_id: transaction.transaction_id.unwrap_or_default(),
+            client_secret: None,
+            card_brand: None,
+            card_last_four: None,
             captured_at: if transaction.trade_state == "SUCCESS" {
                 Some(chrono::Utc::now())
             } else {

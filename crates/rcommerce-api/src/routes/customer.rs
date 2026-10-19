@@ -196,6 +196,7 @@ pub async fn create_address(
     State(state): State<AppState>,
     Json(request): Json<CreateAddressRequest>,
 ) -> Result<(StatusCode, Json<Address>), Error> {
+    super::require_address_phone(&request.phone)?;
     let address = state
         .customer_service
         .add_address(auth.customer_id, request)
@@ -211,6 +212,7 @@ pub async fn update_address(
     Path(address_id): Path<Uuid>,
     Json(request): Json<CreateAddressRequest>,
 ) -> Result<Json<Address>, Error> {
+    super::require_address_phone(&request.phone)?;
     let address = state
         .customer_service
         .update_address(auth.customer_id, address_id, request)

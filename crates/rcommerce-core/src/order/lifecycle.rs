@@ -17,8 +17,11 @@ pub enum OrderStatus {
     Shipped,    // Order has been shipped
     Delivered,  // Order has been delivered
     Completed,  // Order is complete
-    Canceled,   // Order has been canceled
-    Refunded,   // Order has been refunded
+    // The Postgres enum uses British spelling; sqlx's snake_case rename
+    // would map this variant to "canceled", which is not a database value.
+    #[sqlx(rename = "cancelled")]
+    Canceled, // Order has been canceled
+    Refunded, // Order has been refunded
 }
 
 impl OrderStatus {

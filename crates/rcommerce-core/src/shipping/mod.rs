@@ -409,23 +409,39 @@ pub enum ServiceFeature {
 /// Shipping provider factory
 pub struct ShippingProviderFactory {
     providers: HashMap<String, Box<dyn ShippingProvider>>,
+    /// Carrier name for the weight-based provider (store branding)
+    weight_based_carrier_name: String,
 }
 
 impl Clone for ShippingProviderFactory {
     fn clone(&self) -> Self {
         let mut providers = HashMap::new();
         for id in self.providers.keys() {
-            // We can't clone Box<dyn ShippingProvider> directly, so recreate from id/name
-            // For now, only manual provider is clonable by re-creating it
-            if id == "manual" {
-                providers.insert(
-                    id.clone(),
-                    Box::new(crate::shipping::carriers::ManualProvider::new())
-                        as Box<dyn ShippingProvider>,
-                );
+            // We can't clone Box<dyn ShippingProvider> directly, so recreate from id
+            match id.as_str() {
+                "manual" => {
+                    providers.insert(
+                        id.clone(),
+                        Box::new(crate::shipping::carriers::ManualProvider::new())
+                            as Box<dyn ShippingProvider>,
+                    );
+                }
+                "weight_based" => {
+                    providers.insert(
+                        id.clone(),
+                        Box::new(
+                            crate::shipping::carriers::WeightBasedProvider::new()
+                                .with_carrier_name(&self.weight_based_carrier_name),
+                        ) as Box<dyn ShippingProvider>,
+                    );
+                }
+                _ => {}
             }
         }
-        Self { providers }
+        Self {
+            providers,
+            weight_based_carrier_name: self.weight_based_carrier_name.clone(),
+        }
     }
 }
 
@@ -433,57 +449,70 @@ impl ShippingProviderFactory {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
+            weight_based_carrier_name: "Weight Based Shipping".to_string(),
         }
     }
 
-    /// Create a factory from configuration
-    pub fn from_config(config: &crate::config::ShippingConfig) -> Self {
-        let mut factory = Self::new();
+    /// Create a factory from configuration. The weight-based carrier name
+    /// comes from `[shipping.weight_based] carrier_name`, falling back to the
+    /// store's branding name.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let carrier_name = config
+            .shipping
+            .weight_based
+            .carrier_name
+            .clone()
+            .unwrap_or_else(|| config.branding.name.clone());
 
-        // Register manual flat-rate provider by default (always available)
-        factory.register(Box::new(crate::shipping::carriers::ManualProvider::new()));
+        let mut factory = Self::new();
+        factory.weight_based_carrier_name = carrier_name.clone();
+
+        // Register weight-based provider (zone-calculated rates)
+        factory.register(Box::new(
+            crate::shipping::carriers::WeightBasedProvider::new().with_carrier_name(&carrier_name),
+        ));
 
         // Register DHL if configured
-        if config.dhl.enabled {
+        if config.shipping.dhl.enabled {
             if let (Some(api_key), Some(api_secret), Some(account_number)) = (
-                &config.dhl.api_key,
-                &config.dhl.api_secret,
-                &config.dhl.account_number,
+                &config.shipping.dhl.api_key,
+                &config.shipping.dhl.api_secret,
+                &config.shipping.dhl.account_number,
             ) {
                 let provider = crate::shipping::carriers::DhlProvider::new(
                     api_key.clone(),
                     api_secret.clone(),
                     account_number.clone(),
                 )
-                .with_test_mode(config.dhl.sandbox || config.test_mode);
+                .with_test_mode(config.shipping.dhl.sandbox || config.shipping.test_mode);
                 factory.register(Box::new(provider));
             }
         }
 
         // Register FedEx if configured
-        if config.fedex.enabled {
+        if config.shipping.fedex.enabled {
             if let (Some(api_key), Some(api_secret), Some(account_number)) = (
-                &config.fedex.api_key,
-                &config.fedex.api_secret,
-                &config.fedex.account_number,
+                &config.shipping.fedex.api_key,
+                &config.shipping.fedex.api_secret,
+                &config.shipping.fedex.account_number,
             ) {
                 let provider = crate::shipping::carriers::FedExProvider::new(
                     api_key.clone(),
                     api_secret.clone(),
                     account_number.clone(),
                 )
-                .with_test_mode(config.fedex.sandbox || config.test_mode);
+                .with_test_mode(config.shipping.fedex.sandbox || config.shipping.test_mode);
                 factory.register(Box::new(provider));
             }
         }
 
         // Register UPS if configured
-        if config.ups.enabled {
+        if config.shipping.ups.enabled {
             if let (Some(api_key), Some(username), Some(password), Some(account_number)) = (
-                &config.ups.api_key,
-                &config.ups.username,
-                &config.ups.password,
-                &config.ups.account_number,
+                &config.shipping.ups.api_key,
+                &config.shipping.ups.username,
+                &config.shipping.ups.password,
+                &config.shipping.ups.account_number,
             ) {
                 let provider = crate::shipping::carriers::UpsProvider::new(
                     api_key.clone(),
@@ -491,16 +520,16 @@ impl ShippingProviderFactory {
                     password.clone(),
                     account_number.clone(),
                 )
-                .with_test_mode(config.ups.sandbox || config.test_mode);
+                .with_test_mode(config.shipping.ups.sandbox || config.shipping.test_mode);
                 factory.register(Box::new(provider));
             }
         }
 
         // Register USPS if configured
-        if config.usps.enabled {
-            if let Some(api_key) = &config.usps.api_key {
+        if config.shipping.usps.enabled {
+            if let Some(api_key) = &config.shipping.usps.api_key {
                 let provider = crate::shipping::carriers::UspsProvider::new(api_key.clone())
-                    .with_test_mode(config.usps.sandbox || config.test_mode);
+                    .with_test_mode(config.shipping.usps.sandbox || config.shipping.test_mode);
                 factory.register(Box::new(provider));
             }
         }

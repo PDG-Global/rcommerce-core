@@ -1,0 +1,22 @@
+---
+import { brand, content } from '../lib/brand';
+import { pageOverlay } from '../lib/brand/pageOverlays';
+import GenericInfoPage from '../components/GenericInfoPage.astro';
+
+// Stores without a support page redirect to contact.
+if (!content.pages.support) return Astro.redirect('/contact-us');
+
+// Store-private overlay page if one exists, else the generic renderer.
+const Overlay = pageOverlay(`${brand.slug}-support`);
+---
+
+{Overlay ? <Overlay /> : (
+<GenericInfoPage
+  eyebrow="we're here to help"
+  title="Customer Support"
+  paragraphs={[
+    'Need a hand with an order or a product? Email us and we will get back to you as soon as we can.',
+    'For order-specific questions, include your order number so we can help you faster.',
+  ]}
+/>
+)}

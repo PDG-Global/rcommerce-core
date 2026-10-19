@@ -352,6 +352,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             Default::default(),
         )),
         None,
+        None,
     )).await)
 }
 

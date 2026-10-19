@@ -97,6 +97,9 @@ impl PaymentGateway for MockPaymentGateway {
             customer_id: None,
             payment_method: "card".to_string(),
             transaction_id: payment_id.to_string(),
+            client_secret: None,
+            card_brand: Some("visa".to_string()),
+            card_last_four: Some("4242".to_string()),
             captured_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
         })

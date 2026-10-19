@@ -74,6 +74,9 @@ base64 = { workspace = true }
 rand = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
+url = { workspace = true }
+
+# PDF generation (using HTML print-to-PDF approach instead)
 
 # HTTP client
 reqwest = { workspace = true }

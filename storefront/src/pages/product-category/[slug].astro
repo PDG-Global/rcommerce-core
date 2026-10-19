@@ -1,0 +1,12 @@
+---
+// Legacy WooCommerce category permalink: /product-category/<slug>/ -> /products/<slug>
+// Stale Woo categories that don't exist in this store redirect to /products.
+import { brand } from '../../lib/brand';
+
+const { slug } = Astro.params;
+if (slug) {
+  const known = brand.menuCategories.some((c) => c.slug === slug);
+  return Astro.redirect(known ? `/products/${slug}` : '/products', 301);
+}
+return new Response('Not found', { status: 404 });
+---

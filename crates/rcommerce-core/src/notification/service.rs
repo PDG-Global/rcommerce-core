@@ -189,7 +189,7 @@ impl NotificationService {
             r#"
             SELECT n.* FROM notifications n
             JOIN delivery_attempts da ON n.id = da.notification_id
-            WHERE n.recipient_address = $1
+            WHERE n.recipient = $1
             ORDER BY n.created_at DESC
             LIMIT $2
             "#,
@@ -333,6 +333,7 @@ impl NotificationFactory {
         shipping_address: &Address,
         billing_address: &Address,
         order_items: &[OrderItem],
+        branding: &crate::config::BrandingConfig,
     ) -> Result<Notification> {
         // Load the HTML template
         let template = NotificationTemplate::load("order_confirmation_html")
@@ -345,7 +346,7 @@ impl NotificationFactory {
         variables.add_addresses(shipping_address, billing_address);
         variables.add_order_items(order_items);
         variables.add_totals(order);
-        variables.add_company_info("PDG Global Limited", "support@rcommerce.app");
+        variables.add_company_info(&branding.name, &branding.support_email);
 
         // Render templates
         let body = template

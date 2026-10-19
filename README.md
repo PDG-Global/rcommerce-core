@@ -25,6 +25,9 @@ crates/
 ├── rcommerce/          # Application crate (work in progress)
 ├── rcommerce-demo/     # Demo frontend server (secure API proxy with static file serving)
 └── rcommerce-demo-server/ # Dynamic frontend server with SSR, routing, and edge caching
+
+storefront/             # Whitelabel Astro storefront (generic demo template;
+                        # brand via PUBLIC_* build-time env vars)
 ```
 
 ### Core Modules

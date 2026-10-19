@@ -165,7 +165,7 @@ impl PostgresCustomerRepository {
             r#"
             INSERT INTO addresses (
                 customer_id, first_name, last_name, company, phone,
-                address1, address2, city, state, country, zip,
+                address1, address2, city, province, country, zip,
                 is_default_shipping, is_default_billing
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -206,7 +206,7 @@ impl PostgresCustomerRepository {
                 address1 = $5,
                 address2 = $6,
                 city = $7,
-                state = $8,
+                province = $8,
                 country = $9,
                 zip = $10,
                 is_default_shipping = $11,
@@ -361,13 +361,11 @@ impl CustomerRepositoryTrait for PostgresCustomerRepository {
 impl PostgresCustomerRepository {
     /// Update email verification status
     pub async fn update_email_verified(&self, id: Uuid, verified: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE customers SET email_verified = $1, updated_at = NOW() WHERE id = $2"
-        )
-        .bind(verified)
-        .bind(id)
-        .execute(self.db.pool())
-        .await?;
+        sqlx::query("UPDATE customers SET email_verified = $1, updated_at = NOW() WHERE id = $2")
+            .bind(verified)
+            .bind(id)
+            .execute(self.db.pool())
+            .await?;
 
         Ok(())
     }
@@ -383,5 +381,47 @@ impl PostgresCustomerRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression guard: the addresses table has a `province` column, not
+    /// `state` (prod incident). The Rust field stays `state` via
+    /// `#[sqlx(rename = "province")]` on `common::Address`; the INSERT and
+    /// UPDATE here must reference the real column.
+    #[test]
+    fn test_address_sql_uses_province_column() {
+        let src = include_str!("customer_repository.rs");
+        assert!(
+            src.contains("city, province, country, zip"),
+            "INSERT must use the province column"
+        );
+        assert!(
+            src.contains("province = $8"),
+            "UPDATE must set the province column"
+        );
+        // The INSERT column list itself must not reference a state column
+        // (scan only the SQL so this assertion literal cannot match itself).
+        let insert_sql = src
+            .split("INSERT INTO addresses")
+            .nth(1)
+            .and_then(|s| s.split("VALUES").next())
+            .expect("INSERT INTO addresses SQL not found");
+        assert!(
+            !insert_sql.contains("state"),
+            "INSERT column list must not reference a state column: {insert_sql}"
+        );
+    }
+
+    #[test]
+    fn test_address_field_renames_to_province() {
+        // The struct field is `state` for the API/serde contract but must map
+        // to the `province` column for sqlx FromRow / query_as.
+        let src = include_str!("../../common.rs");
+        assert!(
+            src.contains("#[sqlx(rename = \"province\")]"),
+            "Address.state must be renamed to the province column"
+        );
     }
 }

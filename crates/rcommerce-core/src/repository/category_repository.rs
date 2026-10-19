@@ -181,7 +181,7 @@ impl CategoryRepository for PostgresCategoryRepository {
 
     async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ProductCategory>> {
         let categories = sqlx::query_as::<_, ProductCategory>(
-            "SELECT * FROM product_categories ORDER BY sort_order, name LIMIT $1 OFFSET $2",
+            "SELECT * FROM product_categories WHERE is_active = true ORDER BY sort_order, name LIMIT $1 OFFSET $2",
         )
         .bind(limit)
         .bind(offset)

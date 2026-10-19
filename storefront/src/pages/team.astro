@@ -1,0 +1,11 @@
+---
+import { brand } from '../lib/brand';
+import { pageOverlay } from '../lib/brand/pageOverlays';
+
+// A store with a bespoke `<slug>-team` page overlay serves /team;
+// otherwise this route doesn't exist for the store.
+const Overlay = pageOverlay(`${brand.slug}-team`);
+if (!Overlay) return Astro.redirect('/');
+---
+
+<Overlay />

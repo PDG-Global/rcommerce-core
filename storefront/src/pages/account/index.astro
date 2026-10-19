@@ -1,0 +1,18 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { brand } from '../../lib/brand';
+
+import Nav from '../../components/Nav.astro';
+import Footer from '../../components/Footer.astro';
+import AccountDashboard from '../../islands/AccountDashboard.tsx';
+---
+
+<Layout title={`Account | ${brand.titleSuffix}`}>
+  <Nav />
+  <main class="flex-1 py-14">
+    <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+      <AccountDashboard client:load />
+    </div>
+  </main>
+  <Footer />
+</Layout>

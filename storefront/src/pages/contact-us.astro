@@ -1,0 +1,227 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { brand, content } from '../lib/brand';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+---
+
+<Layout title={`Contact Us | ${brand.name}`} description={`Get in touch with ${brand.name} — product questions, support, distribution inquiries. We reply within 24-48 hours.`}>
+  <Nav />
+  <main class="flex-1">
+    {content.contact.faqs.length > 0 && (
+      /* Accordion contact variant (stores with "Quick questions" FAQ content):
+         dark charcoal panel with the email pill CTA on the left, accordion on
+         the right. No contact form. */
+      <div class="grid grid-cols-1 lg:grid-cols-2 min-h-[85vh]">
+        <div class="bg-[#221f1c] text-white flex flex-col justify-center px-6 sm:px-12 lg:px-16 xl:px-24 py-20">
+          <h1 class="font-serif font-bold text-4xl md:text-5xl leading-tight max-w-md">
+            Questions? Comments? No worries.
+          </h1>
+          <p class="mt-6 text-white/70 leading-relaxed max-w-md">
+            {content.contact.intro.map((paragraph) => (
+              <>
+                {paragraph}{' '}
+              </>
+            ))}
+          </p>
+          <div class="mt-10">
+            <a
+              href={`mailto:${content.contact.email}`}
+              class="inline-block bg-rcommerce-primary text-white font-semibold uppercase text-[14px] tracking-button rounded-full py-4 px-10 hover:opacity-90 transition-opacity"
+            >
+              {content.contact.emailCtaLabel}
+            </a>
+          </div>
+          {content.contact.links.length > 0 && (
+            <ul class="mt-8 space-y-2 text-sm">
+              {content.contact.links.map((link) => (
+                <li><a href={link.href} class="text-rcommerce-primary hover:underline" rel="noopener">{link.label}</a></li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div class="bg-white px-6 sm:px-12 lg:px-16 xl:px-24 py-20">
+          <h2 class="font-serif text-3xl font-semibold text-rcommerce-900">Quick questions</h2>
+          <div class="mt-8 border-y border-rcommerce-200 divide-y divide-rcommerce-200">
+            {content.contact.faqs.map((faq, i) => (
+              <div>
+                <h3>
+                  <button
+                    type="button"
+                    id={`faq-btn-${i}`}
+                    class="faq-btn flex w-full items-center justify-between gap-4 py-5 text-left font-medium text-rcommerce-900 hover:text-rcommerce-accent transition-colors"
+                    aria-expanded={i === 0 ? 'true' : 'false'}
+                    aria-controls={`faq-panel-${i}`}
+                  >
+                    {faq.question}
+                    <svg class="faq-chevron shrink-0 text-rcommerce-400" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                  </button>
+                </h3>
+                <div
+                  id={`faq-panel-${i}`}
+                  role="region"
+                  aria-labelledby={`faq-btn-${i}`}
+                  class="pb-5 text-sm text-rcommerce-600 leading-relaxed"
+                  hidden={i !== 0}
+                >
+                  {faq.answer.map((paragraph) => (
+                    <p class="mb-3 last:mb-0">{paragraph}</p>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
+    {content.contact.faqs.length === 0 && (
+    <section class="grid grid-cols-1 lg:grid-cols-2 min-h-[85vh]">
+      <!-- Left: heading + image anchored bottom -->
+      <div class="flex flex-col justify-between bg-white">
+        <div class="px-6 sm:px-12 lg:px-16 xl:px-24 pt-16 lg:pt-20 pb-10">
+          <p class="eyebrow text-xl">Get in</p>
+          <h1 class="font-serif text-5xl md:text-6xl font-semibold text-rcommerce-900 mt-1 leading-tight">touch</h1>
+        </div>
+        {content.contact.heroImage ? (
+          <img
+            src={content.contact.heroImage}
+            alt={`${brand.name} ${content.catalog.photoAlt}`}
+            class="w-full h-auto object-cover"
+            loading="eager"
+          />
+        ) : (
+          <div class="flex-1 bg-rcommerce-100 min-h-[32vh]" aria-hidden="true" />
+        )}
+      </div>
+
+      <!-- Right: contact info + form (aligned to same top as heading) -->
+      <div class="flex flex-col justify-start px-6 sm:px-12 lg:px-16 xl:px-24 pt-16 lg:pt-20 pb-16">
+        <h2 class="font-serif text-3xl font-semibold text-rcommerce-900">Questions? Comments? No worries.</h2>
+        <p class="mt-4 text-rcommerce-600 leading-relaxed">
+          {content.contact.intro.map((paragraph) => (
+            <>
+              {paragraph}{' '}
+            </>
+          ))}
+        </p>
+
+        <div class="mt-8 space-y-3">
+          <div class="flex items-center gap-3">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-rcommerce-accent"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
+            <a href={`mailto:${content.contact.email}`} class="text-rcommerce-accent hover:underline font-medium">{content.contact.email}</a>
+          </div>
+          {content.contact.links.map((link) => (
+            <div class="flex items-center gap-3">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-rcommerce-accent"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+              <a href={link.href} class="text-rcommerce-accent hover:underline font-medium" rel="noopener">{link.label}</a>
+            </div>
+          ))}
+        </div>
+
+        <div class="mt-10 pt-10 border-t border-rcommerce-200">
+          <h2 class="font-serif text-2xl font-semibold text-rcommerce-900">Send us a message</h2>
+          <p class="mt-2 text-sm text-rcommerce-500">We aim to reply to all inquiries within 24–48 hours.</p>
+
+          <form id="contact-form" class="mt-6 space-y-4">
+            <div>
+              <label for="topic" class="block text-[12px] font-semibold uppercase tracking-button text-rcommerce-900 mb-2">Topic</label>
+              <select id="topic" name="topic" class="input" required>
+                <option value="shipping">Shipping</option>
+                <option value="sales">Sales</option>
+                <option value="payments">Payments</option>
+                <option value="distribution">Distribution</option>
+                <option value="new-products">New Products</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label for="name" class="block text-[12px] font-semibold uppercase tracking-button text-rcommerce-900 mb-2">Full Name</label>
+                <input id="name" name="name" type="text" class="input" required />
+              </div>
+              <div>
+                <label for="email" class="block text-[12px] font-semibold uppercase tracking-button text-rcommerce-900 mb-2">Email</label>
+                <input id="email" name="email" type="email" class="input" required />
+              </div>
+            </div>
+            <div>
+              <label for="order" class="block text-[12px] font-semibold uppercase tracking-button text-rcommerce-900 mb-2">Order Number <span class="text-rcommerce-400 normal-case font-normal">(optional)</span></label>
+              <input id="order" name="order" type="text" class="input" placeholder="e.g. ORD-2026…" />
+            </div>
+            <div>
+              <label for="message" class="block text-[12px] font-semibold uppercase tracking-button text-rcommerce-900 mb-2">Message</label>
+              <textarea id="message" name="message" rows="5" class="input" required></textarea>
+            </div>
+            <button type="submit" id="contact-submit" class="btn-primary w-full">Send Message</button>
+            <p id="contact-status" class="text-sm hidden" aria-live="polite"></p>
+          </form>
+        </div>
+      </div>
+    </section>
+    )}
+  </main>
+  <Footer />
+</Layout>
+
+<script>
+  import { API_BASE } from '../lib/api';
+  const form = document.getElementById('contact-form');
+  const status = document.getElementById('contact-status');
+  const submitBtn = document.getElementById('contact-submit') as HTMLButtonElement | null;
+
+  form?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Sending…';
+    }
+    if (status) status.classList.add('hidden');
+
+    const data = new FormData(form as HTMLFormElement);
+    try {
+      const res = await fetch(`${API_BASE}/contact`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          topic: data.get('topic'),
+          name: data.get('name'),
+          email: data.get('email'),
+          order: data.get('order') || null,
+          message: data.get('message'),
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'Failed to send message');
+      (form as HTMLFormElement).reset();
+      if (status) {
+        status.textContent = json.message || "Message sent! We'll reply within 24–48 hours.";
+        status.classList.remove('hidden', 'text-rcommerce-danger');
+        status.classList.add('text-rcommerce-success');
+      }
+    } catch (err: any) {
+      if (status) {
+        status.textContent = err.message || 'Failed to send. Please email us directly.';
+        status.classList.remove('hidden', 'text-rcommerce-success');
+        status.classList.add('text-rcommerce-danger');
+      }
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Send Message';
+      }
+    }
+  });
+</script>
+{content.contact.faqs.length > 0 && (
+  <script is:inline>
+    // "Quick questions" accordion: button + aria-expanded, first panel open.
+    document.querySelectorAll('.faq-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const panel = document.getElementById(btn.getAttribute('aria-controls') || '');
+        const isOpen = btn.getAttribute('aria-expanded') === 'true';
+        btn.setAttribute('aria-expanded', String(!isOpen));
+        if (panel) panel.hidden = isOpen;
+      });
+    });
+  </script>
+)}

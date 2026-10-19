@@ -53,6 +53,9 @@ impl PaymentGateway for MockPaymentGateway {
             customer_id: None,
             payment_method: "card".to_string(),
             transaction_id: "mock_txn_123".to_string(),
+            client_secret: Some("mock_secret".to_string()),
+            card_brand: Some("visa".to_string()),
+            card_last_four: Some("4242".to_string()),
             captured_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
         })
@@ -197,6 +200,11 @@ pub struct Payment {
     pub customer_id: Option<Uuid>,
     pub payment_method: String,
     pub transaction_id: String,
+    /// Gateway client secret for resuming client-side confirmation
+    /// (Stripe/Airwallex), when the retrieve response carries one.
+    pub client_secret: Option<String>,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
     pub captured_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
