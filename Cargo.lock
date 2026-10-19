@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "rcommerce-api"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3864,7 +3864,7 @@ dependencies = [
 
 [[package]]
 name = "rcommerce-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -3900,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "rcommerce-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3957,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "rcommerce-demo"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
