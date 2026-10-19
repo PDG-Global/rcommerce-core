@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::Result;
 
 use crate::config::DunningConfig;
+use crate::payment::PaymentGateway;
 use crate::repository::SubscriptionRepository;
 use crate::services::DunningService;
 
@@ -22,6 +23,10 @@ pub struct DunningJob<R: SubscriptionRepository + Clone> {
     dunning_service: DunningService<R>,
     config: DunningConfig,
     job_id: Uuid,
+    /// Payment gateway used to retry consent charges (None = reschedule only)
+    gateway: Option<std::sync::Arc<dyn PaymentGateway>>,
+    /// Order service used to confirm recovered renewal orders
+    order_service: Option<std::sync::Arc<crate::order::OrderService>>,
 }
 
 impl<R: SubscriptionRepository + Clone> DunningJob<R> {
@@ -31,7 +36,24 @@ impl<R: SubscriptionRepository + Clone> DunningJob<R> {
             dunning_service,
             config,
             job_id: Uuid::new_v4(),
+            gateway: None,
+            order_service: None,
         }
+    }
+
+    /// Attach a payment gateway so retries actually charge the stored consent
+    pub fn with_gateway(mut self, gateway: std::sync::Arc<dyn PaymentGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
+    }
+
+    /// Attach the order service so recovered renewals confirm their order
+    pub fn with_order_service(
+        mut self,
+        order_service: std::sync::Arc<crate::order::OrderService>,
+    ) -> Self {
+        self.order_service = Some(order_service);
+        self
     }
 
     /// Get the job ID
@@ -51,8 +73,27 @@ impl<R: SubscriptionRepository + Clone> DunningJob<R> {
         info!("Starting dunning job {}", self.job_id);
         let start_time = Utc::now();
 
-        // Process all due retries
-        let result = self.dunning_service.process_all_due_retries().await?;
+        // Process all due retries. Without a configured gateway the job only
+        // reschedules (legacy behaviour).
+        let result = match self.gateway.as_ref() {
+            Some(gateway) => {
+                self.dunning_service
+                    .process_all_due_retries(gateway.as_ref(), self.order_service.as_ref())
+                    .await?
+            }
+            None => {
+                warn!(
+                    "Dunning job {} has no payment gateway; retries only rescheduled",
+                    self.job_id
+                );
+                crate::services::RetryProcessingResult {
+                    processed: 0,
+                    succeeded: 0,
+                    failed: 0,
+                    pending: 0,
+                }
+            }
+        };
 
         // Check for subscriptions that should be cancelled (grace period expired)
         let cancelled = self.process_expired_grace_periods().await?;

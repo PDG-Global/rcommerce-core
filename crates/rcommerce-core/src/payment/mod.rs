@@ -97,6 +97,24 @@ impl PaymentGateway for MockPaymentGateway {
             data: serde_json::json!({}),
         })
     }
+
+    async fn create_customer(&self, email: &str, _name: &str) -> Result<String> {
+        // Deterministic fake id derived from the email so tests are stable.
+        let hash = email.bytes().map(u64::from).sum::<u64>();
+        Ok(format!("mock_customer_{:016x}", hash))
+    }
+
+    async fn create_payment_consent(
+        &self,
+        gateway_customer_id: &str,
+        _card: CardDetails,
+        merchant_trigger_reason: &str,
+    ) -> Result<ConsentCreation> {
+        Ok(ConsentCreation {
+            consent_id: format!("mock_consent_{}", gateway_customer_id),
+            client_secret: format!("mock_consent_secret_{}", merchant_trigger_reason),
+        })
+    }
 }
 
 use async_trait::async_trait;
@@ -104,6 +122,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::models::Address;
+use crate::Error;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +154,33 @@ pub trait PaymentGateway: Send + Sync {
 
     /// Handle webhook
     async fn handle_webhook(&self, payload: &[u8], signature: &str) -> Result<WebhookEvent>;
+
+    /// Create a customer at the gateway (e.g. an Airwallex customer to hold
+    /// stored-card consents). Returns the gateway's customer id.
+    async fn create_customer(&self, _email: &str, _name: &str) -> Result<String> {
+        Err(Error::payment_error(
+            "create_customer not supported by this gateway",
+        ))
+    }
+
+    /// Create a stored-card payment consent for merchant-initiated charges.
+    async fn create_payment_consent(
+        &self,
+        _gateway_customer_id: &str,
+        _card: CardDetails,
+        _merchant_trigger_reason: &str,
+    ) -> Result<ConsentCreation> {
+        Err(Error::payment_error(
+            "create_payment_consent not supported by this gateway",
+        ))
+    }
+}
+
+/// Result of creating a stored-card payment consent
+#[derive(Debug, Clone)]
+pub struct ConsentCreation {
+    pub consent_id: String,
+    pub client_secret: String,
 }
 
 /// Create payment request
@@ -147,6 +193,12 @@ pub struct CreatePaymentRequest {
     pub customer_email: String,
     pub payment_method: PaymentMethod,
     pub billing_address: Option<Address>,
+    /// Stored-card consent id (Airwallex payment_consent) for merchant-
+    /// initiated charges such as subscription renewals.
+    pub payment_consent_id: Option<String>,
+    /// True when the charge is merchant-initiated on a stored consent
+    /// (skips customer-present authentication at the gateway).
+    pub merchant_initiated: Option<bool>,
     pub metadata: serde_json::Value,
 }
 
@@ -160,6 +212,9 @@ pub enum PaymentMethod {
     AliPay,
     BankTransfer,
     CashOnDelivery,
+    /// Charge a previously saved payment method (stored-card consent); the
+    /// consent id travels in `CreatePaymentRequest::payment_consent_id`.
+    SavedCard,
 }
 
 #[derive(Debug, Clone)]
@@ -255,4 +310,7 @@ pub enum WebhookEventType {
     PaymentCanceled,
     RefundSucceeded,
     DisputeCreated,
+    /// A stored-card consent was verified by the gateway (log-only; consent
+    /// verification primarily happens synchronously at checkout).
+    PaymentConsentVerified,
 }

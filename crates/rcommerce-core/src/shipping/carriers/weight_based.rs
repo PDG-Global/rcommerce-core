@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::common::Address;
@@ -22,14 +23,16 @@ pub struct WeightBasedProvider {
     carrier_name: String,
 }
 
-#[derive(Debug, Clone)]
-struct ShippingZone {
-    name: &'static str,
-    countries: &'static [&'static str],
-    rate_per_half_kg: Decimal,
-    base_rate: Decimal,
-    delivery_days: i32,
-    free_shipping: bool,
+/// A shipping zone: a set of 2-letter ISO country codes quoted at the same
+/// rate. Zones are checked in order, first match wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShippingZone {
+    pub name: String,
+    pub countries: Vec<String>,
+    pub rate_per_half_kg: Decimal,
+    pub base_rate: Decimal,
+    pub delivery_days: i32,
+    pub free_shipping: bool,
 }
 
 impl Default for WeightBasedProvider {
@@ -44,114 +47,14 @@ impl WeightBasedProvider {
             carrier_name: "Weight Based Shipping".to_string(),
             // Zones are checked in order (WooCommerce first-match-wins); the
             // catch-all fallback lives in `calculate_shipping_cost`.
-            zones: vec![
-                // United States: base $5 + $5/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &["US"],
-                    rate_per_half_kg: dec!(5.00),
-                    base_rate: dec!(5.00),
-                    delivery_days: 7,
-                    free_shipping: false,
-                },
-                // Switzerland: $7.5/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &["CH"],
-                    rate_per_half_kg: dec!(7.50),
-                    base_rate: dec!(0.00),
-                    delivery_days: 10,
-                    free_shipping: false,
-                },
-                // Canada: $5/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &["CA"],
-                    rate_per_half_kg: dec!(5.00),
-                    base_rate: dec!(0.00),
-                    delivery_days: 10,
-                    free_shipping: false,
-                },
-                // Russia: $9/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &["RU"],
-                    rate_per_half_kg: dec!(9.00),
-                    base_rate: dec!(0.00),
-                    delivery_days: 21,
-                    free_shipping: false,
-                },
-                // South Africa: $16/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &["ZA"],
-                    rate_per_half_kg: dec!(16.00),
-                    base_rate: dec!(0.00),
-                    delivery_days: 21,
-                    free_shipping: false,
-                },
-                // Latin America / selected: $12.5/0.5kg (MD moved to the
-                // non-EU Europe list below)
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &[
-                        "AR", "BR", "CL", "CO", "CR", "DO", "EC", "SV", "HN", "JM", "LR", "NI",
-                        "PA", "UY",
-                    ],
-                    rate_per_half_kg: dec!(12.50),
-                    base_rate: dec!(0.00),
-                    delivery_days: 21,
-                    free_shipping: false,
-                },
-                // EU 27: $4.5/0.5kg
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &[
-                        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
-                        "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
-                        "SI", "ES", "SE",
-                    ],
-                    rate_per_half_kg: dec!(4.50),
-                    base_rate: dec!(0.00),
-                    delivery_days: 10,
-                    free_shipping: false,
-                },
-                // Other allowed countries (non-EU Europe + Asia-Pacific):
-                // $3.5/0.5kg. Anything NOT in any zone gets no rates at all.
-                ShippingZone {
-                    name: "Standard Shipping",
-                    countries: &[
-                        // Non-EU Europe
-                        "GB", "NO", "IS", "LI", "MC", "AD", "SM", "AL", "RS", "ME", "MK", "BA",
-                        "MD", "XK", "GI", "GG", "JE", "IM", "FO", // Asia-Pacific / Asia
-                        "JP", "KR", "AU", "NZ", "MY", "TH", "VN", "ID", "PH", "IN", "BD", "LK",
-                        "NP", "KH", "LA", "BN", "PG", "FJ", "MN", "AE",
-                    ],
-                    rate_per_half_kg: dec!(3.50),
-                    base_rate: dec!(0.00),
-                    delivery_days: 21,
-                    free_shipping: false,
-                },
-                // China: free via SF Express
-                ShippingZone {
-                    name: "SF Express",
-                    countries: &["CN"],
-                    rate_per_half_kg: dec!(0.00),
-                    base_rate: dec!(0.00),
-                    delivery_days: 10,
-                    free_shipping: true,
-                },
-                // Hong Kong / Taiwan / Singapore: $2.5/0.5kg via SF Express
-                ShippingZone {
-                    name: "SF Express",
-                    countries: &["HK", "TW", "SG"],
-                    rate_per_half_kg: dec!(2.50),
-                    base_rate: dec!(0.00),
-                    delivery_days: 7,
-                    free_shipping: false,
-                },
-            ],
+            zones: default_zones(),
         }
+    }
+
+    /// Replace the built-in zones entirely (config-driven zones).
+    pub fn with_zones(mut self, zones: Vec<ShippingZone>) -> Self {
+        self.zones = zones;
+        self
     }
 
     /// Override the carrier name shown on rates (store branding)
@@ -164,11 +67,7 @@ impl WeightBasedProvider {
 
     /// Sorted list of all shippable 2-letter country codes across all zones.
     pub fn shippable_countries(&self) -> Vec<String> {
-        let mut codes: Vec<String> = self
-            .zones
-            .iter()
-            .flat_map(|z| z.countries.iter().map(|c| c.to_string()))
-            .collect();
+        let mut codes: Vec<String> = self.zones.iter().flat_map(|z| z.countries.clone()).collect();
         codes.sort_unstable();
         codes.dedup();
         codes
@@ -176,9 +75,7 @@ impl WeightBasedProvider {
 
     fn find_zone(&self, country_code: &str) -> Option<&ShippingZone> {
         let cc = country_code.to_uppercase();
-        self.zones
-            .iter()
-            .find(|z| z.countries.contains(&cc.as_str()))
+        self.zones.iter().find(|z| z.countries.contains(&cc))
     }
 
     /// Quote for a destination, or `None` when the country is not shippable
@@ -193,10 +90,10 @@ impl WeightBasedProvider {
 
         let zone = self.find_zone(country_code)?;
         if zone.free_shipping {
-            return Some((Decimal::ZERO, zone.name, zone.delivery_days));
+            return Some((Decimal::ZERO, zone.name.as_str(), zone.delivery_days));
         }
         let cost = zone.base_rate + (zone.rate_per_half_kg * half_kg_units);
-        Some((cost, zone.name, zone.delivery_days))
+        Some((cost, zone.name.as_str(), zone.delivery_days))
     }
 }
 
@@ -332,6 +229,108 @@ pub fn calculate_eu_vat(items: &[(String, i32)], // (category_slug, quantity)
     total_declared_value * dec!(0.20)
 }
 
+fn zone(
+    name: &str,
+    countries: &[&str],
+    rate_per_half_kg: Decimal,
+    base_rate: Decimal,
+    delivery_days: i32,
+    free_shipping: bool,
+) -> ShippingZone {
+    ShippingZone {
+        name: name.to_string(),
+        countries: countries.iter().map(|c| c.to_string()).collect(),
+        rate_per_half_kg,
+        base_rate,
+        delivery_days,
+        free_shipping,
+    }
+}
+
+/// Built-in default zones (88wheels' WooCommerce rate card). Used when the
+/// configuration does not define `[shipping.weight_based] zones`.
+fn default_zones() -> Vec<ShippingZone> {
+    vec![
+        // United States: base $5 + $5/0.5kg
+        zone(
+            "Standard Shipping",
+            &["US"],
+            dec!(5.00),
+            dec!(5.00),
+            7,
+            false,
+        ),
+        // Switzerland: $7.5/0.5kg
+        zone(
+            "Standard Shipping",
+            &["CH"],
+            dec!(7.50),
+            dec!(0.00),
+            10,
+            false,
+        ),
+        // Canada: $5/0.5kg
+        zone("Standard Shipping", &["CA"], dec!(5.00), dec!(0.00), 10, false),
+        // Russia: $9/0.5kg
+        zone("Standard Shipping", &["RU"], dec!(9.00), dec!(0.00), 21, false),
+        // South Africa: $16/0.5kg
+        zone(
+            "Standard Shipping",
+            &["ZA"],
+            dec!(16.00),
+            dec!(0.00),
+            21,
+            false,
+        ),
+        // Latin America / selected: $12.5/0.5kg (MD moved to the
+        // non-EU Europe list below)
+        zone(
+            "Standard Shipping",
+            &[
+                "AR", "BR", "CL", "CO", "CR", "DO", "EC", "SV", "HN", "JM", "LR", "NI", "PA",
+                "UY",
+            ],
+            dec!(12.50),
+            dec!(0.00),
+            21,
+            false,
+        ),
+        // EU 27: $4.5/0.5kg
+        zone(
+            "Standard Shipping",
+            &[
+                "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU",
+                "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES",
+                "SE",
+            ],
+            dec!(4.50),
+            dec!(0.00),
+            10,
+            false,
+        ),
+        // Other allowed countries (non-EU Europe + Asia-Pacific):
+        // $3.5/0.5kg. Anything NOT in any zone gets no rates at all.
+        zone(
+            "Standard Shipping",
+            &[
+                // Non-EU Europe
+                "GB", "NO", "IS", "LI", "MC", "AD", "SM", "AL", "RS", "ME", "MK", "BA", "MD",
+                "XK", "GI", "GG", "JE", "IM", "FO", // Asia-Pacific / Asia
+                "JP", "KR", "AU", "NZ", "MY", "TH", "VN", "ID", "PH", "IN", "BD", "LK", "NP",
+                "KH", "LA", "BN", "PG", "FJ", "MN", "AE",
+            ],
+            dec!(3.50),
+            dec!(0.00),
+            21,
+            false,
+        ),
+        // China: free via SF Express
+        zone("SF Express", &["CN"], dec!(0.00), dec!(0.00), 10, true),
+        // Hong Kong / Taiwan / Singapore: $2.5/0.5kg via SF Express
+        zone("SF Express", &["HK", "TW", "SG"], dec!(2.50), dec!(0.00), 7, false),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,8 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rates_returns_empty_for_disallowed_country() {
-        let provider = WeightBasedProvider::new();
+    fn test_get_rates_returns_empty_for_disallowed_country() {        let provider = WeightBasedProvider::new();
         let mut addr = test_address("IL");
         let package = Package {
             weight: dec!(1.0),
@@ -480,8 +478,107 @@ mod tests {
         );
     }
 
-    fn test_address(country: &str) -> Address {
-        Address {
+    fn au_nz_zones() -> Vec<ShippingZone> {
+        vec![
+            ShippingZone {
+                name: "Standard Shipping".to_string(),
+                countries: vec!["AU".to_string()],
+                rate_per_half_kg: dec!(0.00),
+                base_rate: dec!(0.00),
+                delivery_days: 5,
+                free_shipping: true,
+            },
+            ShippingZone {
+                name: "Standard Shipping".to_string(),
+                countries: vec!["NZ".to_string()],
+                rate_per_half_kg: dec!(0.00),
+                base_rate: dec!(0.00),
+                delivery_days: 7,
+                free_shipping: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_custom_zones_replace_defaults() {
+        // Config-driven zones must REPLACE the built-in zones entirely:
+        // AU/NZ-only config must not quote the default-zone countries.
+        let provider = WeightBasedProvider::new().with_zones(au_nz_zones());
+
+        // AU/NZ get free rates
+        assert_eq!(
+            provider
+                .calculate_shipping_cost(dec!(2.0), "AU")
+                .map(|(cost, _, _)| cost),
+            Some(dec!(0.00))
+        );
+        assert_eq!(
+            provider
+                .calculate_shipping_cost(dec!(2.0), "nz") // case-insensitive
+                .map(|(cost, _, days)| (cost, days)),
+            Some((dec!(0.00), 7))
+        );
+
+        // Countries from the default zones are no longer shippable
+        for cc in ["US", "CN", "GB", "DE", "SG", "JP"] {
+            assert_eq!(
+                provider.calculate_shipping_cost(dec!(1.0), cc),
+                None,
+                "{cc} must not be shippable with AU/NZ-only zones"
+            );
+        }
+
+        assert_eq!(
+            provider.shippable_countries(),
+            vec!["AU".to_string(), "NZ".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_custom_zones_get_rates_via_provider_trait() {
+        let provider = WeightBasedProvider::new().with_zones(au_nz_zones());
+        let addr = test_address("AU");
+        let package = Package {
+            weight: dec!(1.5),
+            weight_unit: "kg".to_string(),
+            length: None,
+            width: None,
+            height: None,
+            dimension_unit: None,
+            predefined_package: None,
+        };
+        let options = RateOptions {
+            carriers: None,
+            services: None,
+            include_insurance: false,
+            insurance_value: None,
+            signature_confirmation: false,
+            adult_signature: false,
+            saturday_delivery: false,
+            hold_for_pickup: false,
+            currency: Some("USD".to_string()),
+        };
+
+        let rates =
+            futures::executor::block_on(provider.get_rates(&addr, &addr, &package, &options))
+                .unwrap();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].total_cost, dec!(0.00));
+        assert_eq!(
+            rates[0].service_name,
+            "Free Shipping (Standard Shipping)"
+        );
+        assert_eq!(rates[0].delivery_days, Some(5));
+
+        // US produces no rates at all
+        let us_addr = test_address("US");
+        let rates =
+            futures::executor::block_on(provider.get_rates(&us_addr, &us_addr, &package, &options))
+                .unwrap();
+        assert!(rates.is_empty(), "US must produce no rates");
+    }
+
+    fn test_address(country: &str) -> Address {        Address {
             id: uuid::Uuid::new_v4(),
             customer_id: uuid::Uuid::nil(),
             first_name: "Test".to_string(),

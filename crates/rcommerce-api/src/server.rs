@@ -64,6 +64,7 @@ async fn run_http_server(config: Config) -> Result<()> {
     // Initialize application state
     let app_state = create_app_state(&config).await?;
     spawn_abandoned_order_sweeper(&config, &app_state);
+    spawn_subscription_billing_loop(&config, &app_state);
 
     // Build router
     let app = build_router(app_state, None, &config.server.cors, &config.rate_limiting);
@@ -120,6 +121,7 @@ async fn run_tls_server(config: Config) -> Result<()> {
     // Initialize application state
     let app_state = create_app_state(&config).await?;
     spawn_abandoned_order_sweeper(&config, &app_state);
+    spawn_subscription_billing_loop(&config, &app_state);
 
     // Build main API router (HTTPS)
     let api_app = build_router(
@@ -631,6 +633,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             .site_url
             .clone()
             .or_else(|| std::env::var("STOREFRONT_URL").ok()),
+        subscription_discount_percent: config.subscriptions.discount_percent,
         ..CheckoutConfig::default()
     };
     let checkout_payment_gateway: Arc<dyn rcommerce_core::payment::PaymentGateway> =
@@ -655,12 +658,16 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         cart_service.clone(),
         tax_service.clone(),
         order_service.clone(),
-        checkout_payment_gateway,
+        checkout_payment_gateway.clone(),
         shipping_factory.clone(),
         checkout_config,
         Some(Arc::new(coupon_service.clone())),
     ));
     info!("Checkout service initialized");
+    // Subscription renewals are charged through the same legacy gateway
+    // instance as checkout (stored-card consent charges).
+    let subscription_gateway: Arc<dyn rcommerce_core::payment::PaymentGateway> =
+        checkout_payment_gateway;
 
     // Build email config from notification settings if enabled
     let smtp_config = if config.notifications.enabled {
@@ -739,6 +746,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         tax_service,
         shipping_factory,
         checkout_service,
+        Some(subscription_gateway),
         Arc::new(inventory_service),
         smtp_config,
         if config.accounting.xero.enabled {
@@ -828,6 +836,117 @@ fn spawn_abandoned_order_sweeper(config: &Config, app_state: &AppState) {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+/// Spawn the subscription billing loop when enabled
+/// (`[subscriptions] enabled`). First run ~60s after startup, then every
+/// `billing_interval_minutes`. For each due subscription a renewal order is
+/// created and the stored-card consent charged; per-subscription errors are
+/// logged and swallowed so one bad subscription never stops the loop.
+fn spawn_subscription_billing_loop(config: &Config, app_state: &AppState) {
+    if !config.subscriptions.enabled {
+        return;
+    }
+    let interval_minutes = config.subscriptions.billing_interval_minutes.max(1);
+    info!(
+        "subscription billing loop enabled (every {} min)",
+        interval_minutes
+    );
+    let Some(gateway) = app_state.subscription_gateway.clone() else {
+        warn!("subscription billing loop enabled but no payment gateway available");
+        return;
+    };
+    let subscription_service = app_state.subscription_service.clone();
+    let order_service = app_state.order_service.clone();
+    let notification_service = app_state.notification_service.clone();
+    let customer_service = std::sync::Arc::new(app_state.customer_service.clone());
+    let db = app_state.db.clone();
+    let branding = app_state.branding.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            match subscription_service
+                .process_due_subscriptions_with_charging(&gateway, &order_service)
+                .await
+            {
+                Ok(report) => {
+                    if report.processed > 0 {
+                        info!(
+                            "subscription billing: {} processed, {} charged, {} failed",
+                            report.processed, report.charged, report.failed
+                        );
+                    }
+                    // Order-confirmation emails for the renewals that paid
+                    // (fire-and-forget; failures only log).
+                    if !report.charged_order_ids.is_empty() {
+                        send_renewal_confirmation_emails(
+                            &report.charged_order_ids,
+                            &notification_service,
+                            &order_service,
+                            &customer_service,
+                            &db,
+                            &branding,
+                        );
+                    }
+                }
+                Err(e) => warn!("subscription billing run failed: {}", e),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval_minutes * 60)).await;
+        }
+    });
+}
+
+/// Best-effort order-confirmation emails for renewal orders that were just
+/// charged by the billing loop. Fire-and-forget; failures only log.
+fn send_renewal_confirmation_emails(
+    order_ids: &[uuid::Uuid],
+    notification_service: &Option<Arc<rcommerce_core::notification::service::NotificationService>>,
+    order_service: &Arc<OrderService>,
+    customer_service: &Arc<CustomerService>,
+    db: &Database,
+    branding: &rcommerce_core::config::BrandingConfig,
+) {
+    let Some(svc) = notification_service.clone() else {
+        return;
+    };
+    for order_id in order_ids {
+        let order_service = order_service.clone();
+        let customer_service = customer_service.clone();
+        let db = db.clone();
+        let branding = branding.clone();
+        let svc = svc.clone();
+        let order_id = *order_id;
+        tokio::spawn(async move {
+            // The renewal order carries the customer's email; the checkout
+            // email helper loads the order and sends the confirmation.
+            let customer_email: Option<String> =
+                sqlx::query_scalar("SELECT customer_email FROM orders WHERE id = $1")
+                    .bind(order_id)
+                    .fetch_optional(db.pool())
+                    .await
+                    .unwrap_or(None);
+            let Some(customer_email) = customer_email else {
+                return;
+            };
+            if let Err(e) = crate::routes::checkout::send_order_confirmation_email(
+                &svc,
+                &order_service,
+                &customer_service,
+                &db,
+                &branding,
+                order_id,
+                &customer_email,
+            )
+            .await
+            {
+                tracing::error!(
+                    "Failed to send renewal confirmation email for order {}: {}",
+                    order_id,
+                    e
+                );
+            }
+        });
+    }
 }
 
 /// Build the main API router
@@ -1006,9 +1125,11 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::auth_protected_router())
         // Payment routes except webhooks
         .merge(crate::routes::payment::payment_routes())
-        // Subscription routes
+        // Subscription routes (customer-facing; admin routes live in the
+        // admin group below)
         .merge(crate::routes::subscription_router())
-        // Dunning routes
+        // Dunning routes (customer-facing; admin routes live in the admin
+        // group below)
         .merge(crate::routes::dunning_router())
         // Customer cart lookup and cart deletion require authentication
         .merge(crate::routes::cart_protected_router())
@@ -1036,6 +1157,8 @@ fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::review_admin_router())
         .merge(crate::routes::statistics_router())
         .merge(crate::routes::coupon_router())
+        .merge(crate::routes::subscription_admin_router())
+        .merge(crate::routes::dunning_admin_router())
         .route_layer(middleware::from_fn_with_state(app_state, admin_middleware));
 
     Router::new()

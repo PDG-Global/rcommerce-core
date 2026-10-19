@@ -256,10 +256,13 @@ async fn map_order(
             .await
             .unwrap_or_default()
             .into_iter()
-            .fold(std::collections::HashMap::new(), |mut map, (vid, name, value)| {
-                map.entry(vid).or_insert_with(Vec::new).push((name, value));
-                map
-            })
+            .fold(
+                std::collections::HashMap::new(),
+                |mut map, (vid, name, value)| {
+                    map.entry(vid).or_insert_with(Vec::new).push((name, value));
+                    map
+                },
+            )
         } else {
             std::collections::HashMap::new()
         };
@@ -1007,12 +1010,14 @@ mod line_item_tests {
             (v1, "Color".to_string(), "Orange".to_string()),
             (v2, "Degree".to_string(), "30".to_string()),
         ];
-        let map: std::collections::HashMap<uuid::Uuid, Vec<(String, String)>> = rows
-            .into_iter()
-            .fold(std::collections::HashMap::new(), |mut map, (vid, name, value)| {
-                map.entry(vid).or_insert_with(Vec::new).push((name, value));
-                map
-            });
+        let map: std::collections::HashMap<uuid::Uuid, Vec<(String, String)>> =
+            rows.into_iter().fold(
+                std::collections::HashMap::new(),
+                |mut map, (vid, name, value)| {
+                    map.entry(vid).or_insert_with(Vec::new).push((name, value));
+                    map
+                },
+            );
         assert_eq!(map[&v1].len(), 2);
         assert_eq!(map[&v2].len(), 1);
     }

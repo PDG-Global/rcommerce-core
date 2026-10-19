@@ -378,6 +378,8 @@ mod tests {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         };
 

@@ -188,7 +188,12 @@ pub fn generate_invoice_html(data: &InvoiceData) -> Result<String, String> {
                 .variant_title
                 .as_deref()
                 .filter(|v| !v.is_empty())
-                .map(|v| format!(r#"<div class="item-variant">{variant}</div>"#, variant = escape_html(v)))
+                .map(|v| {
+                    format!(
+                        r#"<div class="item-variant">{variant}</div>"#,
+                        variant = escape_html(v)
+                    )
+                })
                 .unwrap_or_default();
             format!(
                 r#"<tr>
@@ -457,29 +462,36 @@ mod tests {
             cancelled_at: None,
         };
 
-        let make_item = |name: &str, sku: &str, total: Decimal, component: bool, variant: Option<&str>| {
-            rcommerce_core::order::OrderItem {
-                id: uuid::Uuid::new_v4(),
-                order_id: order.id,
-                product_id: uuid::Uuid::new_v4(),
-                variant_id: None,
-                quantity: 1,
-                price: total,
-                subtotal: total,
-                tax_amount: Decimal::ZERO,
-                total,
-                sku: Some(sku.to_string()),
-                name: name.to_string(),
-                variant_name: variant.map(|v| v.to_string()),
-                weight: None,
-                weight_unit: None,
-                is_bundle_component: Some(component),
-                metadata: serde_json::json!({}),
-                created_at: Utc::now(),
-            }
-        };
+        let make_item =
+            |name: &str, sku: &str, total: Decimal, component: bool, variant: Option<&str>| {
+                rcommerce_core::order::OrderItem {
+                    id: uuid::Uuid::new_v4(),
+                    order_id: order.id,
+                    product_id: uuid::Uuid::new_v4(),
+                    variant_id: None,
+                    quantity: 1,
+                    price: total,
+                    subtotal: total,
+                    tax_amount: Decimal::ZERO,
+                    total,
+                    sku: Some(sku.to_string()),
+                    name: name.to_string(),
+                    variant_name: variant.map(|v| v.to_string()),
+                    weight: None,
+                    weight_unit: None,
+                    is_bundle_component: Some(component),
+                    metadata: serde_json::json!({}),
+                    created_at: Utc::now(),
+                }
+            };
         let items = vec![
-            make_item("Race Pack", "RACE-PACK", Decimal::new(12000, 2), false, None),
+            make_item(
+                "Race Pack",
+                "RACE-PACK",
+                Decimal::new(12000, 2),
+                false,
+                None,
+            ),
             // $0 stock-reservation component line: must not appear on the invoice
             make_item("80mm Maverick Wheels", "MAV-80", Decimal::ZERO, true, None),
             // Variant line: must map order_items.variant_title through
@@ -534,13 +546,18 @@ mod tests {
         );
         // Discount row sits between Subtotal and Shipping in the totals block.
         let sub_pos = html.find("Subtotal").expect("subtotal missing");
-        let disc_pos = html.find("Discount (1V97NIBP40)").expect("discount missing");
+        let disc_pos = html
+            .find("Discount (1V97NIBP40)")
+            .expect("discount missing");
         let after_sub = &html[sub_pos..];
         let ship_pos = after_sub
             .find("Shipping")
             .expect("shipping missing in totals block");
         let disc_rel = disc_pos - sub_pos;
-        assert!(disc_rel < ship_pos, "discount row must sit between Subtotal and Shipping");
+        assert!(
+            disc_rel < ship_pos,
+            "discount row must sit between Subtotal and Shipping"
+        );
     }
 
     #[test]

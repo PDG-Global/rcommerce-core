@@ -194,6 +194,8 @@ impl<G: PaymentGateway> DunningManager<G> {
                 name: String::new(),
             }),
             billing_address: None,
+            payment_consent_id: subscription.payment_method_id.clone(),
+            merchant_initiated: Some(true),
             metadata: serde_json::json!({
                 "subscription_id": subscription.id,
                 "invoice_id": invoice.id,

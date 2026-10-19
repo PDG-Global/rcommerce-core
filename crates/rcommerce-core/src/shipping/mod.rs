@@ -411,6 +411,9 @@ pub struct ShippingProviderFactory {
     providers: HashMap<String, Box<dyn ShippingProvider>>,
     /// Carrier name for the weight-based provider (store branding)
     weight_based_carrier_name: String,
+    /// Config-driven zones for the weight-based provider. Empty = use the
+    /// provider's built-in default zones.
+    weight_based_zones: Vec<crate::shipping::carriers::ShippingZone>,
 }
 
 impl Clone for ShippingProviderFactory {
@@ -429,10 +432,7 @@ impl Clone for ShippingProviderFactory {
                 "weight_based" => {
                     providers.insert(
                         id.clone(),
-                        Box::new(
-                            crate::shipping::carriers::WeightBasedProvider::new()
-                                .with_carrier_name(&self.weight_based_carrier_name),
-                        ) as Box<dyn ShippingProvider>,
+                        Box::new(self.weight_based_provider()) as Box<dyn ShippingProvider>,
                     );
                 }
                 _ => {}
@@ -441,6 +441,7 @@ impl Clone for ShippingProviderFactory {
         Self {
             providers,
             weight_based_carrier_name: self.weight_based_carrier_name.clone(),
+            weight_based_zones: self.weight_based_zones.clone(),
         }
     }
 }
@@ -450,12 +451,32 @@ impl ShippingProviderFactory {
         Self {
             providers: HashMap::new(),
             weight_based_carrier_name: "Weight Based Shipping".to_string(),
+            weight_based_zones: Vec::new(),
         }
+    }
+
+    /// Build the weight-based provider with the factory's carrier name and
+    /// configured zones (falling back to the built-in default zones when no
+    /// zones are configured).
+    fn weight_based_provider(&self) -> crate::shipping::carriers::WeightBasedProvider {
+        let mut provider = crate::shipping::carriers::WeightBasedProvider::new()
+            .with_carrier_name(&self.weight_based_carrier_name);
+        if !self.weight_based_zones.is_empty() {
+            provider = provider.with_zones(self.weight_based_zones.clone());
+        }
+        provider
+    }
+
+    /// Sorted list of shippable country codes from the weight-based provider
+    /// (respecting configured custom zones when present).
+    pub fn weight_based_shippable_countries(&self) -> Vec<String> {
+        self.weight_based_provider().shippable_countries()
     }
 
     /// Create a factory from configuration. The weight-based carrier name
     /// comes from `[shipping.weight_based] carrier_name`, falling back to the
-    /// store's branding name.
+    /// store's branding name. Custom `[shipping.weight_based] zones`, when
+    /// present, replace the provider's built-in default zones.
     pub fn from_config(config: &crate::config::Config) -> Self {
         let carrier_name = config
             .shipping
@@ -466,11 +487,10 @@ impl ShippingProviderFactory {
 
         let mut factory = Self::new();
         factory.weight_based_carrier_name = carrier_name.clone();
+        factory.weight_based_zones = config.shipping.weight_based.zones.clone();
 
         // Register weight-based provider (zone-calculated rates)
-        factory.register(Box::new(
-            crate::shipping::carriers::WeightBasedProvider::new().with_carrier_name(&carrier_name),
-        ));
+        factory.register(Box::new(factory.weight_based_provider()));
 
         // Register DHL if configured
         if config.shipping.dhl.enabled {

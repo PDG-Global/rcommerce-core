@@ -83,6 +83,8 @@ fn create_test_request(amount: Decimal) -> CreatePaymentRequest {
             name: "Test User".to_string(),
         }),
         billing_address: None,
+        payment_consent_id: None,
+        merchant_initiated: None,
         metadata: serde_json::json!({
             "test": true,
             "environment": "integration_test"
@@ -105,6 +107,8 @@ fn create_test_request_airwallex(amount: Decimal) -> CreatePaymentRequest {
             name: "Test User".to_string(),
         }),
         billing_address: None,
+        payment_consent_id: None,
+        merchant_initiated: None,
         metadata: serde_json::json!({
             "test": true,
             "environment": "integration_test"
@@ -121,6 +125,8 @@ fn create_test_request_alipay(amount: Decimal) -> CreatePaymentRequest {
         customer_email: "test@example.com".to_string(),
         payment_method: PaymentMethod::AliPay,
         billing_address: None,
+        payment_consent_id: None,
+        merchant_initiated: None,
         metadata: serde_json::json!({
             "test": true,
             "environment": "integration_test"

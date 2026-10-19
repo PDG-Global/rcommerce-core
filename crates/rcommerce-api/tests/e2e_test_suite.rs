@@ -1059,6 +1059,8 @@ impl TestHarness {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         };
 
@@ -1094,6 +1096,8 @@ impl TestHarness {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({
                 "merchant_order_id": format!("E2E-{}", Uuid::new_v4()),
             }),

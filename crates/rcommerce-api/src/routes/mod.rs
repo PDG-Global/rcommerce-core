@@ -43,7 +43,7 @@ pub use checkout::router as checkout_router;
 pub use coupon::router as coupon_router;
 pub use customer::router as customer_router;
 pub use downloads::router as downloads_router;
-pub use dunning::router as dunning_router;
+pub use dunning::{admin_router as dunning_admin_router, router as dunning_router};
 pub use newsletter::router as newsletter_router;
 pub use order::router as order_router;
 pub use payment::router as payment_router;
@@ -53,7 +53,7 @@ pub use review::admin_router as review_admin_router;
 pub use review::protected_router as review_protected_router;
 pub use review::public_router as review_public_router;
 pub use statistics::router as statistics_router;
-pub use subscription::router as subscription_router;
+pub use subscription::{admin_router as subscription_admin_router, router as subscription_router};
 pub use webhook::router as webhook_router;
 
 use crate::state::AppState;
@@ -103,12 +103,14 @@ fn api_v1_routes() -> Router<AppState> {
         .merge(coupon_router())
         .merge(payment_router())
         .merge(subscription_router())
+        .merge(subscription_admin_router())
         .merge(newsletter_router())
         .merge(review_public_router())
         .merge(review_protected_router())
         .merge(admin_router())
         .merge(statistics_router())
         .merge(dunning_router())
+        .merge(dunning_admin_router())
         .merge(downloads_router())
         .merge(webhook_router())
 }

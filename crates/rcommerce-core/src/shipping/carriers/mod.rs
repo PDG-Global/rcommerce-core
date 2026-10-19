@@ -12,7 +12,7 @@ pub use fedex::FedExProvider;
 pub use manual::ManualProvider;
 pub use ups::UpsProvider;
 pub use usps::UspsProvider;
-pub use weight_based::WeightBasedProvider;
+pub use weight_based::{ShippingZone, WeightBasedProvider};
 
 use crate::common::Address;
 use crate::Result;

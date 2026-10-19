@@ -194,6 +194,11 @@ impl Migrator {
                 "payments_legacy",
                 include_str!("../../migrations/019_payments_legacy.sql"),
             ),
+            (
+                20,
+                "subscriptions_money",
+                include_str!("../../migrations/020_subscriptions_money.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {

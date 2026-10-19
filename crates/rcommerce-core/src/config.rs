@@ -58,6 +58,42 @@ pub struct Config {
 
     #[serde(default)]
     pub orders: OrdersConfig,
+
+    #[serde(default)]
+    pub subscriptions: SubscriptionsConfig,
+}
+
+/// Subscription billing settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionsConfig {
+    /// Enable subscription billing (the background renewal charging loop).
+    /// Disabled by default: turning this on starts charging stored-card
+    /// consents when subscriptions come due.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Percentage discount applied to the merchandise subtotal when a
+    /// checkout includes a subscription option (0 = no discount).
+    #[serde(default)]
+    pub discount_percent: i64,
+
+    /// How often the background billing loop runs, in minutes.
+    #[serde(default = "default_subscription_billing_interval_minutes")]
+    pub billing_interval_minutes: u64,
+}
+
+impl Default for SubscriptionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discount_percent: 0,
+            billing_interval_minutes: default_subscription_billing_interval_minutes(),
+        }
+    }
+}
+
+fn default_subscription_billing_interval_minutes() -> u64 {
+    60
 }
 
 /// Order lifecycle settings
@@ -1638,6 +1674,12 @@ pub struct WeightBasedConfig {
     /// Carrier name shown on shipping rates and order records. Falls back to
     /// the store's branding name when unset.
     pub carrier_name: Option<String>,
+
+    /// Custom shipping zones for the weight-based provider. When non-empty,
+    /// this REPLACES the built-in default zones entirely; when empty (the
+    /// default), the provider uses its hardcoded zone table.
+    #[serde(default)]
+    pub zones: Vec<crate::shipping::carriers::ShippingZone>,
 }
 
 /// DHL Express configuration
@@ -1782,6 +1824,52 @@ carrier_name = "Example Carrier"
             config.shipping.weight_based.carrier_name.as_deref(),
             Some("Example Carrier")
         );
+    }
+
+    #[test]
+    fn test_weight_based_zones_config() {
+        // Absent -> no custom zones (provider falls back to built-in zones)
+        let config: Config = toml::from_str("[server]\nport = 8080\n").unwrap();
+        assert!(config.shipping.weight_based.zones.is_empty());
+
+        let config: Config = toml::from_str(
+            r##"[shipping.weight_based]
+carrier_name = "Example Carrier"
+
+[[shipping.weight_based.zones]]
+name = "Australia"
+countries = ["AU"]
+rate_per_half_kg = "0.00"
+base_rate = "0.00"
+delivery_days = 5
+free_shipping = true
+
+[[shipping.weight_based.zones]]
+name = "New Zealand"
+countries = ["NZ"]
+rate_per_half_kg = "0.00"
+base_rate = "0.00"
+delivery_days = 7
+free_shipping = true
+"##,
+        )
+        .unwrap();
+
+        let zones = &config.shipping.weight_based.zones;
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].name, "Australia");
+        assert_eq!(zones[0].countries, vec!["AU".to_string()]);
+        assert_eq!(
+            zones[0].rate_per_half_kg,
+            rust_decimal::Decimal::new(0, 0)
+        );
+        assert_eq!(zones[0].base_rate, rust_decimal::Decimal::new(0, 0));
+        assert_eq!(zones[0].delivery_days, 5);
+        assert!(zones[0].free_shipping);
+        assert_eq!(zones[1].name, "New Zealand");
+        assert_eq!(zones[1].countries, vec!["NZ".to_string()]);
+        assert_eq!(zones[1].delivery_days, 7);
+        assert!(zones[1].free_shipping);
     }
 
     #[test]

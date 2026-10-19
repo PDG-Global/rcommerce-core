@@ -510,6 +510,8 @@ pub enum WebhookEventType {
     SubscriptionCancelled,
     SubscriptionPaymentSucceeded,
     SubscriptionPaymentFailed,
+    /// A stored-card consent was verified by the gateway (log-only).
+    PaymentConsentVerified,
 }
 
 /// Payment service - orchestrates payments across multiple gateways

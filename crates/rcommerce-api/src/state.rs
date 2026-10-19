@@ -6,6 +6,7 @@ use rcommerce_core::notification::channels::email::{
 };
 use rcommerce_core::notification::service::NotificationService;
 use rcommerce_core::payment::agnostic::PaymentService;
+use rcommerce_core::payment::PaymentGateway;
 use rcommerce_core::repository::{
     Database, PostgresApiKeyRepository, PostgresSubscriptionRepository,
 };
@@ -36,6 +37,9 @@ pub struct AppStateParams {
     pub tax_service: Arc<DefaultTaxService>,
     pub shipping_factory: Arc<ShippingProviderFactory>,
     pub checkout_service: Arc<CheckoutService>,
+    /// Legacy payment gateway used to charge subscription renewals against
+    /// stored-card consents (same gateway instance the checkout uses).
+    pub subscription_gateway: Option<Arc<dyn PaymentGateway>>,
     pub inventory_service: Arc<rcommerce_core::inventory::InventoryService>,
     pub smtp_config: Option<SmtpConfig>,
     pub xero_config: Option<rcommerce_core::config::XeroConfig>,
@@ -66,6 +70,7 @@ impl AppStateParams {
         tax_service: Arc<DefaultTaxService>,
         shipping_factory: Arc<ShippingProviderFactory>,
         checkout_service: Arc<CheckoutService>,
+        subscription_gateway: Option<Arc<dyn PaymentGateway>>,
         inventory_service: Arc<rcommerce_core::inventory::InventoryService>,
         smtp_config: Option<SmtpConfig>,
         xero_config: Option<rcommerce_core::config::XeroConfig>,
@@ -90,6 +95,7 @@ impl AppStateParams {
             tax_service,
             shipping_factory,
             checkout_service,
+            subscription_gateway,
             inventory_service,
             smtp_config,
             xero_config,
@@ -118,6 +124,9 @@ pub struct AppState {
     pub tax_service: Arc<DefaultTaxService>,
     pub shipping_factory: Arc<ShippingProviderFactory>,
     pub checkout_service: Arc<CheckoutService>,
+    /// Legacy payment gateway used to charge subscription renewals against
+    /// stored-card consents. None only when constructed by tests.
+    pub subscription_gateway: Option<Arc<dyn PaymentGateway>>,
     pub inventory_service: Arc<rcommerce_core::inventory::InventoryService>,
     pub db: Database,
     pub redis: Option<RedisPool>,
@@ -238,6 +247,7 @@ impl AppState {
             tax_service: params.tax_service,
             shipping_factory: params.shipping_factory,
             checkout_service: params.checkout_service,
+            subscription_gateway: params.subscription_gateway,
             inventory_service: params.inventory_service,
             db: params.db,
             redis: params.redis,

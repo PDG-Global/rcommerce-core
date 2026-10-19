@@ -8,6 +8,12 @@ interface Props {
   image?: string;
   url?: string;
   type?: string;
+  /**
+   * Bare pages bring their own full chrome (header/footer/cart UI) and must
+   * not get the default global CartDrawer island — e.g. a single-page brand
+   * build that ships its own overlay system.
+   */
+  bare?: boolean;
 }
 
 const {
@@ -16,6 +22,7 @@ const {
   image,
   url,
   type = 'website',
+  bare = false,
 } = Astro.props;
 
 const canonical = url || `${Astro.url.origin}${Astro.url.pathname}`;
@@ -71,7 +78,7 @@ const schemaOrg = {
   </head>
   <body class="min-h-screen flex flex-col">
     <slot />
-    <CartDrawer client:load />
+    {!bare && <CartDrawer client:load />}
   </body>
 </html>
 

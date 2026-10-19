@@ -118,6 +118,26 @@ pub trait SubscriptionRepository: Send + Sync + 'static {
 
     /// Calculate Annual Recurring Revenue (ARR)
     async fn calculate_arr(&self) -> Result<rust_decimal::Decimal>;
+
+    /// Schedule the next retry attempt for a failed invoice (dunning).
+    ///
+    /// Default: not supported (in-memory repositories).
+    async fn schedule_invoice_retry(
+        &self,
+        _invoice_id: Uuid,
+        _next_retry_at: DateTime<Utc>,
+    ) -> Result<()> {
+        Err(Error::validation(
+            "schedule_invoice_retry not supported by this repository",
+        ))
+    }
+
+    /// Look up a customer's email address (needed to charge renewals).
+    ///
+    /// Default: not supported (in-memory repositories).
+    async fn customer_email(&self, _customer_id: Uuid) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// PostgreSQL implementation of subscription repository
@@ -129,6 +149,12 @@ pub struct PostgresSubscriptionRepository {
 impl PostgresSubscriptionRepository {
     pub fn new(pool: sqlx::Pool<sqlx::Postgres>) -> Self {
         Self { pool }
+    }
+
+    /// Direct pool access for the Postgres-specialized billing routines
+    /// (renewal order annotation, charge persistence).
+    pub fn pool(&self) -> &sqlx::Pool<sqlx::Postgres> {
+        &self.pool
     }
 }
 
@@ -159,8 +185,9 @@ impl SubscriptionRepository for PostgresSubscriptionRepository {
                 current_cycle, min_cycles, max_cycles,
                 starts_at, next_billing_at,
                 payment_method_id, gateway, notes,
+                quantity, shipping_address,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $21)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $23)
             RETURNING *
             "#
         )
@@ -184,6 +211,8 @@ impl SubscriptionRepository for PostgresSubscriptionRepository {
         .bind(request.payment_method_id)
         .bind(request.gateway)
         .bind(request.notes)
+        .bind(request.quantity.unwrap_or(1))
+        .bind(request.shipping_address)
         .bind(now)
         .fetch_one(&self.pool)
         .await
@@ -684,5 +713,32 @@ impl SubscriptionRepository for PostgresSubscriptionRepository {
     async fn calculate_arr(&self) -> Result<rust_decimal::Decimal> {
         let mrr = self.calculate_mrr().await?;
         Ok(mrr * rust_decimal::Decimal::from(12))
+    }
+
+    async fn schedule_invoice_retry(
+        &self,
+        invoice_id: Uuid,
+        next_retry_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE subscription_invoices SET next_retry_at = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(next_retry_at)
+        .bind(invoice_id)
+        .execute(&self.pool)
+        .await
+        .map_err(Error::Database)?;
+
+        Ok(())
+    }
+
+    async fn customer_email(&self, customer_id: Uuid) -> Result<Option<String>> {
+        let email: Option<String> = sqlx::query_scalar("SELECT email FROM customers WHERE id = $1")
+            .bind(customer_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Error::Database)?;
+
+        Ok(email)
     }
 }

@@ -610,6 +610,9 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
             "payment_intent.payment_attempt_failed" => WebhookEventType::PaymentFailed,
             "refund.succeeded" => WebhookEventType::PaymentRefunded,
             "refund.failed" => WebhookEventType::PaymentFailed,
+            // Stored-card consent verified. Log-only on our side: consent
+            // status is verified synchronously at checkout.
+            "payment_consent.verified" => WebhookEventType::PaymentConsentVerified,
             _ => return Err(crate::Error::validation("Unsupported webhook event type")),
         };
 
@@ -1234,8 +1237,8 @@ mod tests {
         let gateway = test_gateway();
         let timestamp = "1712345678000";
         let body = serde_json::json!({
-            "name": "payment_consent.verified",
-            "data": { "object": { "id": "pc_123" } }
+            "name": "payment_intent.unknown_event",
+            "data": { "object": { "id": "int_xxx" } }
         })
         .to_string();
         let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
@@ -1250,5 +1253,30 @@ mod tests {
             result.is_err(),
             "unsupported event types should be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn test_webhook_payment_consent_verified() {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "payment_consent.verified",
+            "data": { "object": { "id": "pc_123", "status": "VERIFIED" } }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        let event = gateway
+            .handle_webhook(body.as_bytes(), &headers)
+            .await
+            .expect("payment_consent.verified webhook should verify");
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentConsentVerified);
+        assert_eq!(event.payment_id, "pc_123");
     }
 }

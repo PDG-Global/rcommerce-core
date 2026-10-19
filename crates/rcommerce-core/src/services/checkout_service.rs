@@ -62,6 +62,9 @@ pub struct CheckoutConfig {
     pub airwallex_env: Option<String>,
     /// Public site URL sent to payment providers in metadata (spec 2.1)
     pub site_url: Option<String>,
+    /// Percentage discount applied to the merchandise subtotal when the
+    /// checkout includes a subscription option ([subscriptions] config)
+    pub subscription_discount_percent: i64,
 }
 
 impl Default for CheckoutConfig {
@@ -78,8 +81,42 @@ impl Default for CheckoutConfig {
             airwallex_client_id: None,
             airwallex_env: None,
             site_url: None,
+            subscription_discount_percent: 0,
         }
     }
+}
+
+/// Subscription option selected at checkout.
+///
+/// When present, the order starts a subscription: the merchandise subtotal
+/// gets the configured subscription discount, and (once payment succeeds) a
+/// Subscription row is created that bills the stored-card consent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubscriptionCheckoutOption {
+    /// Billing interval (validated against the subscription_interval enum)
+    pub interval: crate::models::SubscriptionInterval,
+    /// How many intervals between billings (default 1)
+    #[serde(default)]
+    pub interval_count: Option<i32>,
+}
+
+/// Subscription discount for a merchandise subtotal, rounded half-up to 2dp.
+pub fn subscription_discount(subtotal: Decimal, discount_percent: i64) -> Decimal {
+    if discount_percent <= 0 || subtotal <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (subtotal * Decimal::from(discount_percent) / Decimal::from(100))
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+}
+
+/// Unit price for a renewal order line: subscription amount split across the
+/// subscribed quantity, rounded half-up to 2dp.
+pub fn renewal_unit_price(amount: Decimal, quantity: i32) -> Decimal {
+    if quantity <= 0 {
+        return amount.round_dp(2);
+    }
+    (amount / Decimal::from(quantity))
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
 }
 
 /// Checkout summary for displaying to customer
@@ -123,6 +160,8 @@ pub struct InitiateCheckoutRequest {
     pub vat_id: Option<String>,
     pub customer_id: Option<Uuid>,
     pub currency: Option<Currency>,
+    /// Subscription option, when the customer is subscribing
+    pub subscription: Option<SubscriptionCheckoutOption>,
 }
 
 /// Shipping selection request
@@ -149,6 +188,12 @@ pub struct CompleteCheckoutRequest {
     /// Mark this order as a test order (spec 2.2). Test orders are exported
     /// with test=true so accounting can book them to a suspense account.
     pub test: Option<bool>,
+    /// Subscription option: turns this checkout into a subscription initial
+    /// order once payment succeeds.
+    pub subscription: Option<SubscriptionCheckoutOption>,
+    /// Stored-card consent id (verified by the storefront before checkout).
+    /// Mandatory when `subscription` is present.
+    pub payment_consent_id: Option<String>,
 }
 
 /// Checkout result
@@ -243,7 +288,12 @@ impl CheckoutService {
 
         // Calculate subtotal (already in cart)
         let subtotal = cart.subtotal;
-        let discount_total = cart.discount_total;
+        // Subscription discount applies to the merchandise subtotal
+        let subscription_discount_total = match request.subscription {
+            Some(_) => subscription_discount(subtotal, self.config.subscription_discount_percent),
+            None => Decimal::ZERO,
+        };
+        let discount_total = cart.discount_total + subscription_discount_total;
 
         // Validate VAT ID if provided
         let vat_id_valid = if let Some(ref vat_id) = request.vat_id {
@@ -442,9 +492,7 @@ impl CheckoutService {
         {
             match prior.status {
                 crate::order::OrderStatus::Pending => {
-                    return self
-                        .replay_pending_order(prior, &cart)
-                        .await;
+                    return self.replay_pending_order(prior, &cart).await;
                 }
                 crate::order::OrderStatus::Confirmed
                 | crate::order::OrderStatus::Processing
@@ -520,8 +568,60 @@ impl CheckoutService {
         // comes from the tax-zone rates (10% per EU country) on items only.
         let shipping_total = validated_rate.total_cost;
 
+        // Subscription validation: single-product carts only, and a stored
+        // card consent is required to bill future renewals.
+        let subscription = request.subscription.clone();
+        let subscription_quantity: Option<i32>;
+        let subscription_product_id;
+        if subscription.is_some() {
+            let consent_present = request
+                .payment_consent_id
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            if !consent_present {
+                return Err(Error::validation(
+                    "payment_consent_id is required for subscription checkout",
+                ));
+            }
+            // Single-product rule: every line (ignoring $0 bundle components)
+            // must be the same product.
+            let distinct: Vec<Uuid> = items
+                .iter()
+                .filter(|i| !self.is_bundle_component(i))
+                .map(|i| i.product_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if distinct.len() != 1 {
+                return Err(Error::validation(
+                    "Subscription carts must contain a single product",
+                ));
+            }
+            subscription_product_id = distinct.first().copied();
+            subscription_quantity = Some(
+                items
+                    .iter()
+                    .filter(|i| !self.is_bundle_component(i))
+                    .map(|i| i.quantity)
+                    .sum(),
+            );
+        } else {
+            subscription_quantity = None;
+            subscription_product_id = None;
+        }
+
+        // Subscription discount applies to the merchandise subtotal
+        let subscription_discount_total = match subscription {
+            Some(_) => {
+                subscription_discount(cart.subtotal, self.config.subscription_discount_percent)
+            }
+            None => Decimal::ZERO,
+        };
+        let discount_total = cart.discount_total + subscription_discount_total;
+
         let tax_total = tax_result.total_tax;
-        let total = cart.subtotal - cart.discount_total + shipping_total + tax_total;
+        let total = cart.subtotal - discount_total + shipping_total + tax_total;
 
         // Create order items. Bundle parents carry the bundle price but do not
         // reserve inventory; component lines are $0 fulfillment rows that reserve
@@ -578,10 +678,9 @@ impl CheckoutService {
         // Persist the cart's coupon on the order (usage itself is only
         // recorded at payment confirmation — see OrderService).
         let cart_coupon_code = cart.coupon_code.clone();
-        let cart_coupon_id = if let (Some(svc), Some(code)) = (
-            self.coupon_service.as_ref(),
-            cart_coupon_code.as_deref(),
-        ) {
+        let cart_coupon_id = if let (Some(svc), Some(code)) =
+            (self.coupon_service.as_ref(), cart_coupon_code.as_deref())
+        {
             match svc.get_coupon_by_code(code).await {
                 Ok(coupon) => Some(coupon.id),
                 Err(e) => {
@@ -597,6 +696,22 @@ impl CheckoutService {
         };
 
         // Create order
+        let mut order_metadata = serde_json::json!({
+            "cart_id": cart.id.to_string(),
+            "vat_id": request.vat_id,
+            "shipping_carrier": validated_rate.carrier,
+            "shipping_service": validated_rate.service_code,
+        });
+        if let Some(ref sub) = subscription {
+            order_metadata["subscription"] = serde_json::json!({
+                "interval": sub.interval,
+                "interval_count": sub.interval_count.unwrap_or(1),
+                "payment_consent_id": request.payment_consent_id,
+                "product_id": subscription_product_id,
+                "quantity": subscription_quantity,
+            });
+        }
+
         let create_order_request = CreateOrderRequest {
             customer_id: request.customer_id,
             customer_email: request.customer_email.clone(),
@@ -614,19 +729,14 @@ impl CheckoutService {
             subtotal: cart.subtotal,
             tax_total,
             shipping_total,
-            discount_total: cart.discount_total,
+            discount_total,
             total,
             notes: request.notes,
             tags: None,
             test: request.test.unwrap_or(false),
             coupon_code: cart_coupon_code,
             coupon_id: cart_coupon_id,
-            metadata: serde_json::json!({
-                "cart_id": cart.id.to_string(),
-                "vat_id": request.vat_id,
-                "shipping_carrier": validated_rate.carrier,
-                "shipping_service": validated_rate.service_code,
-            }),
+            metadata: order_metadata,
         };
 
         let order = self
@@ -677,6 +787,8 @@ impl CheckoutService {
             customer_email: request.customer_email.clone(),
             payment_method: request.payment_method,
             billing_address: request.billing_address.clone(),
+            payment_consent_id: request.payment_consent_id.clone(),
+            merchant_initiated: request.payment_consent_id.as_ref().map(|_| true),
             metadata: serde_json::json!({
                 "order_id": order.id.to_string(),
                 "order_number": order.order_number,
@@ -796,13 +908,14 @@ impl CheckoutService {
             .get_order(prior.id)
             .await?
             .ok_or_else(|| Error::not_found("Order not found"))?;
-        let intent_id = self.order_service.latest_payment_gateway_id(prior.id).await?;
+        let intent_id = self
+            .order_service
+            .latest_payment_gateway_id(prior.id)
+            .await?;
 
         if let Some(ref intent_id) = intent_id {
             match self.payment_gateway.get_payment(intent_id).await {
-                Ok(payment)
-                    if payment.status == crate::payment::PaymentStatus::Succeeded =>
-                {
+                Ok(payment) if payment.status == crate::payment::PaymentStatus::Succeeded => {
                     info!(
                         "Reusing existing order {} for cart {}: payment {} succeeded; finalizing",
                         prior.id, cart.id, intent_id
@@ -810,11 +923,17 @@ impl CheckoutService {
                     if let Err(e) = self.order_service.record_payment(prior.id, &payment).await {
                         warn!("Failed to record payment for order {}: {}", prior.id, e);
                     }
-                    if let Err(e) = self.cart_service.mark_converted(cart.id, Some(prior.id)).await
+                    if let Err(e) = self
+                        .cart_service
+                        .mark_converted(cart.id, Some(prior.id))
+                        .await
                     {
                         warn!("Failed to mark cart {} converted: {}", cart.id, e);
                     }
-                    let finalized = self.order_service.confirm_order_after_payment(prior.id).await?;
+                    let finalized = self
+                        .order_service
+                        .confirm_order_after_payment(prior.id)
+                        .await?;
                     return Ok(CheckoutResult {
                         payment_id: payment.id.clone(),
                         total_charged: payment.amount,
@@ -919,9 +1038,7 @@ impl CheckoutService {
         if already_final {
             info!(
                 "Order {} already {:?}; confirm replay is a no-op (payment {})",
-                request.order_id,
-                existing.order.status,
-                request.payment_intent_id
+                request.order_id, existing.order.status, request.payment_intent_id
             );
             return Ok(CheckoutResult {
                 order: existing,
@@ -1327,6 +1444,29 @@ mod tests {
         assert_eq!(config.base_shipping_cost, dec!(10.00));
         assert_eq!(config.free_shipping_threshold, Some(dec!(100.00)));
         assert_eq!(config.stripe_publishable_key, None);
+        assert_eq!(config.subscription_discount_percent, 0);
+    }
+
+    #[test]
+    fn test_subscription_discount_calculation() {
+        // 10% of 100.00
+        assert_eq!(subscription_discount(dec!(100.00), 10), dec!(10.00));
+        // 15% of 153.00
+        assert_eq!(subscription_discount(dec!(153.00), 15), dec!(22.95));
+        // Half-up rounding: 10% of 19.99
+        assert_eq!(subscription_discount(dec!(19.99), 10), dec!(2.00));
+        // Zero percent / zero subtotal → no discount
+        assert_eq!(subscription_discount(dec!(100.00), 0), Decimal::ZERO);
+        assert_eq!(subscription_discount(Decimal::ZERO, 10), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_renewal_unit_price_split() {
+        // $153.00 across 4 bags → $38.25 each
+        assert_eq!(renewal_unit_price(dec!(153.00), 4), dec!(38.25));
+        assert_eq!(renewal_unit_price(dec!(100.00), 1), dec!(100.00));
+        // Zero/negative quantity falls back to the full amount
+        assert_eq!(renewal_unit_price(dec!(99.99), 0), dec!(99.99));
     }
 
     #[test]
@@ -1447,10 +1587,7 @@ mod tests {
             "Controllable Test Gateway"
         }
 
-        async fn create_payment(
-            &self,
-            request: CreatePaymentRequest,
-        ) -> Result<PaymentSession> {
+        async fn create_payment(&self, request: CreatePaymentRequest) -> Result<PaymentSession> {
             let id = format!("pi_{}", Uuid::new_v4());
             let secret = format!("secret_{}", Uuid::new_v4());
             self.sessions
@@ -1538,9 +1675,13 @@ mod tests {
         location_id: Uuid,
     }
 
-    async fn checkout_setup() -> Option<(Arc<ControllableGateway>, CheckoutService, CheckoutTestContext)> {
-        use crate::repository::{Database, PgCartRepository, PgCouponRepository};
+    async fn checkout_setup() -> Option<(
+        Arc<ControllableGateway>,
+        CheckoutService,
+        CheckoutTestContext,
+    )> {
         use crate::repository::{CartRepository, CouponRepository};
+        use crate::repository::{Database, PgCartRepository, PgCouponRepository};
 
         let url = std::env::var("TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
@@ -1630,7 +1771,8 @@ mod tests {
 
         // Cart with one unit of the product.
         let cart_repo: Arc<dyn CartRepository> = Arc::new(PgCartRepository::new(pool.clone()));
-        let coupon_repo: Arc<dyn CouponRepository> = Arc::new(PgCouponRepository::new(pool.clone()));
+        let coupon_repo: Arc<dyn CouponRepository> =
+            Arc::new(PgCouponRepository::new(pool.clone()));
         let coupon_service = Arc::new(CouponService::new(coupon_repo.clone(), cart_repo.clone()));
         let cart_service = Arc::new(CartService::new(
             cart_repo.clone(),
@@ -1668,10 +1810,8 @@ mod tests {
             .unwrap();
 
         let gateway = Arc::new(ControllableGateway::default());
-        let inventory_service = crate::inventory::InventoryService::new(
-            db.clone(),
-            Default::default(),
-        );
+        let inventory_service =
+            crate::inventory::InventoryService::new(db.clone(), Default::default());
         let order_service = Arc::new(
             OrderService::new(
                 db.clone(),
@@ -1758,6 +1898,8 @@ mod tests {
             notes: None,
             selected_shipping_rate: idem_shipping_rate(),
             test: None,
+            subscription: None,
+            payment_consent_id: None,
         }
     }
 
@@ -1852,13 +1994,12 @@ mod tests {
         assert_eq!(second.payment_intent_id.as_deref(), Some(intent.as_str()));
         assert!(second.requires_confirmation);
 
-        let order_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1",
-        )
-        .bind(ctx.cart_id.to_string())
-        .fetch_one(&ctx.pool)
-        .await
-        .unwrap();
+        let order_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1")
+                .bind(ctx.cart_id.to_string())
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
         assert_eq!(order_count, 1, "exactly one order must exist for the cart");
 
         // The first payment succeeds (customer finishes the drop-in): a later
@@ -1875,13 +2016,12 @@ mod tests {
             crate::order::OrderStatus::Confirmed
         );
 
-        let order_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1",
-        )
-        .bind(ctx.cart_id.to_string())
-        .fetch_one(&ctx.pool)
-        .await
-        .unwrap();
+        let order_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1")
+                .bind(ctx.cart_id.to_string())
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
         assert_eq!(
             order_count, 1,
             "finalization must not create a second order either"
@@ -1906,10 +2046,7 @@ mod tests {
             .await
             .expect("complete_checkout must succeed");
         let order_id = first.order.order.id;
-        let intent = first
-            .payment_intent_id
-            .clone()
-            .expect("payment intent id");
+        let intent = first.payment_intent_id.clone().expect("payment intent id");
 
         gateway.set_status(crate::payment::PaymentStatus::Succeeded);
         let confirm = ConfirmCheckoutRequest {
@@ -1936,13 +2073,12 @@ mod tests {
         assert_eq!(replay.order.order.id, order_id);
         assert!(!replay.requires_confirmation);
 
-        let order_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1",
-        )
-        .bind(ctx.cart_id.to_string())
-        .fetch_one(&ctx.pool)
-        .await
-        .unwrap();
+        let order_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE metadata->>'cart_id' = $1")
+                .bind(ctx.cart_id.to_string())
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
         assert_eq!(order_count, 1);
 
         idem_cleanup(&ctx).await;

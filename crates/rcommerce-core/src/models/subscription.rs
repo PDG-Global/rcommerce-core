@@ -61,6 +61,7 @@ pub struct Subscription {
     pub currency: super::Currency,
     pub amount: Decimal, // Amount per billing cycle
     pub setup_fee: Option<Decimal>,
+    pub quantity: i32, // Units of the product delivered per cycle (default 1)
 
     // Trial
     pub trial_days: i32,
@@ -80,8 +81,11 @@ pub struct Subscription {
     pub cancellation_reason: Option<CancellationReason>,
 
     // Payment method
-    pub payment_method_id: Option<String>, // Gateway payment method ID
+    pub payment_method_id: Option<String>, // Gateway payment method ID (stored-card consent id)
     pub gateway: String,                   // Payment gateway used
+
+    /// Shipping address snapshot (renewals are delivered here)
+    pub shipping_address: Option<serde_json::Value>,
 
     // Metadata
     pub notes: Option<String>,
@@ -164,6 +168,14 @@ pub struct CreateSubscriptionRequest {
     pub currency: super::Currency,
     pub amount: Decimal,
     pub setup_fee: Option<Decimal>,
+
+    /// Units of the product per billing cycle (default 1)
+    #[serde(default)]
+    pub quantity: Option<i32>,
+
+    /// Shipping address snapshot for renewals
+    #[serde(default)]
+    pub shipping_address: Option<serde_json::Value>,
 
     pub trial_days: Option<i32>,
     pub min_cycles: Option<i32>,

@@ -935,11 +935,7 @@ async fn fetch_order(state: &AppState, id: Uuid) -> Result<rcommerce_core::model
 }
 
 /// Load refunds for an order and attach them to their parent payment responses.
-async fn attach_refunds(
-    state: &AppState,
-    order_id: Uuid,
-    payments: &mut [OrderPaymentResponse],
-) {
+async fn attach_refunds(state: &AppState, order_id: Uuid, payments: &mut [OrderPaymentResponse]) {
     let refund_rows = sqlx::query_as::<_, RefundRow>(
         r#"
         SELECT id, payment_id, amount, currency::text AS currency_text,

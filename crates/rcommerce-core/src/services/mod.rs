@@ -25,7 +25,7 @@ pub use cart_service::CartService;
 pub use checkout_service::{
     CheckoutConfig, CheckoutResult, CheckoutService, CheckoutSummary, CompleteCheckoutRequest,
     ConfirmCheckoutRequest, InitiateCheckoutRequest, SelectShippingRequest,
-    TaxBreakdownItem as CheckoutTaxBreakdownItem,
+    SubscriptionCheckoutOption, TaxBreakdownItem as CheckoutTaxBreakdownItem,
 };
 pub use coupon_service::CouponService;
 pub use customer_service::CustomerService;
@@ -38,7 +38,9 @@ pub use order_service::OrderService;
 pub use product_service::ProductService;
 pub use review_service::ReviewService;
 pub use statistics_service::{FullDashboardData, SalesReport, StatisticsService};
-pub use subscription_service::SubscriptionService;
+pub use subscription_service::{
+    next_billing_at, BillingReport, CreateSubscriptionFromOrder, SubscriptionService,
+};
 
 use crate::Result;
 

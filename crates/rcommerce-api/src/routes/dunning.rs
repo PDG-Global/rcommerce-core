@@ -5,7 +5,7 @@
 //! - Customer endpoints for viewing dunning history
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -24,19 +24,26 @@ pub struct ListRetriesQuery {
     pub per_page: Option<i64>,
 }
 
-/// Trigger manual dunning processing
+/// Admin: Trigger manual dunning processing
 ///
 /// POST /api/v1/admin/dunning/process
 async fn admin_process_dunning(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(gateway) = state.subscription_gateway.clone() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
     // Create dunning service
     let dunning_service = DunningService::with_config(
         (*state.subscription_repository).clone(),
         DunningConfig::default(),
     );
 
-    match dunning_service.process_all_due_retries().await {
+    match dunning_service
+        .process_all_due_retries(gateway.as_ref(), Some(&state.order_service))
+        .await
+    {
         Ok(result) => Ok(Json(serde_json::json!({
             "success": true,
             "message": format!("Processed {} retries", result.processed),
@@ -121,19 +128,25 @@ async fn admin_list_due_retries(
     }
 }
 
-/// Manually trigger a retry for a specific invoice
+/// Admin: Manually trigger a retry for a specific invoice
 ///
 /// POST /api/v1/admin/dunning/retry/:invoice_id
 async fn admin_manual_retry(
     State(state): State<AppState>,
     Path(invoice_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(gateway) = state.subscription_gateway.clone() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let dunning_service = DunningService::with_config(
         (*state.subscription_repository).clone(),
         state.subscription_service.config().clone(),
     );
 
-    match dunning_service.manual_retry(invoice_id).await {
+    match dunning_service
+        .manual_retry(invoice_id, gateway.as_ref(), Some(&state.order_service))
+        .await
+    {
         Ok(result) => {
             let response = match result {
                 rcommerce_core::models::PaymentRecoveryResult::Success => {
@@ -183,13 +196,24 @@ async fn admin_manual_retry(
     }
 }
 
-/// Get dunning history for a subscription
+/// Get dunning history for a subscription (owner or admin only)
 ///
 /// GET /api/v1/subscriptions/:id/dunning-history
 async fn get_dunning_history(
     State(state): State<AppState>,
+    Extension(auth): Extension<crate::middleware::JwtAuth>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 404 for foreign subscriptions (no id enumeration)
+    let subscription = state
+        .subscription_service
+        .get_subscription(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !auth.is_admin() && subscription.customer_id != auth.customer_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     let dunning_service = DunningService::with_config(
         (*state.subscription_repository).clone(),
         state.subscription_service.config().clone(),
@@ -343,13 +367,24 @@ async fn admin_process_recovery(
     }
 }
 
-/// Reset dunning state for a subscription (after payment method update)
+/// Reset dunning state for a subscription (owner or admin only; after a
+/// payment method update)
 ///
 /// POST /api/v1/subscriptions/:id/reset-dunning
 async fn reset_dunning_state(
     State(state): State<AppState>,
+    Extension(auth): Extension<crate::middleware::JwtAuth>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let subscription = state
+        .subscription_service
+        .get_subscription(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !auth.is_admin() && subscription.customer_id != auth.customer_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     let dunning_service = DunningService::with_config(
         (*state.subscription_repository).clone(),
         state.subscription_service.config().clone(),
@@ -405,10 +440,22 @@ async fn admin_get_stats(
     }
 }
 
-/// Router for dunning routes
+/// Router for customer-facing dunning routes (JWT auth required)
 pub fn router() -> Router<AppState> {
-    // Admin routes
-    let admin_routes = Router::new()
+    Router::new()
+        .route(
+            "/subscriptions/:id/dunning-history",
+            get(get_dunning_history),
+        )
+        .route(
+            "/subscriptions/:id/reset-dunning",
+            post(reset_dunning_state),
+        )
+}
+
+/// Router for admin dunning routes (mounted under admin_middleware)
+pub fn admin_router() -> Router<AppState> {
+    Router::new()
         .route("/admin/dunning/process", post(admin_process_dunning))
         .route("/admin/dunning/retries", get(admin_list_pending_retries))
         .route("/admin/dunning/retries/due", get(admin_list_due_retries))
@@ -419,18 +466,5 @@ pub fn router() -> Router<AppState> {
             "/admin/dunning/failed-payment",
             post(admin_process_failed_payment),
         )
-        .route("/admin/dunning/recovery", post(admin_process_recovery));
-
-    // Customer routes
-    let customer_routes = Router::new()
-        .route(
-            "/subscriptions/:id/dunning-history",
-            get(get_dunning_history),
-        )
-        .route(
-            "/subscriptions/:id/reset-dunning",
-            post(reset_dunning_state),
-        );
-
-    Router::new().merge(admin_routes).merge(customer_routes)
+        .route("/admin/dunning/recovery", post(admin_process_recovery))
 }

@@ -63,6 +63,8 @@ mod unit_tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }),
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({"test": true}),
         };
 

@@ -64,6 +64,8 @@ fn create_test_request(amount: Decimal) -> CreatePaymentRequest {
             name: "".to_string(),
         }),
         billing_address: None,
+        payment_consent_id: None,
+        merchant_initiated: None,
         metadata: serde_json::json!({
             "test": true,
             "environment": "integration_test"

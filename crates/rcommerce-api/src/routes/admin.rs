@@ -1,7 +1,11 @@
 pub mod products;
 
 use crate::state::AppState;
-use axum::{extract::State, routing::{get, patch}, Json, Router};
+use axum::{
+    extract::State,
+    routing::{get, patch},
+    Json, Router,
+};
 use rcommerce_core::repository::statistics_repository::PgStatisticsRepository;
 use rcommerce_core::repository::ApiKeyRepository;
 use rcommerce_core::services::statistics_service::StatisticsService;

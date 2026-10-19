@@ -477,6 +477,19 @@ default_provider = "manual"
 # Enable test mode for shipping APIs (default: false)
 test_mode = false
 
+# Weight-based shipping provider (zone rate table).
+# When `zones` is non-empty it REPLACES the provider's built-in default
+# zones entirely; leave it out to keep the defaults. Zones are checked in
+# order, first country match wins; countries not in any zone get no rates.
+# `rate_per_half_kg` / `base_rate` are Decimal strings (e.g. "4.50").
+# [shipping.weight_based]
+# carrier_name = "My Store Shipping"   # shown on rates; defaults to branding name
+# zones = [
+#   { name = "Australia",     countries = ["AU"], rate_per_half_kg = "0.00", base_rate = "0.00", delivery_days = 5, free_shipping = true },
+#   { name = "New Zealand",   countries = ["NZ"], rate_per_half_kg = "0.00", base_rate = "0.00", delivery_days = 7, free_shipping = true },
+#   { name = "Standard",      countries = ["US", "CA"], rate_per_half_kg = "5.00", base_rate = "5.00", delivery_days = 7 },
+# ]
+
 # Default shipping origin address
 [shipping.origin]
 name = "Your Store"
@@ -518,6 +531,23 @@ enabled = false
 enabled = false
 # api_key = "your-usps-api-key"
 # sandbox = false
+
+# =============================================================================
+# SUBSCRIPTIONS
+# =============================================================================
+# Recurring billing via stored-card payment consents. The billing loop creates
+# a renewal order and charges the consent for each due subscription.
+# Disabled by default: enabling this starts charging customers.
+#[subscriptions]
+# Enable the subscription billing loop (default: false)
+#enabled = false
+
+# Percentage discount applied to the merchandise subtotal when a checkout
+# includes a subscription option (default: 0)
+#discount_percent = 10
+
+# How often the background billing loop runs, in minutes (default: 60)
+#billing_interval_minutes = 60
 
 # =============================================================================
 # DUNNING (PAYMENT RETRY) CONFIGURATION

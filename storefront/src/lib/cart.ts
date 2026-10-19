@@ -49,7 +49,12 @@ export function formatMoney(value: string | number | null | undefined): string {
   return num.toFixed(2);
 }
 
-export async function getOrCreateCart(): Promise<Cart> {
+// Concurrent getOrCreateCart() callers (e.g. several islands hydrating on
+// load) must share one creation request, otherwise each creates its own
+// guest cart and the last localStorage write wins, stranding items.
+let creatingCart: Promise<Cart> | null = null;
+
+export async function getOrCreateCart(currency?: string): Promise<Cart> {
   const existingId = getStoredCartId();
   if (existingId) {
     try {
@@ -62,17 +67,29 @@ export async function getOrCreateCart(): Promise<Cart> {
       // ignore, create new cart
     }
   }
-  const res = await fetch(`${API_BASE}/carts/guest`, { method: 'POST' });
-  if (!res.ok) {
-    throw new Error('Failed to create cart');
+  if (creatingCart) return creatingCart;
+  creatingCart = (async () => {
+    const res = await fetch(`${API_BASE}/carts/guest`, {
+      method: 'POST',
+      headers: currency ? { 'content-type': 'application/json' } : undefined,
+      body: currency ? JSON.stringify({ currency }) : undefined,
+    });
+    if (!res.ok) {
+      throw new Error('Failed to create cart');
+    }
+    const data = await res.json();
+    const cart: Cart = normalizeCart(data);
+    setStoredCartId(cart.id);
+    if (cart.session_token) {
+      setStoredSessionToken(cart.session_token);
+    }
+    return cart;
+  })();
+  try {
+    return await creatingCart;
+  } finally {
+    creatingCart = null;
   }
-  const data = await res.json();
-  const cart: Cart = normalizeCart(data);
-  setStoredCartId(cart.id);
-  if (cart.session_token) {
-    setStoredSessionToken(cart.session_token);
-  }
-  return cart;
 }
 
 export async function mergeGuestCartOnLogin(): Promise<void> {

@@ -42,6 +42,8 @@ mod stripe_tests {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         }
     }
@@ -171,6 +173,8 @@ mod airwallex_tests {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         }
     }
@@ -273,6 +277,8 @@ mod mock_tests {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         }
     }
@@ -371,6 +377,8 @@ mod gateway_comparison_tests {
                 name: "Test User".to_string(),
             }),
             billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
             metadata: serde_json::json!({}),
         };
 

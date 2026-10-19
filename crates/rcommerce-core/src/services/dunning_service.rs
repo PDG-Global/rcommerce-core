@@ -17,7 +17,9 @@ use crate::models::{
     InvoiceStatus, PaymentRecoveryResult, PaymentRetryAttempt, Subscription, SubscriptionInvoice,
     SubscriptionStatus, UpdateSubscriptionRequest,
 };
+use crate::payment::{CreatePaymentRequest, PaymentGateway, PaymentMethod};
 use crate::repository::SubscriptionRepository;
+use crate::services::subscription_service::next_billing_at;
 use crate::{Error, Result};
 // TODO: Integrate with email service when notification module is ready
 // use crate::notification::email::{EmailService, EmailTemplate};
@@ -164,6 +166,19 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
             .schedule_retry(subscription_id, invoice_id, attempt_number)
             .await?;
 
+        // Persist the retry schedule on the invoice so the dunning sweep
+        // knows when this invoice is due again.
+        if let Err(e) = self
+            .repository
+            .schedule_invoice_retry(invoice_id, next_retry)
+            .await
+        {
+            warn!(
+                "Failed to persist next retry for invoice {}: {}",
+                invoice_id, e
+            );
+        }
+
         // Update subscription status to past_due
         self.repository
             .record_failed_payment(subscription_id, error_message.to_string())
@@ -220,9 +235,17 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
 
     /// Execute a scheduled retry
     ///
-    /// Attempts to process payment for an invoice that is due for retry.
-    /// This should be called by the background job processor.
-    pub async fn execute_retry(&self, invoice_id: Uuid) -> Result<PaymentRecoveryResult> {
+    /// Attempts to charge the subscription's stored-card consent
+    /// (merchant-initiated) for an invoice that is due for retry. On success
+    /// the invoice is marked paid, the subscription reactivated, and the
+    /// billing schedule advanced; on failure the existing reschedule /
+    /// cancel-after-retries logic runs.
+    pub async fn execute_retry(
+        &self,
+        invoice_id: Uuid,
+        gateway: &dyn PaymentGateway,
+        order_service: Option<&std::sync::Arc<crate::order::OrderService>>,
+    ) -> Result<PaymentRecoveryResult> {
         info!("Executing retry for invoice {}", invoice_id);
 
         let invoice = self
@@ -270,8 +293,6 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
             )));
         }
 
-        // Attempt payment (this would integrate with payment gateway)
-        // For now, we simulate the payment attempt
         info!(
             "Attempting payment retry for subscription {}: attempt {}/{}",
             subscription.id,
@@ -279,19 +300,134 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
             self.config.max_retries
         );
 
-        // TODO: Integrate with actual payment gateway
-        // This is where you would call the payment gateway to retry the charge
+        // Attempt the charge against the stored consent.
+        match self
+            .charge_with_consent(gateway, &subscription, &invoice)
+            .await
+        {
+            Ok(intent_id) => {
+                info!(
+                    "Retry payment succeeded for subscription {} (intent {})",
+                    subscription.id, intent_id
+                );
 
-        // For now, we return a retry scheduled result
-        // In real implementation, this would either:
-        // 1. Call process_recovery() on success
-        // 2. Call process_failed_payment() on failure
+                // Mark the invoice paid and reactivate the subscription.
+                self.repository
+                    .mark_invoice_paid(invoice.id, intent_id.clone())
+                    .await?;
+                self.repository
+                    .record_payment(subscription.id, intent_id.clone())
+                    .await?;
 
-        Ok(PaymentRecoveryResult::RetryScheduled {
-            next_retry_at: Utc::now() + Duration::days(1),
-            attempt_number: invoice.failed_attempts + 1,
-            max_attempts: self.config.max_retries,
-        })
+                // Advance the billing schedule from where it should have been.
+                let anchor = std::cmp::max(subscription.next_billing_at, Utc::now());
+                let next_billing =
+                    next_billing_at(subscription.interval, subscription.interval_count, anchor);
+                self.repository
+                    .update_next_billing(subscription.id, next_billing)
+                    .await?;
+
+                // Record the successful attempt.
+                self.repository
+                    .record_retry_attempt(PaymentRetryAttempt {
+                        id: Uuid::new_v4(),
+                        subscription_id: subscription.id,
+                        invoice_id: invoice.id,
+                        attempt_number: invoice.failed_attempts + 1,
+                        attempted_at: Utc::now(),
+                        succeeded: true,
+                        error_message: None,
+                        error_code: None,
+                        next_retry_at: None,
+                        payment_method_id: subscription.payment_method_id.clone(),
+                        gateway_transaction_id: Some(intent_id.clone()),
+                        created_at: Utc::now(),
+                    })
+                    .await?;
+
+                // Confirm the renewal order when we can reach the order service.
+                if let (Some(order_service), Some(order_id)) = (order_service, invoice.order_id) {
+                    if let Err(e) = order_service.confirm_order_after_payment(order_id).await {
+                        warn!(
+                            "Failed to confirm recovered renewal order {}: {}",
+                            order_id, e
+                        );
+                    }
+                }
+
+                self.send_dunning_email(
+                    subscription.id,
+                    invoice.id,
+                    DunningEmailType::PaymentRecovered,
+                )
+                .await?;
+
+                Ok(PaymentRecoveryResult::Success)
+            }
+            Err(e) => {
+                warn!(
+                    "Retry payment failed for subscription {}: {}",
+                    subscription.id, e
+                );
+                // Record the failed attempt, reschedule (or cancel after max).
+                self.process_failed_payment(subscription.id, invoice.id, &e.to_string())
+                    .await
+            }
+        }
+    }
+
+    /// Charge a subscription invoice using its stored-card consent
+    /// (merchant-initiated). Returns the gateway intent id on success.
+    async fn charge_with_consent(
+        &self,
+        gateway: &dyn PaymentGateway,
+        subscription: &Subscription,
+        invoice: &SubscriptionInvoice,
+    ) -> Result<String> {
+        let consent_id = subscription
+            .payment_method_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::validation("Subscription has no stored-card consent"))?;
+
+        let order_id = invoice
+            .order_id
+            .ok_or_else(|| Error::validation("Invoice has no renewal order to charge"))?;
+
+        let customer_email = self
+            .repository
+            .customer_email(subscription.customer_id)
+            .await?
+            .unwrap_or_default();
+
+        let session = gateway
+            .create_payment(CreatePaymentRequest {
+                amount: invoice.total,
+                currency: subscription.currency.to_string(),
+                order_id,
+                customer_id: Some(subscription.customer_id),
+                customer_email,
+                payment_method: PaymentMethod::SavedCard,
+                billing_address: None,
+                payment_consent_id: Some(consent_id),
+                merchant_initiated: Some(true),
+                metadata: serde_json::json!({
+                    "subscription_id": subscription.id,
+                    "invoice_id": invoice.id,
+                    "billing_cycle": invoice.cycle_number,
+                }),
+            })
+            .await?;
+
+        let payment = gateway.get_payment(&session.id).await?;
+        if payment.status != crate::payment::PaymentStatus::Succeeded {
+            return Err(Error::payment_error(format!(
+                "Retry charge not succeeded: {:?}",
+                payment.status
+            )));
+        }
+
+        Ok(session.id)
     }
 
     /// Cancel subscription after max retries exhausted
@@ -588,7 +724,11 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
     /// Process all due retries
     ///
     /// This is the main method for the background job to process all pending retries
-    pub async fn process_all_due_retries(&self) -> Result<RetryProcessingResult> {
+    pub async fn process_all_due_retries(
+        &self,
+        gateway: &dyn PaymentGateway,
+        order_service: Option<&std::sync::Arc<crate::order::OrderService>>,
+    ) -> Result<RetryProcessingResult> {
         let due_invoices = self.get_invoices_for_retry().await?;
 
         let mut processed = 0;
@@ -598,7 +738,10 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
         for retryable in due_invoices {
             processed += 1;
 
-            match self.execute_retry(retryable.invoice.id).await {
+            match self
+                .execute_retry(retryable.invoice.id, gateway, order_service)
+                .await
+            {
                 Ok(result) => {
                     match result {
                         PaymentRecoveryResult::Success => succeeded += 1,
@@ -759,7 +902,12 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
     /// Manually trigger a retry for an invoice
     ///
     /// This bypasses the scheduled retry time and attempts payment immediately
-    pub async fn manual_retry(&self, invoice_id: Uuid) -> Result<PaymentRecoveryResult> {
+    pub async fn manual_retry(
+        &self,
+        invoice_id: Uuid,
+        gateway: &dyn PaymentGateway,
+        order_service: Option<&std::sync::Arc<crate::order::OrderService>>,
+    ) -> Result<PaymentRecoveryResult> {
         info!("Manual retry triggered for invoice {}", invoice_id);
 
         let invoice = self
@@ -788,7 +936,7 @@ impl<R: SubscriptionRepository + Clone> DunningService<R> {
         }
 
         // Execute the retry
-        self.execute_retry(invoice_id).await
+        self.execute_retry(invoice_id, gateway, order_service).await
     }
 
     /// Reset dunning state for a subscription
@@ -879,6 +1027,8 @@ mod tests {
                 currency: Currency::USD,
                 amount: Decimal::new(1000, 2),
                 setup_fee: None,
+                quantity: 1,
+                shipping_address: None,
                 trial_days: 0,
                 trial_ends_at: None,
                 current_cycle: 1,

@@ -610,6 +610,11 @@ pub async fn handle_webhook(
             info!("Payment refunded: {}", event.payment_id);
             handle_payment_refunded(&state, &event).await?;
         }
+        WebhookAction::ConsentVerified => {
+            // Stored-card consent verified at the gateway. Consent status is
+            // verified synchronously at checkout, so this is informational.
+            info!("Payment consent verified at gateway: {}", event.payment_id);
+        }
         WebhookAction::Ignore => {
             info!("Unhandled webhook event: {:?}", event.event_type);
         }
@@ -633,6 +638,8 @@ enum WebhookAction {
     CancelPayment,
     /// Mark the payment refunded
     MarkRefunded,
+    /// A stored-card consent was verified (log only)
+    ConsentVerified,
     /// Log only
     Ignore,
 }
@@ -643,6 +650,11 @@ fn webhook_action(event_type: &WebhookEventType) -> WebhookAction {
         WebhookEventType::PaymentFailed => WebhookAction::FailPayment,
         WebhookEventType::PaymentCancelled => WebhookAction::CancelPayment,
         WebhookEventType::PaymentRefunded => WebhookAction::MarkRefunded,
+        WebhookEventType::SubscriptionPaymentSucceeded => WebhookAction::Ignore,
+        WebhookEventType::SubscriptionPaymentFailed => WebhookAction::Ignore,
+        WebhookEventType::SubscriptionCreated => WebhookAction::Ignore,
+        WebhookEventType::SubscriptionCancelled => WebhookAction::Ignore,
+        WebhookEventType::PaymentConsentVerified => WebhookAction::ConsentVerified,
         _ => WebhookAction::Ignore,
     }
 }
@@ -693,6 +705,9 @@ async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Res
                 .order_service
                 .confirm_order_after_payment(payment.order_id)
                 .await?;
+
+            // A paid subscription-initial order starts the subscription.
+            super::checkout::finalize_subscription_for_order(state, payment.order_id).await;
 
             // Notify the shop operator about the now-paid order
             super::email_helpers::send_admin_order_email(state, payment.order_id).await;
@@ -1296,7 +1311,10 @@ mod tests {
         assert_eq!(currency, "hkd");
 
         // Missing fields → None (caller falls back to the original payment).
-        assert_eq!(refund_amount_currency_from_payload(&serde_json::json!({})), None);
+        assert_eq!(
+            refund_amount_currency_from_payload(&serde_json::json!({})),
+            None
+        );
         assert_eq!(
             refund_amount_currency_from_payload(&serde_json::json!({"amount": 5})),
             None

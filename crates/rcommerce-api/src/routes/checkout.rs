@@ -19,7 +19,7 @@ use crate::middleware::JwtAuth;
 use crate::state::AppState;
 
 // Import core checkout types
-use rcommerce_core::models::Address;
+use rcommerce_core::models::{Address, SubscriptionInterval};
 use rcommerce_core::notification::{
     service::NotificationService, Address as EmailAddress, Notification, NotificationChannel,
     NotificationPriority, OrderConfirmationParams, OrderItem,
@@ -39,6 +39,8 @@ pub struct InitiateCheckoutApiRequest {
     pub billing_address: Option<Address>,
     pub vat_id: Option<String>,
     pub currency: Option<String>,
+    /// Subscription option: applies the subscription discount to the summary
+    pub subscription: Option<rcommerce_core::services::SubscriptionCheckoutOption>,
 }
 
 /// Request to select shipping
@@ -64,6 +66,11 @@ pub struct CompleteCheckoutApiRequest {
     /// test=true so accounting can book it to a suspense account.
     #[serde(default)]
     pub test: Option<bool>,
+    /// Subscription option: turns this order into a subscription initial
+    /// order once payment succeeds.
+    pub subscription: Option<rcommerce_core::services::SubscriptionCheckoutOption>,
+    /// Verified stored-card consent id. Mandatory when `subscription` is set.
+    pub payment_consent_id: Option<String>,
 }
 
 /// Request to confirm checkout after client-side payment confirmation
@@ -396,6 +403,7 @@ pub async fn initiate_checkout(
         vat_id: request.vat_id,
         customer_id: auth.map(|a| a.customer_id),
         currency: Some(currency),
+        subscription: request.subscription,
     };
 
     // Call checkout service
@@ -528,6 +536,31 @@ pub async fn complete_checkout(
         }
     }
 
+    // Subscriptions require an account (renewals bill a stored-card consent,
+    // which needs a real customer) and a verified payment consent.
+    if request.subscription.is_some() && auth.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "An account is required for subscriptions"
+            })),
+        ));
+    }
+    if request.subscription.is_some()
+        && request
+            .payment_consent_id
+            .as_ref()
+            .map(|c| c.is_empty())
+            .unwrap_or(true)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "payment_consent_id is required for subscription checkout"
+            })),
+        ));
+    }
+
     // Build the core request
     let core_request = CompleteCheckoutRequest {
         cart_id: request.cart_id,
@@ -540,15 +573,23 @@ pub async fn complete_checkout(
         notes: request.notes,
         selected_shipping_rate: request.selected_shipping_rate.into(),
         test: request.test,
+        subscription: request.subscription,
+        payment_consent_id: request.payment_consent_id,
     };
 
     // Call checkout service
     match state.checkout_service.complete_checkout(core_request).await {
         Ok(result) => {
+            let order_id = result.order.order.id;
             let response: CheckoutResultResponse = result.into();
             // No admin notification here: orders that still require payment
             // confirmation are not real orders yet. The shop operator is
             // emailed exactly when payment confirms (webhook or /checkout/confirm).
+
+            // A paid one-shot (mock gateway path): the subscription starts now.
+            if !response.requires_confirmation {
+                finalize_subscription_for_order(&state, order_id).await;
+            }
 
             // Fire-and-forget order confirmation email if SMTP configured
             if !response.requires_confirmation {
@@ -601,6 +642,186 @@ pub async fn complete_checkout(
     }
 }
 
+/// After a subscription-initial order's payment succeeds, create the
+/// Subscription row from the order metadata's subscription options and link
+/// the order (order_type + subscription_id). Idempotent: a no-op when the
+/// order has no subscription options or already has a subscription.
+pub(crate) async fn finalize_subscription_for_order(state: &AppState, order_id: Uuid) {
+    let row: Option<(
+        Option<Uuid>,
+        Option<serde_json::Value>,
+        Option<Uuid>,
+        String,
+        Decimal,
+        Option<serde_json::Value>,
+    )> = sqlx::query_as(
+        "SELECT customer_id, metadata, subscription_id, currency::text, total, shipping_address \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .unwrap_or(None);
+    let Some((
+        customer_id,
+        metadata,
+        existing_subscription_id,
+        currency_text,
+        total,
+        shipping_address,
+    )) = row
+    else {
+        return;
+    };
+    if existing_subscription_id.is_some() {
+        return; // already finalized (webhook/confirm race)
+    }
+    let Some(customer_id) = customer_id else {
+        return; // guest orders never carry subscriptions (enforced at checkout)
+    };
+    let Some(metadata) = metadata else {
+        return;
+    };
+    let Some(sub_meta) = metadata.get("subscription").cloned() else {
+        return;
+    };
+
+    let parse = |v: &serde_json::Value| -> Option<SubscriptionInterval> {
+        serde_json::from_value(v.clone()).ok()
+    };
+    let Some(interval) = sub_meta.get("interval").and_then(parse) else {
+        tracing::error!(
+            "Order {} has subscription metadata without a valid interval",
+            order_id
+        );
+        return;
+    };
+    let interval_count = sub_meta
+        .get("interval_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1) as i32;
+    let Some(consent_id) = sub_meta
+        .get("payment_consent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        tracing::error!(
+            "Order {} has subscription metadata without a payment consent",
+            order_id
+        );
+        return;
+    };
+    let product_id = sub_meta
+        .get("product_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .or_else(|| {
+            // Fall back to the first order line's product.
+            None
+        });
+    let quantity = sub_meta
+        .get("quantity")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1) as i32;
+
+    // Product/variant from the order's first line when not in metadata.
+    let (product_id, variant_id) = match product_id {
+        Some(pid) => {
+            let variant: Option<Uuid> = sqlx::query_scalar(
+                "SELECT variant_id FROM order_items WHERE order_id = $1 ORDER BY created_at LIMIT 1",
+            )
+            .bind(order_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .unwrap_or(None);
+            (pid, variant)
+        }
+        None => {
+            let line: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+                "SELECT product_id, variant_id FROM order_items \
+                 WHERE order_id = $1 ORDER BY created_at LIMIT 1",
+            )
+            .bind(order_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .unwrap_or(None);
+            match line {
+                Some((pid, vid)) => (pid, vid),
+                None => {
+                    tracing::error!(
+                        "Subscription order {} has no line items to subscribe",
+                        order_id
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    let gateway = state
+        .subscription_gateway
+        .as_ref()
+        .map(|g| g.id().to_string())
+        .unwrap_or_else(|| "airwallex".to_string());
+
+    let subscription = match state
+        .subscription_service
+        .create_from_order(rcommerce_core::services::CreateSubscriptionFromOrder {
+            customer_id,
+            order_id,
+            product_id,
+            variant_id,
+            quantity,
+            amount: total,
+            currency: currency_text.parse().unwrap_or_default(),
+            interval,
+            interval_count,
+            payment_consent_id: consent_id.to_string(),
+            gateway,
+            shipping_address,
+        })
+        .await
+    {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::error!(
+                "Failed to create subscription from order {}: {}",
+                order_id,
+                e
+            );
+            return;
+        }
+    };
+
+    // Link the order: it is the subscription's initial order.
+    if let Err(e) = sqlx::query(
+        "UPDATE orders SET order_type = 'subscription_initial', subscription_id = $1 \
+         WHERE id = $2",
+    )
+    .bind(subscription.id)
+    .bind(order_id)
+    .execute(state.db.pool())
+    .await
+    {
+        tracing::error!(
+            "Failed to link order {} to subscription {}: {}",
+            order_id,
+            subscription.id,
+            e
+        );
+    }
+
+    tracing::info!(
+        "Subscription {} created from order {} (interval {:?} x{}, {} {} per cycle)",
+        subscription.id,
+        order_id,
+        interval,
+        interval_count,
+        subscription.amount,
+        subscription.currency,
+    );
+}
+
 /// Confirm checkout endpoint
 ///
 /// Verifies a client-side confirmed payment (e.g., Stripe Elements) and finalizes the order
@@ -634,6 +855,10 @@ pub async fn confirm_checkout(
             // re-notify: the admin email, customer confirmation and Xero sync
             // all fire exactly once per order.
             if was_pending {
+                // The payment is confirmed: start the subscription when this
+                // order carries subscription options.
+                finalize_subscription_for_order(&state, response.order.id).await;
+
                 super::email_helpers::send_admin_order_email(&state, response.order.id).await;
 
                 // Fire-and-forget order confirmation email if SMTP configured
@@ -686,7 +911,7 @@ pub async fn confirm_checkout(
     }
 }
 
-async fn send_order_confirmation_email(
+pub(crate) async fn send_order_confirmation_email(
     notification_service: &NotificationService,
     order_service: &OrderService,
     customer_service: &CustomerService,
@@ -956,10 +1181,11 @@ async fn sync_order_to_xero(
 }
 
 /// GET /api/v1/shipping/countries - public list of shippable country codes
-/// (the storefront filters its country selector to these).
-pub async fn shipping_countries() -> Json<serde_json::Value> {
-    let provider = rcommerce_core::shipping::carriers::WeightBasedProvider::new();
-    Json(serde_json::json!({ "countries": provider.shippable_countries() }))
+/// (the storefront filters its country selector to these). Reflects the
+/// weight-based provider's configured zones when present.
+pub async fn shipping_countries(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let countries = state.shipping_factory.weight_based_shippable_countries();
+    Json(serde_json::json!({ "countries": countries }))
 }
 
 /// Router for checkout routes

@@ -235,6 +235,7 @@ impl TestApp {
             tax_service,
             shipping_factory,
             checkout_service,
+            None, // No subscription gateway for tests
             inventory_service,
             None,               // No SMTP for tests
             None,               // No Xero for tests

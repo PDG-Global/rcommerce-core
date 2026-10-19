@@ -168,6 +168,9 @@ impl AirwallexGateway {
             "payment_intent.failed" => Ok(WebhookEventType::PaymentFailed),
             "payment_intent.cancelled" => Ok(WebhookEventType::PaymentCanceled),
             "refund.succeeded" => Ok(WebhookEventType::RefundSucceeded),
+            // Stored-card consent verified. Log-only on our side: consent
+            // status is verified synchronously at checkout.
+            "payment_consent.verified" => Ok(WebhookEventType::PaymentConsentVerified),
             _ => Err(Error::validation("Unsupported webhook event type")),
         }
     }
@@ -225,8 +228,14 @@ impl PaymentGateway for AirwallexGateway {
                 serde_json::Value::String(customer_id.to_string()),
             );
         }
+        if request.merchant_initiated.unwrap_or(false) {
+            metadata.insert(
+                "merchant_initiated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "amount": request.amount,
             "currency": request.currency,
@@ -234,6 +243,11 @@ impl PaymentGateway for AirwallexGateway {
             "merchant_order_id": merchant_order_id,
             "metadata": metadata,
         });
+        // Merchant-initiated charge on a stored-card consent: a normal intent
+        // create with payment_consent_id set (Airwallex docs: recurring).
+        if let Some(ref consent_id) = request.payment_consent_id {
+            payload["payment_consent_id"] = serde_json::json!(consent_id);
+        }
 
         let response = self
             .client
@@ -546,6 +560,117 @@ impl PaymentGateway for AirwallexGateway {
                 .map_err(|e| Error::Network(format!("Failed to parse webhook data: {}", e)))?,
         })
     }
+
+    async fn create_customer(&self, email: &str, name: &str) -> Result<String> {
+        let token = self.get_access_token().await?;
+
+        let payload = serde_json::json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "email": email,
+        });
+        let payload = if name.trim().is_empty() {
+            payload
+        } else {
+            let mut p = payload;
+            p["name"] = serde_json::json!(name);
+            p
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/pa/customers", self.base_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::network(format!("Airwallex API error: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        if !status.is_success() {
+            return Err(Error::payment_error(format!(
+                "Airwallex create customer error ({}): {}",
+                status, body
+            )));
+        }
+
+        let customer: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::Network(format!("Failed to parse Airwallex customer: {}", e)))?;
+        customer
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| Error::payment_error("Airwallex customer response missing id"))
+    }
+
+    async fn create_payment_consent(
+        &self,
+        gateway_customer_id: &str,
+        card: crate::payment::CardDetails,
+        merchant_trigger_reason: &str,
+    ) -> Result<crate::payment::ConsentCreation> {
+        let token = self.get_access_token().await?;
+
+        let payload = serde_json::json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "customer_id": gateway_customer_id,
+            "merchant_trigger_reason": merchant_trigger_reason,
+            "payment_method": {
+                "type": "card",
+                "card": {
+                    "number": card.number,
+                    "expiry_month": format!("{:02}", card.exp_month),
+                    "expiry_year": format!("{}", card.exp_year),
+                    "cvc": card.cvc,
+                    "name": card.name,
+                },
+            },
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/pa/payment_consents/create", self.base_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| Error::network(format!("Airwallex API error: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        if !status.is_success() {
+            return Err(Error::payment_error(format!(
+                "Airwallex create consent error ({}): {}",
+                status, body
+            )));
+        }
+
+        let consent: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::Network(format!("Failed to parse Airwallex consent: {}", e)))?;
+        let consent_id = consent
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| Error::payment_error("Airwallex consent response missing id"))?;
+        let client_secret = consent
+            .get("client_secret")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+
+        Ok(crate::payment::ConsentCreation {
+            consent_id,
+            client_secret,
+        })
+    }
 }
 
 // Airwallex API response types
@@ -704,7 +829,11 @@ mod tests {
             AirwallexGateway::map_event_type("refund.succeeded").unwrap(),
             WebhookEventType::RefundSucceeded
         );
-        assert!(AirwallexGateway::map_event_type("payment_consent.verified").is_err());
+        assert_eq!(
+            AirwallexGateway::map_event_type("payment_consent.verified").unwrap(),
+            WebhookEventType::PaymentConsentVerified
+        );
+        assert!(AirwallexGateway::map_event_type("payment_intent.unknown").is_err());
     }
 
     #[tokio::test]
