@@ -757,6 +757,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         config.notifications.admin_email.clone(),
         config.branding.clone(),
         config.accounting.clone(),
+        config.default_currency.clone(),
         Some(config.payment.airwallex.clone()),
     ))
     .await)

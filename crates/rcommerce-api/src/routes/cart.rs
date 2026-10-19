@@ -27,16 +27,33 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 /// Create a new guest cart
+#[derive(Debug, Deserialize, Default)]
+pub struct GuestCartRequest {
+    /// Optional currency override (ISO code). Defaults to the store's
+    /// configured `default_currency`.
+    pub currency: Option<String>,
+}
+
 pub async fn create_guest_cart(
     State(state): State<AppState>,
+    body: Option<Json<GuestCartRequest>>,
 ) -> Result<Json<CartWithItems>, Error> {
     // Generate session token for guest cart
     let session_token = format!("sess_{}", Uuid::new_v4().to_string().replace("-", ""));
 
+    let currency = body
+        .and_then(|Json(b)| b.currency)
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| state.default_currency.clone());
+    let currency = currency
+        .parse::<rcommerce_core::models::Currency>()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|_| "USD".to_string());
+
     // Get or create cart via service
     let cart = state
         .cart_service
-        .get_or_create_cart(CartIdentifier::Session(session_token.clone()), "USD")
+        .get_or_create_cart(CartIdentifier::Session(session_token.clone()), &currency)
         .await?;
 
     // Return cart with items (empty for new cart), including session_token so the
@@ -58,7 +75,7 @@ pub async fn get_customer_cart(
     // Get or create cart for authenticated customer
     let cart = state
         .cart_service
-        .get_or_create_cart(CartIdentifier::Customer(auth.customer_id), "USD")
+        .get_or_create_cart(CartIdentifier::Customer(auth.customer_id), &state.default_currency)
         .await?;
 
     // Return cart with items

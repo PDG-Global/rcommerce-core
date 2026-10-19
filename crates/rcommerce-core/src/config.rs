@@ -61,6 +61,15 @@ pub struct Config {
 
     #[serde(default)]
     pub subscriptions: SubscriptionsConfig,
+
+    /// Store base currency (ISO code, e.g. "USD", "AUD") used when creating
+    /// carts and anywhere a money amount needs a default currency.
+    #[serde(default = "default_currency_string")]
+    pub default_currency: String,
+}
+
+fn default_currency_string() -> String {
+    "USD".to_string()
 }
 
 /// Subscription billing settings

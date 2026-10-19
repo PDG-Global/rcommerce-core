@@ -47,6 +47,8 @@ pub struct AppStateParams {
     pub branding: rcommerce_core::BrandingConfig,
     /// Accounting export configuration (store code/name, site URL)
     pub accounting: rcommerce_core::config::AccountingConfig,
+    /// Store base currency for new carts (ISO code, e.g. "USD", "AUD")
+    pub default_currency: String,
     /// Airwallex gateway config for settlement reconciliation
     pub airwallex_config: Option<rcommerce_core::config::AirwallexConfig>,
 }
@@ -77,6 +79,7 @@ impl AppStateParams {
         notification_admin_email: Option<String>,
         branding: rcommerce_core::BrandingConfig,
         accounting: rcommerce_core::config::AccountingConfig,
+        default_currency: String,
         airwallex_config: Option<rcommerce_core::config::AirwallexConfig>,
     ) -> Self {
         Self {
@@ -102,6 +105,7 @@ impl AppStateParams {
             notification_admin_email,
             branding,
             accounting,
+            default_currency,
             airwallex_config,
         }
     }
@@ -141,6 +145,8 @@ pub struct AppState {
     pub branding: rcommerce_core::BrandingConfig,
     /// Accounting export configuration (store code/name, site URL)
     pub accounting: rcommerce_core::config::AccountingConfig,
+    /// Store base currency for new carts (ISO code, e.g. "USD", "AUD")
+    pub default_currency: String,
     /// Airwallex settlement reconciliation client (None when unconfigured)
     pub settlement_sync: Option<Arc<rcommerce_core::accounting::SettlementSync>>,
 }
@@ -260,6 +266,7 @@ impl AppState {
             xero_client,
             branding,
             accounting: params.accounting,
+            default_currency: params.default_currency,
             settlement_sync,
         }
     }

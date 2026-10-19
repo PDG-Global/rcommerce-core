@@ -546,6 +546,10 @@ enabled = false
 # includes a subscription option (default: 0)
 #discount_percent = 10
 
+# Store base currency (ISO code) used when creating carts and anywhere a
+# money amount needs a default. Set "AUD" for an Australia-facing store.
+#default_currency = "USD"
+
 # How often the background billing loop runs, in minutes (default: 60)
 #billing_interval_minutes = 60
 
