@@ -1127,13 +1127,26 @@ impl OrderService {
 
     async fn get_default_location_id(&self) -> Result<Uuid> {
         // Use the first active inventory location as the default fulfillment location.
-        let location_id = sqlx::query_scalar::<_, Uuid>(
+        let existing = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM inventory_locations WHERE is_active = true ORDER BY created_at LIMIT 1",
         )
         .fetch_optional(self.db.pool())
         .await?;
 
-        location_id.ok_or_else(|| Error::validation("No active inventory location configured"))
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        // No location exists (e.g. legacy DB that pre-dates the default
+        // warehouse migration) — create one rather than failing order
+        // creation, mirroring the checkout service's behaviour.
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Default Warehouse', $2)")
+            .bind(id)
+            .bind(format!("MAIN-{}", &id.to_string()[..8]))
+            .execute(self.db.pool())
+            .await?;
+        Ok(id)
     }
 
     async fn commit_inventory_reservations(&self, order_id: Uuid) -> Result<()> {

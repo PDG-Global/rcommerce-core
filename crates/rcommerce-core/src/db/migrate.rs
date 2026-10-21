@@ -199,6 +199,11 @@ impl Migrator {
                 "subscriptions_money",
                 include_str!("../../migrations/020_subscriptions_money.sql"),
             ),
+            (
+                21,
+                "default_warehouse",
+                include_str!("../../migrations/021_default_warehouse.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {
