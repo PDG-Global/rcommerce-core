@@ -497,6 +497,13 @@ pub enum PaymentMethod {
 | POST | /api/v1/checkout/initiate | JWT | Start checkout, get tax & shipping rates |
 | POST | /api/v1/checkout/shipping | JWT | Select shipping method |
 | POST | /api/v1/checkout/complete | JWT | Process payment & create order |
+| POST | /api/v1/checkout/confirm | Optional JWT | Confirm a client-side (Stripe Elements / Airwallex Drop-in) payment |
+
+**Confirming a client-side payment:** `POST /checkout/confirm` only accepts the
+payment intent that `/checkout/complete` recorded for that order, and only once the
+gateway reports it succeeded for at least the order total, in the order's currency.
+Any other succeeded intent, for example one of another order, is refused, so one
+payment cannot confirm several orders.
 
 ## Authentication
 

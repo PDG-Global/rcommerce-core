@@ -994,6 +994,35 @@ impl CheckoutService {
         })
     }
 
+    /// A succeeded intent proves nothing about *this* order: it must be the
+    /// intent recorded for it at checkout and cover its total, otherwise a
+    /// cheap order's payment could confirm an expensive one (or many).
+    async fn ensure_payment_pays_order(
+        &self,
+        payment: &crate::payment::Payment,
+        order: &crate::order::Order,
+        payment_intent_id: &str,
+    ) -> Result<()> {
+        if !self
+            .order_service
+            .payment_belongs_to_order(order.id, payment_intent_id)
+            .await?
+        {
+            return Err(Error::validation("Payment does not belong to this order"));
+        }
+        if !payment_covers_order(
+            payment.amount,
+            &payment.currency,
+            order.total,
+            &order.currency,
+        ) {
+            return Err(Error::payment_error(
+                "Payment amount does not cover the order total",
+            ));
+        }
+        Ok(())
+    }
+
     /// Confirm checkout after client-side payment confirmation (Stripe Elements)
     pub async fn confirm_checkout(
         &self,
@@ -1034,6 +1063,9 @@ impl CheckoutService {
                 payment.status
             )));
         }
+
+        self.ensure_payment_pays_order(&payment, &existing.order, &request.payment_intent_id)
+            .await?;
 
         if already_final {
             info!(
@@ -1426,6 +1458,16 @@ fn address_to_tax_address(address: &Address) -> TaxAddress {
 
 use rust_decimal_macros::dec;
 
+/// Whether a gateway payment pays for an order: at least its total, in its currency
+fn payment_covers_order(
+    amount: Decimal,
+    currency: &str,
+    order_total: Decimal,
+    order_currency: &str,
+) -> bool {
+    amount >= order_total && currency.eq_ignore_ascii_case(order_currency)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,6 +1478,19 @@ mod tests {
     };
     use crate::services::cart_service::ProductDetails;
     use crate::services::CouponService;
+
+    #[test]
+    fn test_payment_covers_order() {
+        assert!(payment_covers_order(dec!(50.00), "usd", dec!(50.00), "USD"));
+        assert!(payment_covers_order(dec!(50.01), "USD", dec!(50.00), "USD"));
+        assert!(!payment_covers_order(dec!(0.01), "USD", dec!(50.00), "USD"));
+        assert!(!payment_covers_order(
+            dec!(50.00),
+            "EUR",
+            dec!(50.00),
+            "USD"
+        ));
+    }
 
     #[test]
     fn test_checkout_config_default() {
@@ -2080,6 +2135,90 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(order_count, 1);
+
+        idem_cleanup(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn test_confirm_checkout_rejects_an_intent_of_another_order() {
+        let Some((gateway, service, ctx)) = checkout_setup().await else {
+            return;
+        };
+        gateway.set_status(crate::payment::PaymentStatus::Pending);
+        let first = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("complete_checkout must succeed");
+        let order_id = first.order.order.id;
+
+        // A succeeded payment the gateway knows, but that was never recorded for
+        // this order (e.g. the intent of another, cheaper order)
+        let other = gateway
+            .create_payment(CreatePaymentRequest {
+                amount: first.total_charged,
+                currency: "USD".to_string(),
+                order_id: Uuid::new_v4(),
+                customer_id: None,
+                customer_email: "other@example.com".to_string(),
+                payment_method: crate::payment::PaymentMethod::StripeElements,
+                billing_address: None,
+                payment_consent_id: None,
+                merchant_initiated: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        gateway.set_status(crate::payment::PaymentStatus::Succeeded);
+
+        let result = service
+            .confirm_checkout(ConfirmCheckoutRequest {
+                order_id,
+                payment_intent_id: other.id,
+                cart_id: ctx.cart_id,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "an intent not recorded for the order must be refused"
+        );
+
+        idem_cleanup(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn test_confirm_checkout_rejects_an_underpaid_intent() {
+        let Some((gateway, service, ctx)) = checkout_setup().await else {
+            return;
+        };
+        gateway.set_status(crate::payment::PaymentStatus::Pending);
+        let first = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("complete_checkout must succeed");
+        let order_id = first.order.order.id;
+        let intent = first.payment_intent_id.clone().expect("payment intent id");
+
+        // The gateway reports one cent for the intent recorded for this order
+        gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|(id, _, _)| *id == intent)
+            .for_each(|session| session.2 = dec!(0.01));
+        gateway.set_status(crate::payment::PaymentStatus::Succeeded);
+
+        let result = service
+            .confirm_checkout(ConfirmCheckoutRequest {
+                order_id,
+                payment_intent_id: intent,
+                cart_id: ctx.cart_id,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a payment below the order total must be refused"
+        );
 
         idem_cleanup(&ctx).await;
     }

@@ -1042,6 +1042,21 @@ impl OrderService {
         Ok(items)
     }
 
+    /// Whether a gateway payment id was recorded for this order (at checkout)
+    pub async fn payment_belongs_to_order(
+        &self,
+        order_id: Uuid,
+        gateway_payment_id: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM payments WHERE order_id = $1 AND gateway_payment_id = $2)",
+        )
+        .bind(order_id)
+        .bind(gateway_payment_id)
+        .fetch_one(self.db.pool())
+        .await?)
+    }
+
     /// Record a payment for an order (idempotent on gateway + transaction id)
     pub async fn record_payment(
         &self,
