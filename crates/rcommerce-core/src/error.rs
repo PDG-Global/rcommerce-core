@@ -312,9 +312,20 @@ impl Default for ValidationErrors {
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
+        // Server-side failures (database, config, I/O...) can carry SQL, constraint
+        // names or file paths: log them, and give the client a generic message.
+        let message = if status >= 500 {
+            tracing::error!(category = self.category(), "request failed: {}", self);
+            match status {
+                503 => "Service temporarily unavailable".to_string(),
+                _ => "Internal server error".to_string(),
+            }
+        } else {
+            self.to_string()
+        };
         let body = serde_json::json!({
             "error": {
-                "message": self.to_string(),
+                "message": message,
                 "code": status,
                 "category": self.category()
             }
@@ -330,3 +341,48 @@ impl axum::response::IntoResponse for Error {
 }
 
 // Pagination helpers
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use axum::response::IntoResponse;
+
+    async fn render(error: Error) -> (u16, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn server_errors_hide_their_details() {
+        let (status, body) = render(Error::Database(sqlx::Error::Protocol(
+            "value too long for type character varying(100)".into(),
+        )))
+        .await;
+        assert_eq!(status, 500);
+        assert_eq!(body["error"]["message"], "Internal server error");
+        assert!(!body.to_string().contains("varying"));
+
+        let (status, body) = render(Error::Network("timeout calling 10.0.0.5".into())).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["message"], "Service temporarily unavailable");
+        assert!(!body.to_string().contains("10.0.0.5"));
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_their_message() {
+        let (status, body) =
+            render(Error::validation("Names must be at most 100 characters")).await;
+        assert_eq!(status, 400);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Names must be at most 100 characters"));
+
+        let (status, _) = render(Error::not_found("Product not found")).await;
+        assert_eq!(status, 404);
+    }
+}

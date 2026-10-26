@@ -96,9 +96,12 @@ All errors follow a consistent JSON format:
 
 #### `internal_error`
 - **Status**: 500
-- **Message**: "Internal server error occurred"
+- **Message**: "Internal server error"
 - **Common Causes**: Unexpected server error
 - **Solution**: Retry with backoff, contact support if persists
+- **Note**: server errors (5xx) never carry internal details such as SQL errors,
+  constraint names or file paths. The detail is logged server-side (`ERROR`
+  level, with the error category) for operators.
 
 #### `not_implemented`
 - **Status**: 501
