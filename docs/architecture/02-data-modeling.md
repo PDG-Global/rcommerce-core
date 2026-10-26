@@ -527,6 +527,35 @@ CREATE TRIGGER update_categories_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 ```
 
+### Catalogue Translations
+
+Products and categories keep their base-language text in their own rows, so
+orders, invoices and e-mails are unchanged. Other languages are stored in
+translation tables (migration 022):
+
+```sql
+product_translations (
+    product_id UUID REFERENCES products(id) ON DELETE CASCADE,
+    locale VARCHAR(16),                 -- primary language subtag: 'fr', 'nl'
+    title, slug, description, seo_title, seo_description,
+    search_vector tsvector GENERATED ALWAYS AS (...) STORED,  -- stemmed for the locale
+    PRIMARY KEY (product_id, locale),
+    UNIQUE (locale, slug)
+)
+
+category_translations (
+    category_id UUID REFERENCES product_categories(id) ON DELETE CASCADE,
+    locale, name, slug, description, seo_title, seo_description,
+    PRIMARY KEY (category_id, locale),
+    UNIQUE (locale, slug)
+)
+```
+
+Search uses GIN indexes on the translation vectors and on expressions over the
+base rows (`rc_search_config(locale)` maps a locale to its PostgreSQL text-search
+configuration), plus trigram indexes on titles for the substring fallback
+(requires the `pg_trgm` extension, created by the migration).
+
 ### Payment Tables
 
 ```sql
