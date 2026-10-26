@@ -48,6 +48,10 @@ R Commerce supports two authentication methods with a unified middleware approac
 
 For customer and admin user sessions. JWT tokens are short-lived (24 hours by default) and provide role-based permissions.
 
+**Registration limits** (`POST /api/v1/auth/register`): the password must be 8–128 characters,
+`first_name` and `last_name` at most 100 characters, `email` at most 255 and `phone` at most 50.
+Longer values are rejected with `400 Validation error` before the password is hashed.
+
 **Login:**
 ```bash
 POST /api/v1/auth/login
