@@ -70,7 +70,7 @@ pub async fn require_scope_middleware(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Verify token and get claims
-    let claims = match state.auth_service.verify_token(token) {
+    let claims = match state.auth_service.verify_access_token(token) {
         Ok(claims) => claims,
         Err(e) => {
             tracing::warn!("Token verification failed: {}", e);

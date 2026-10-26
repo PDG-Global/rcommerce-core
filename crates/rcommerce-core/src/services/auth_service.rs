@@ -256,6 +256,17 @@ impl AuthService {
             })
     }
 
+    /// Verify a token presented as `Authorization: Bearer` on an API request. Only
+    /// access tokens are sessions: refresh, password-reset and e-mail verification
+    /// tokens carry the customer id too, but must not authenticate requests.
+    pub fn verify_access_token(&self, token: &str) -> Result<JwtClaims> {
+        let claims = self.verify_token(token)?;
+        if claims.token_type != TokenType::Access {
+            return Err(Error::unauthorized("Invalid token type"));
+        }
+        Ok(claims)
+    }
+
     /// Extract bearer token from Authorization header
     pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
         auth_header.strip_prefix("Bearer ")
@@ -424,6 +435,30 @@ mod tests {
         config.security.jwt.secret =
             "this_is_a_test_secret_that_is_at_least_32_bytes_long".to_string();
         config
+    }
+
+    #[test]
+    fn test_only_access_tokens_authenticate_requests() {
+        let auth = AuthService::new(test_config());
+        let id = Uuid::new_v4();
+        let role = crate::models::CustomerRole::default();
+
+        let access = auth
+            .generate_access_token(id, "a@example.com", &role)
+            .unwrap();
+        assert_eq!(auth.verify_access_token(&access).unwrap().sub, id);
+
+        let refresh = auth.generate_refresh_token(id, true).unwrap();
+        let reset = auth
+            .generate_password_reset_token(id, "a@example.com")
+            .unwrap();
+        let verify = auth
+            .generate_email_verification_token(id, "a@example.com")
+            .unwrap();
+        for token in [refresh, reset, verify] {
+            assert!(auth.verify_token(&token).is_ok());
+            assert!(auth.verify_access_token(&token).is_err());
+        }
     }
 
     #[test]

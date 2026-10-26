@@ -155,7 +155,7 @@ pub async fn auth_middleware(
     tracing::debug!("Extracted bearer token");
 
     // Verify token
-    match state.auth_service.verify_token(token) {
+    match state.auth_service.verify_access_token(token) {
         Ok(claims) => {
             tracing::debug!("Token verified for customer: {}", claims.sub);
 
@@ -192,7 +192,7 @@ pub async fn optional_auth_middleware(
         .and_then(|h| h.to_str().ok())
     {
         if let Some(token) = AuthService::extract_bearer_token(header) {
-            if let Ok(claims) = state.auth_service.verify_token(token) {
+            if let Ok(claims) = state.auth_service.verify_access_token(token) {
                 let auth = JwtAuth {
                     customer_id: claims.sub,
                     email: claims.email,
@@ -385,7 +385,7 @@ pub async fn admin_middleware(
     // Verify token
     let claims = state
         .auth_service
-        .verify_token(token)
+        .verify_access_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     // Check for admin permission

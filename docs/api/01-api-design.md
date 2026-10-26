@@ -85,6 +85,11 @@ Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
 - Access token: 24 hours (configurable via `security.jwt.expiry_hours`)
 - Refresh token: 7 days (configurable)
 
+**Token types:** only access tokens authenticate API requests. Refresh tokens are
+accepted by `POST /api/v1/auth/refresh` only, and password-reset and e-mail
+verification tokens only by their own endpoints; sent as a Bearer token they get
+`401 Unauthorized`.
+
 #### 2. API Key Authentication (Service-to-Service)
 
 For server-to-server authentication with fine-grained scope-based permissions. API keys are long-lived and designed for integrations.

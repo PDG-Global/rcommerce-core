@@ -286,7 +286,7 @@ pub async fn combined_auth_middleware(
     if let Some(token) = AuthService::extract_bearer_token(auth_header) {
         tracing::debug!("Combined auth: Attempting JWT authentication");
 
-        match auth_service.verify_token(token) {
+        match auth_service.verify_access_token(token) {
             Ok(claims) => {
                 // Create JWT auth context
                 let auth = JwtAuth {
