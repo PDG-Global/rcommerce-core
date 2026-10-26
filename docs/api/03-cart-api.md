@@ -23,9 +23,14 @@ The Cart API provides a complete shopping cart system that supports both guest u
 | Endpoint | Authentication |
 |----------|---------------|
 | `POST /carts/guest` | None (creates session token) |
-| `GET /carts/:id` | None (cart ID is the identifier) |
-| `GET /carts/me` | Required (JWT Bearer token) |
-| All other endpoints | Required (JWT Bearer token) |
+| `GET /carts/:id`, `/carts/:id/items...`, `/carts/:id/coupon` | Guest cart: none (the cart ID is the identifier). Customer cart: the owner's access token |
+| `GET /carts/me`, `POST /carts/merge`, `DELETE /carts/:id` | Required (JWT Bearer token); `DELETE` also needs to own a customer cart |
+
+**Cart ownership:** a cart that belongs to a customer (`customer_id` set) is only
+readable and modifiable with that customer's access token, on the cart routes and on
+the `/checkout/*` routes that take a `cart_id`. Any other caller gets
+`404 Not Found`, the same as for an unknown cart, so cart ids cannot be probed.
+Guest carts stay addressable by their (random) id alone.
 
 ### Using JWT Authentication
 
