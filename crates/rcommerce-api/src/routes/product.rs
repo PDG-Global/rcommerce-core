@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -9,10 +11,12 @@ use uuid::Uuid;
 
 use crate::middleware::JwtAuth;
 use crate::state::AppState;
-use rcommerce_core::models::{CreateProductRequest, UpdateProductRequest};
+use rcommerce_core::models::{
+    CreateProductRequest, Product, ProductCategory, UpdateProductRequest,
+};
 use rcommerce_core::repository::{CategoryRepository, PostgresCategoryRepository};
 use rcommerce_core::services::product_service::ProductList;
-use rcommerce_core::services::PaginationParams;
+use rcommerce_core::services::{PaginationInfo, PaginationParams};
 
 /// List products from database
 pub async fn list_products(
@@ -23,28 +27,10 @@ pub async fn list_products(
         let cat_repo = PostgresCategoryRepository::new(state.db.pool().clone());
         match cat_repo.get_by_slug(category_slug).await {
             Ok(Some(cat)) => Some(cat.id),
-            Ok(None) => {
-                return Json(serde_json::json!({
-                    "products": [],
-                    "meta": {
-                        "total": 0,
-                        "page": 1,
-                        "per_page": 20,
-                        "total_pages": 0
-                    }
-                }));
-            }
+            Ok(None) => return Json(empty_product_list()),
             Err(e) => {
                 tracing::error!("Failed to lookup category {}: {}", category_slug, e);
-                return Json(serde_json::json!({
-                    "products": [],
-                    "meta": {
-                        "total": 0,
-                        "page": 1,
-                        "per_page": 20,
-                        "total_pages": 0
-                    }
-                }));
+                return Json(empty_product_list());
             }
         }
     } else {
@@ -74,121 +60,162 @@ pub async fn list_products(
         Ok(list) => list,
         Err(e) => {
             tracing::error!("Failed to list products: {}", e);
-            return Json(serde_json::json!({
-                "products": [],
-                "meta": {
-                    "total": 0,
-                    "page": 1,
-                    "per_page": 20,
-                    "total_pages": 0
-                }
-            }));
+            return Json(empty_product_list());
         }
     };
 
-    // Fetch first image and categories for each product (small catalog, simple N+1 is fine)
-    let mut images_by_product: std::collections::HashMap<Uuid, String> =
-        std::collections::HashMap::new();
-    let mut categories_by_product: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
-        std::collections::HashMap::new();
-    let cat_repo = PostgresCategoryRepository::new(state.db.pool().clone());
-    for p in &product_list.products {
-        if let Ok(images) = state.product_service.repository.find_images(p.id).await {
-            if let Some(img) = images.first().cloned() {
-                images_by_product.insert(p.id, img.src.clone());
-            }
+    let cards = ProductCards::load(&state, &product_list.products).await;
+    let products = cards.into_cards(product_list.products);
+    Json(product_list_json(products, &product_list.pagination))
+}
+
+/// Response of a product listing
+fn product_list_json(
+    products: Vec<serde_json::Value>,
+    pagination: &PaginationInfo,
+) -> serde_json::Value {
+    serde_json::json!({
+        "products": products,
+        "meta": {
+            "total": pagination.total,
+            "page": pagination.page,
+            "per_page": pagination.per_page,
+            "total_pages": pagination.total_pages
         }
-        if let Ok(cats) = cat_repo.get_product_categories(p.id).await {
-            categories_by_product.insert(
-                p.id,
-                cats.into_iter()
-                    .map(|c| serde_json::json!({"id": c.id, "name": c.name, "slug": c.slug}))
-                    .collect(),
-            );
+    })
+}
+
+/// Response of a listing that matches nothing (or failed)
+fn empty_product_list() -> serde_json::Value {
+    let pagination = PaginationInfo {
+        page: 1,
+        per_page: 20,
+        total: 0,
+        total_pages: 0,
+    };
+    product_list_json(Vec::new(), &pagination)
+}
+
+/// Card data for one page of products. First images, categories, review
+/// aggregates and bundle stock are one query each for the whole page, run
+/// concurrently (the images and categories used to cost two queries per
+/// product). A failing lookup leaves its fields empty, as before.
+struct ProductCards {
+    images: HashMap<Uuid, String>,
+    categories: HashMap<Uuid, Vec<serde_json::Value>>,
+    reviews: HashMap<Uuid, (f64, i64)>,
+    bundle_stock: HashMap<Uuid, i32>,
+}
+
+impl ProductCards {
+    async fn load(state: &AppState, products: &[Product]) -> Self {
+        let ids: Vec<Uuid> = products.iter().map(|p| p.id).collect();
+        let cat_repo = PostgresCategoryRepository::new(state.db.pool().clone());
+        let (images, categories, reviews, bundle_stock) = tokio::join!(
+            state.product_service.repository.find_first_images(&ids),
+            cat_repo.categories_for_products(&ids),
+            review_aggregates(state, &ids),
+            bundle_stock(state, products),
+        );
+        Self {
+            images: or_empty(images, "product images"),
+            categories: category_refs(or_empty(categories, "product categories")),
+            reviews: or_empty(reviews, "review aggregates"),
+            bundle_stock: or_empty(bundle_stock, "bundle stock"),
         }
     }
 
-    // Review aggregates for the listed products (single batched query)
-    let mut reviews_by_product: std::collections::HashMap<Uuid, (f64, i64)> =
-        std::collections::HashMap::new();
-    let product_ids: Vec<Uuid> = product_list.products.iter().map(|p| p.id).collect();
-    if !product_ids.is_empty() {
-        let agg = sqlx::query_as::<_, (Uuid, Option<f64>, i64)>(
-            r#"
-            SELECT product_id, AVG(rating)::float8, COUNT(*)::int8
-            FROM product_reviews
-            WHERE product_id = ANY($1) AND status = 'approved'
-            GROUP BY product_id
-            "#,
-        )
-        .bind(&product_ids)
-        .fetch_all(state.db.pool())
-        .await;
-        if let Ok(rows) = agg {
-            for (product_id, avg, count) in rows {
-                reviews_by_product.insert(product_id, (avg.unwrap_or(0.0), count));
-            }
-        }
+    /// The listing cards of a page of products, in order
+    fn into_cards(mut self, products: Vec<Product>) -> Vec<serde_json::Value> {
+        products.into_iter().map(|p| self.card(p)).collect()
     }
 
-    // Derived stock for bundle products (sellable = min over required components)
-    let bundle_ids: Vec<Uuid> = product_list
-        .products
+    /// The listing card of one product
+    fn card(&mut self, p: Product) -> serde_json::Value {
+        let categories = self.categories.remove(&p.id).unwrap_or_default();
+        let (average_rating, review_count) = self.reviews.get(&p.id).copied().unwrap_or((0.0, 0));
+        serde_json::json!({
+            "id": p.id,
+            "title": p.title,
+            "slug": p.slug,
+            "sku": p.sku,
+            "price": p.price,
+            "currency": p.currency,
+            "description": p.description,
+            "seo_description": p.seo_description,
+            "is_active": p.is_active,
+            "product_type": format!("{:?}", p.product_type).to_lowercase(),
+            "inventory_quantity": self.bundle_stock.get(&p.id).copied().unwrap_or(p.inventory_quantity),
+            "image": self.images.get(&p.id),
+            "categories": categories,
+            "average_rating": average_rating,
+            "review_count": review_count,
+            "created_at": p.created_at
+        })
+    }
+}
+
+/// Stock of the bundles among the products, derived from their required
+/// components
+async fn bundle_stock(
+    state: &AppState,
+    products: &[Product],
+) -> rcommerce_core::Result<HashMap<Uuid, i32>> {
+    let bundle_ids: Vec<Uuid> = products
         .iter()
         .filter(|p| matches!(p.product_type, rcommerce_core::models::ProductType::Bundle))
         .map(|p| p.id)
         .collect();
-    let bundle_stock: std::collections::HashMap<Uuid, i32> = if bundle_ids.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        state
-            .bundle_service
-            .available_stock_many(&bundle_ids)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to derive bundle stock for list: {}", e);
-                std::collections::HashMap::new()
-            })
-    };
+    state.bundle_service.available_stock_many(&bundle_ids).await
+}
 
-    let products: Vec<serde_json::Value> = product_list
-        .products
+/// Each product's categories as `{id, name, slug}` references
+fn category_refs(
+    categories: HashMap<Uuid, Vec<ProductCategory>>,
+) -> HashMap<Uuid, Vec<serde_json::Value>> {
+    categories
         .into_iter()
-        .map(|p| {
-            let image = images_by_product.get(&p.id).cloned();
-            let categories = categories_by_product.remove(&p.id).unwrap_or_default();
-            let (average_rating, review_count) =
-                reviews_by_product.get(&p.id).copied().unwrap_or((0.0, 0));
-            serde_json::json!({
-                "id": p.id,
-                "title": p.title,
-                "slug": p.slug,
-                "sku": p.sku,
-                "price": p.price,
-                "currency": p.currency,
-                "description": p.description,
-                "seo_description": p.seo_description,
-                "is_active": p.is_active,
-                "product_type": format!("{:?}", p.product_type).to_lowercase(),
-                "inventory_quantity": bundle_stock.get(&p.id).copied().unwrap_or(p.inventory_quantity),
-                "image": image,
-                "categories": categories,
-                "average_rating": average_rating,
-                "review_count": review_count,
-                "created_at": p.created_at
-            })
+        .map(|(id, cats)| {
+            let cats = cats
+                .into_iter()
+                .map(|c| serde_json::json!({"id": c.id, "name": c.name, "slug": c.slug}))
+                .collect();
+            (id, cats)
         })
-        .collect();
+        .collect()
+}
 
-    Json(serde_json::json!({
-        "products": products,
-        "meta": {
-            "total": product_list.pagination.total,
-            "page": product_list.pagination.page,
-            "per_page": product_list.pagination.per_page,
-            "total_pages": product_list.pagination.total_pages
-        }
-    }))
+/// Approved-review average and count per product, in one query
+async fn review_aggregates(
+    state: &AppState,
+    product_ids: &[Uuid],
+) -> Result<HashMap<Uuid, (f64, i64)>, sqlx::Error> {
+    if product_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid, Option<f64>, i64)>(
+        r#"
+        SELECT product_id, AVG(rating)::float8, COUNT(*)::int8
+        FROM product_reviews
+        WHERE product_id = ANY($1) AND status = 'approved'
+        GROUP BY product_id
+        "#,
+    )
+    .bind(product_ids)
+    .fetch_all(state.db.pool())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(product_id, avg, count)| (product_id, (avg.unwrap_or(0.0), count)))
+        .collect())
+}
+
+/// The result of a card lookup, or nothing (logged) when it failed
+fn or_empty<T: Default, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
+    result.unwrap_or_else(|e| {
+        tracing::error!("Failed to fetch {} for list: {}", what, e);
+        T::default()
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
