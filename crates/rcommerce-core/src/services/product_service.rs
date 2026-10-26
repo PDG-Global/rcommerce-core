@@ -145,7 +145,7 @@ impl ProductService {
 
 impl ProductService {
     /// Variants, images and options of a product, fetched concurrently
-    async fn load_related(
+    pub async fn load_related(
         &self,
         product_id: Uuid,
     ) -> Result<(
