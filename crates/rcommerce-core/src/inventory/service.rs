@@ -336,6 +336,19 @@ impl InventoryService {
         Ok(i32::try_from(available).unwrap_or(i32::MAX))
     }
 
+    /// Available quantity summed over every location and variant: the same number as
+    /// `get_product_inventory(..).total_available`, in one query.
+    pub async fn get_total_available(&self, product_id: uuid::Uuid) -> Result<i32> {
+        let available: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(available_quantity), 0) FROM inventory_levels WHERE product_id = $1",
+        )
+        .bind(product_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(i32::try_from(available).unwrap_or(i32::MAX))
+    }
+
     /// Helper: Get location name
     async fn get_location_name(&self, location_id: uuid::Uuid) -> Result<String> {
         let location = sqlx::query_as::<_, InventoryLocation>(

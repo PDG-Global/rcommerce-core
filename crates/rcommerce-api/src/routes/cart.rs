@@ -26,6 +26,11 @@ use serde::Deserialize;
 
 use uuid::Uuid;
 
+/// Whether a cart would hold more than the available stock
+fn exceeds_stock(in_cart: i64, requested: i32, available: i32) -> bool {
+    in_cart + i64::from(requested) > i64::from(available)
+}
+
 /// Create a new guest cart
 #[derive(Debug, Deserialize, Default)]
 pub struct GuestCartRequest {
@@ -260,11 +265,19 @@ pub async fn add_item_to_cart(
     } else {
         state
             .inventory_service
-            .get_product_inventory(target_product_id)
+            .get_total_available(target_product_id)
             .await?
-            .total_available
     };
-    let requested_total = request.quantity;
+    // Count what this cart already holds, or repeated adds could exceed the stock
+    let in_cart: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity), 0)::int8 FROM cart_items
+         WHERE cart_id = $1 AND product_id = $2 AND variant_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(cart_id)
+    .bind(request.product_id)
+    .bind(request.variant_id)
+    .fetch_one(state.db.pool())
+    .await?;
 
     if total_available <= 0 {
         return Err(Error::validation(format!(
@@ -273,7 +286,7 @@ pub async fn add_item_to_cart(
         )));
     }
 
-    if requested_total > total_available {
+    if exceeds_stock(in_cart, request.quantity, total_available) {
         return Err(Error::validation(format!(
             "Only {} units of '{}' are available",
             total_available, product_detail.product.title
@@ -350,6 +363,10 @@ pub async fn update_cart_item(
     if request.quantity < 0 {
         return Err(Error::validation("Quantity cannot be negative"));
     }
+    // Raising a line's quantity is subject to the same stock check as adding it
+    if request.quantity > 0 {
+        check_line_stock(&state, cart_id, item_id, request.quantity).await?;
+    }
 
     // Create update input
     let input = UpdateCartItemInput {
@@ -364,6 +381,45 @@ pub async fn update_cart_item(
         .await?;
 
     Ok(Json(cart_item))
+}
+
+/// Refuse a new quantity for a cart line when it exceeds the stock of the
+/// line's product (or variant)
+async fn check_line_stock(
+    state: &AppState,
+    cart_id: Uuid,
+    item_id: Uuid,
+    quantity: i32,
+) -> Result<(), Error> {
+    let line: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT product_id, variant_id FROM cart_items WHERE id = $1 AND cart_id = $2",
+    )
+    .bind(item_id)
+    .bind(cart_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    let (product_id, variant_id) = line.ok_or_else(|| Error::not_found("Cart item not found"))?;
+    let available = match variant_id {
+        Some(_) => {
+            state
+                .inventory_service
+                .get_available_stock_for_product(product_id, variant_id)
+                .await?
+        }
+        None => {
+            state
+                .inventory_service
+                .get_total_available(product_id)
+                .await?
+        }
+    };
+    if exceeds_stock(0, quantity, available) {
+        return Err(Error::validation(format!(
+            "Only {} units are available",
+            available
+        )));
+    }
+    Ok(())
 }
 
 /// Remove item from cart
@@ -509,4 +565,18 @@ pub fn router() -> Router<AppState> {
     // The server should use public_router() and protected_router() separately
     // with appropriate middleware
     public_router().merge(protected_router())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exceeds_stock;
+
+    #[test]
+    fn stock_check_counts_what_the_cart_holds() {
+        assert!(!exceeds_stock(0, 5, 5));
+        assert!(exceeds_stock(0, 6, 5));
+        assert!(!exceeds_stock(4, 1, 5));
+        assert!(exceeds_stock(5, 1, 5));
+        assert!(exceeds_stock(0, 1, 0));
+    }
 }
