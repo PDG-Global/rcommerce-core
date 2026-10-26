@@ -17,6 +17,7 @@ R commerce uses TOML format for configuration files, with support for environmen
 [logging]
 [cache]
 [security]
+[search]
 [compatibility]
 [migration]
 [features]
@@ -451,6 +452,45 @@ RCOMMERCE_SECURITY_JWT_SECRET=your_secret_here
 RCOMMERCE_SECURITY_API_KEY_SECRET_LENGTH=40
 RCOMMERCE_SECURITY_WEBHOOK_VERIFY_SIGNATURES=true
 ```
+
+## Search Configuration
+
+Catalogue search (`GET /api/v1/products?q=...`). The default uses PostgreSQL
+full-text search and needs no extra service. Elasticsearch is optional: it adds
+typo tolerance ("perseuse" finds "perceuse"), accent-insensitive matching,
+prefix matching while typing and infix matching inside compound words
+("boormachine" finds "accuboormachine"), and moves search load off the
+database.
+
+```toml
+[search]
+# "postgres" (default) or "elasticsearch"
+engine = "elasticsearch"
+elasticsearch_url = "http://localhost:9200"
+# elasticsearch_api_key = "base64-api-key"   # sent as "Authorization: ApiKey ..."
+
+# Alias the API searches; each full reindex builds a new index behind it
+index = "rcommerce-products"
+
+# Languages indexed (product translations, falling back to the base text).
+# The first one is used when a request asks for an unlisted language.
+# fr, nl, en and de get stemming and stop words; others are folded and lowercased.
+locales = ["en", "fr", "nl"]
+```
+
+How it behaves:
+
+- The index holds searchable text, category ids and the active flag only.
+  Product cards are always loaded from PostgreSQL, so prices and stock are
+  never stale.
+- On startup, if the alias does not exist, the index is built in the
+  background. Until then, and whenever Elasticsearch fails, search falls back
+  to PostgreSQL.
+- Creating, updating or deleting a product or a product translation through
+  the admin API re-indexes that product in the background.
+- After imports or direct SQL changes, rebuild the index with
+  `rcommerce search reindex`. It builds a new index and swaps the alias, so
+  search keeps working while it runs.
 
 ## Compatibility Configuration
 

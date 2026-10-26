@@ -274,9 +274,24 @@ async fn search_page(
     pagination: &PaginationParams,
 ) -> rcommerce_core::Result<ProductList> {
     let offset = (pagination.page - 1) * pagination.per_page;
-    let hits = i18n
-        .search_products(query, locale, category_id, pagination.per_page, offset)
-        .await?;
+    let limit = pagination.per_page;
+    let hits = match &state.catalog_search {
+        Some(search) => match search
+            .search(query, locale, category_id, limit, offset)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("Elasticsearch search failed, using PostgreSQL: {}", e);
+                i18n.search_products(query, locale, category_id, limit, offset)
+                    .await?
+            }
+        },
+        None => {
+            i18n.search_products(query, locale, category_id, limit, offset)
+                .await?
+        }
+    };
     let mut products = state
         .product_service
         .repository
@@ -547,6 +562,7 @@ pub async fn create_product(
     }
 
     let product = state.product_service.create_product(request).await?;
+    reindex_in_background(&state, vec![product.id]);
 
     Ok((
         StatusCode::CREATED,
@@ -574,6 +590,7 @@ pub async fn update_product(
     }
 
     let product = state.product_service.update_product(id, request).await?;
+    reindex_in_background(&state, vec![id]);
 
     Ok(Json(serde_json::json!({
         "id": product.id,
@@ -597,8 +614,22 @@ pub async fn delete_product(
     }
 
     state.product_service.delete_product(id).await?;
+    reindex_in_background(&state, vec![id]);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Re-index products in the search engine after an admin change (no-op
+/// without Elasticsearch). Runs in the background: a slow or unavailable search
+/// engine must not fail the admin request.
+fn reindex_in_background(state: &AppState, ids: Vec<Uuid>) {
+    if let Some(search) = state.catalog_search.clone() {
+        tokio::spawn(async move {
+            if let Err(e) = search.index_products(&ids).await {
+                tracing::error!("Search index update failed for {:?}: {}", ids, e);
+            }
+        });
+    }
 }
 
 /// Router for public product routes
@@ -794,6 +825,7 @@ pub async fn put_product_translation(
     let saved = CatalogI18nRepository::new(state.db.pool().clone())
         .upsert_product_translation(&translation)
         .await?;
+    reindex_in_background(&state, vec![id]);
     Ok(Json(saved))
 }
 
@@ -807,6 +839,7 @@ pub async fn delete_product_translation(
     let deleted = CatalogI18nRepository::new(state.db.pool().clone())
         .delete_product_translation(id, &path_locale(&locale)?)
         .await?;
+    reindex_in_background(&state, vec![id]);
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
