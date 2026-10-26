@@ -144,6 +144,12 @@ pub enum Commands {
     /// Show configuration
     Config,
 
+    /// Catalogue search index (Elasticsearch)
+    Search {
+        #[command(subcommand)]
+        command: SearchCommands,
+    },
+
     /// Email testing and management
     Email {
         #[command(subcommand)]
@@ -177,6 +183,13 @@ pub enum DbCommands {
 
     /// Show database status
     Status,
+}
+
+/// `rcommerce search` subcommands (Elasticsearch catalogue index)
+#[derive(Subcommand, Debug)]
+pub enum SearchCommands {
+    /// Rebuild the index from the database (after imports or bulk SQL changes)
+    Reindex,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1728,6 +1741,10 @@ async fn main() -> Result<()> {
             println!("{:#?}", config);
         }
 
+        Commands::Search { command } => match command {
+            SearchCommands::Reindex => reindex_search(&config).await?,
+        },
+
         Commands::Email { command } => {
             use colored::*;
 
@@ -1969,6 +1986,33 @@ async fn create_pool(config: &Config) -> Result<sqlx::PgPool> {
         .map_err(rcommerce_core::Error::Database)?;
 
     Ok(pool)
+}
+
+/// `rcommerce search reindex`: rebuild the Elasticsearch catalogue index from
+/// the database
+async fn reindex_search(config: &Config) -> Result<()> {
+    if !config.search.engine.eq_ignore_ascii_case("elasticsearch") {
+        eprintln!(
+            "{}",
+            "❌ Nothing to reindex: [search] engine is not \"elasticsearch\"".red()
+        );
+        std::process::exit(1);
+    }
+    let pool = create_pool(config).await?;
+    let catalog = rcommerce_core::search::ElasticsearchCatalog::new(&config.search, pool)?;
+    println!("{}", "Rebuilding the catalogue search index...".yellow());
+    let started = std::time::Instant::now();
+    match catalog.reindex_all().await {
+        Ok(count) => println!(
+            "{}",
+            format!("✅ Indexed {} products in {:.1?}", count, started.elapsed()).green()
+        ),
+        Err(e) => {
+            eprintln!("{}", format!("❌ Reindex failed: {}", e).red());
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 /// Run database migrations
