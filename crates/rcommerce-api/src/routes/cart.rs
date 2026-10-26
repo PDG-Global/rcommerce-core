@@ -120,6 +120,10 @@ pub async fn add_item_to_cart(
         .get_product(request.product_id)
         .await?
         .ok_or_else(|| Error::not_found("Product not found"))?;
+    // Inactive products are drafts: not for sale
+    if !product_detail.product.is_active {
+        return Err(Error::not_found("Product not found"));
+    }
 
     // Bundle products are expanded into their components.
     if product_detail.product.product_type == rcommerce_core::models::ProductType::Bundle {

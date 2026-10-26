@@ -387,6 +387,12 @@ GET    /v1/categories/:id           # Get category
 - `q` - Search query
 - `page`, `per_page` - Pagination
 
+**Drafts and missing items:** `GET /v1/products/:id` (id or slug) and
+`GET /v1/categories/:slug` answer `404 Not Found` with the standard error body when
+the item does not exist. Inactive (draft) products are only returned to admins:
+other callers get `404`, category pages list active products only, and drafts
+cannot be added to a cart.
+
 ### Orders
 
 ```

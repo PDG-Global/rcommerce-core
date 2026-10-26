@@ -297,7 +297,7 @@ impl CategoryRepository for PostgresCategoryRepository {
             r#"
             SELECT p.* FROM products p
             INNER JOIN product_category_relations pcr ON p.id = pcr.product_id
-            WHERE pcr.category_id = $1
+            WHERE pcr.category_id = $1 AND p.is_active = true
             ORDER BY p.created_at DESC
             LIMIT $2 OFFSET $3
             "#,

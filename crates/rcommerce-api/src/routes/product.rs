@@ -202,11 +202,21 @@ pub struct ListProductsParams {
     per_page: Option<i64>,
 }
 
-/// Get product by ID or slug from database
+/// Whether a product can be shown publicly: inactive products are drafts,
+/// visible to admins only
+fn product_visible(is_active: bool, auth: Option<&JwtAuth>) -> bool {
+    is_active || auth.is_some_and(|a| a.is_admin())
+}
+
+/// Get product by ID or slug from database (404 when missing or a draft)
 pub async fn get_product(
     State(state): State<AppState>,
+    // Set by optional_auth_middleware; absent (anonymous) when a router mounts
+    // this route without it
+    auth: Option<Extension<Option<JwtAuth>>>,
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, rcommerce_core::Error> {
+    let auth = auth.and_then(|Extension(auth)| auth);
     // Try UUID first, fall back to slug lookup
     let product_detail = if let Ok(uuid) = Uuid::parse_str(&id) {
         state.product_service.get_product(uuid).await
@@ -214,20 +224,11 @@ pub async fn get_product(
         state.product_service.get_product_by_slug(&id).await
     };
 
-    let product_detail = match product_detail {
-        Ok(Some(detail)) => detail,
-        Ok(None) => {
-            return Json(serde_json::json!({
-                "error": "Product not found"
-            }));
-        }
-        Err(e) => {
-            tracing::error!("Failed to get product {}: {}", id, e);
-            return Json(serde_json::json!({
-                "error": "Failed to retrieve product"
-            }));
-        }
-    };
+    let not_found = || rcommerce_core::Error::not_found("Product not found");
+    let product_detail = product_detail?.ok_or_else(not_found)?;
+    if !product_visible(product_detail.product.is_active, auth.as_ref()) {
+        return Err(not_found());
+    }
 
     let p = product_detail.product;
     // Bundles report stock derived from their required components
@@ -252,7 +253,7 @@ pub async fn get_product(
         .map(|c| serde_json::json!({"id": c.id, "name": c.name, "slug": c.slug}))
         .collect();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
     "product": {
         "id": p.id,
         "title": p.title,
@@ -303,7 +304,7 @@ pub async fn get_product(
                     })).collect::<Vec<_>>()
                 })).collect::<Vec<_>>()
             }
-        }))
+        })))
 }
 
 /// Derive a short purchase-option label from a pack product's title.
@@ -491,49 +492,40 @@ pub async fn list_categories(State(state): State<AppState>) -> Json<serde_json::
     }
 }
 
-/// Get a single category by slug and include its products
+/// Get a single category by slug and include its (active) products; 404 when missing
 pub async fn get_category(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, rcommerce_core::Error> {
     let cat_repo = PostgresCategoryRepository::new(state.db.pool().clone());
-    match cat_repo.get_by_slug(&slug).await {
-        Ok(Some(category)) => {
-            let products = match cat_repo.get_products(category.id, 100, 0).await {
-                Ok(products) => products
-                    .into_iter()
-                    .map(|p| {
-                        serde_json::json!({
-                            "id": p.id,
-                            "title": p.title,
-                            "slug": p.slug,
-                            "price": p.price,
-                            "currency": p.currency,
-                            "is_active": p.is_active,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                Err(e) => {
-                    tracing::error!("Failed to fetch category products: {}", e);
-                    vec![]
-                }
-            };
-            Json(serde_json::json!({
-                "category": {
-                    "id": category.id,
-                    "name": category.name,
-                    "slug": category.slug,
-                    "description": category.description,
-                },
-                "products": products,
-            }))
-        }
-        Ok(None) => Json(serde_json::json!({ "error": "Category not found" })),
-        Err(e) => {
-            tracing::error!("Failed to get category: {}", e);
-            Json(serde_json::json!({ "error": "Failed to retrieve category" }))
-        }
-    }
+    let category = cat_repo
+        .get_by_slug(&slug)
+        .await?
+        .ok_or_else(|| rcommerce_core::Error::not_found("Category not found"))?;
+    let products: Vec<serde_json::Value> = cat_repo
+        .get_products(category.id, 100, 0)
+        .await?
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "title": p.title,
+                "slug": p.slug,
+                "price": p.price,
+                "currency": p.currency,
+                "is_active": p.is_active,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "category": {
+            "id": category.id,
+            "name": category.name,
+            "slug": category.slug,
+            "description": category.description,
+        },
+        "products": products,
+    })))
 }
 
 /// Router for admin product routes (requires admin middleware to be applied by caller)
@@ -576,6 +568,24 @@ mod tests {
             "4 Pack"
         );
         assert_eq!(pack_option_label("McFly Value Pack", "McFly"), "Value Pack");
+    }
+
+    #[test]
+    fn drafts_are_visible_to_admins_only() {
+        let customer = JwtAuth {
+            customer_id: uuid::Uuid::new_v4(),
+            email: "c@example.com".to_string(),
+            permissions: vec!["read".to_string()],
+        };
+        let admin = JwtAuth {
+            permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            ..customer.clone()
+        };
+        assert!(product_visible(true, None));
+        assert!(product_visible(true, Some(&customer)));
+        assert!(!product_visible(false, None));
+        assert!(!product_visible(false, Some(&customer)));
+        assert!(product_visible(false, Some(&admin)));
     }
 
     #[test]
