@@ -416,7 +416,13 @@ POST   /v1/orders/:id/payments      # Process payment
 POST   /v1/orders/:id/fulfillments  # Create fulfillment
 POST   /v1/orders/:id/cancel        # Cancel order
 POST   /v1/orders/:id/refund        # Process refund
+```
 
+`POST /v1/orders` creates the order for the authenticated customer; the request's
+`customer_id` is only honoured for admins (orders on behalf of a customer). Orders
+are created in the store's `default_currency`.
+
+```
 GET    /v1/orders/:id/notes         # List order notes
 POST   /v1/orders/:id/notes         # Add note
 ```

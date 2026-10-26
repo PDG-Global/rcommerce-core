@@ -337,15 +337,27 @@ pub async fn get_order(
     }))
 }
 
+/// The customer a new order belongs to: the caller, unless an admin creates
+/// it on behalf of another customer (or as a guest order)
+fn order_customer_id(is_admin: bool, caller: Uuid, requested: Option<Uuid>) -> Option<Uuid> {
+    if is_admin {
+        requested
+    } else {
+        Some(caller)
+    }
+}
+
 /// Create a new order
 ///
 /// This endpoint now integrates with TaxService and ShippingService for accurate calculations.
 /// For a full checkout flow with shipping selection, use the /checkout endpoints.
 pub async fn create_order(
     State(state): State<AppState>,
-    Extension(_auth): Extension<JwtAuth>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<(StatusCode, Json<OrderResponse>), (StatusCode, Json<serde_json::Value>)> {
+    let customer_id = order_customer_id(auth.is_admin(), auth.customer_id, request.customer_id);
+
     // Validate email
     if request.customer_email.is_empty() || !request.customer_email.contains('@') {
         return Err((
@@ -454,7 +466,7 @@ pub async fn create_order(
         // Calculate tax based on shipping address
         let tax_context = rcommerce_core::tax::TaxContext {
             customer: rcommerce_core::tax::CustomerTaxInfo {
-                customer_id: request.customer_id,
+                customer_id,
                 is_tax_exempt: false,
                 vat_id: None,
                 exemptions: vec![],
@@ -566,10 +578,11 @@ pub async fn create_order(
     let order_id = Uuid::new_v4();
 
     // Create order
-    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(
+    // Order reads `currency_text`, so return the same column list as the other order queries
+    let insert_sql = format!(
         r#"
         INSERT INTO orders (
-            id, order_number, customer_id, email,
+            id, order_number, customer_id, customer_email,
             status, payment_status, fulfillment_status,
             currency, subtotal, tax_total, shipping_total, discount_total, total,
             notes, tags, metadata, draft, order_type
@@ -577,23 +590,25 @@ pub async fn create_order(
         VALUES (
             $1, $2, $3, $4,
             'pending', 'pending', 'pending',
-            'USD', $5, $6, $7, 0, $8,
-            $9, ARRAY[]::TEXT[], '{}'::JSONB, false, 'one_time'
+            UPPER($10)::currency, $5, $6, $7, 0, $8,
+            $9, ARRAY[]::TEXT[], '{{}}'::JSONB, false, 'one_time'
         )
-        RETURNING *
-        "#,
-    )
-    .bind(order_id)
-    .bind(&order_number)
-    .bind(request.customer_id)
-    .bind(&request.customer_email)
-    .bind(subtotal)
-    .bind(tax_total)
-    .bind(shipping_total)
-    .bind(total)
-    .bind(request.notes)
-    .fetch_one(state.db.pool())
-    .await
+        RETURNING {ORDER_COLUMNS}
+        "#
+    );
+    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(&insert_sql)
+        .bind(order_id)
+        .bind(&order_number)
+        .bind(customer_id)
+        .bind(&request.customer_email)
+        .bind(subtotal)
+        .bind(tax_total)
+        .bind(shipping_total)
+        .bind(total)
+        .bind(request.notes)
+        .bind(&state.default_currency)
+        .fetch_one(state.db.pool())
+        .await
     {
         Ok(o) => o,
         Err(e) => {
@@ -1088,4 +1103,29 @@ pub fn router() -> Router<AppState> {
         .route("/orders/:id/cancel", post(cancel_order))
         .route("/orders/:id/refund", post(refund_order))
         .route("/orders/:id/status", put(update_order_status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_customer_id;
+    use uuid::Uuid;
+
+    #[test]
+    fn customers_create_orders_for_themselves() {
+        let caller = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert_eq!(order_customer_id(false, caller, Some(other)), Some(caller));
+        assert_eq!(order_customer_id(false, caller, None), Some(caller));
+    }
+
+    #[test]
+    fn admins_may_create_orders_for_anyone() {
+        let admin = Uuid::new_v4();
+        let customer = Uuid::new_v4();
+        assert_eq!(
+            order_customer_id(true, admin, Some(customer)),
+            Some(customer)
+        );
+        assert_eq!(order_customer_id(true, admin, None), None);
+    }
 }
