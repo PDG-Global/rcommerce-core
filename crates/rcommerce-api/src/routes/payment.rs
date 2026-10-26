@@ -6,12 +6,13 @@
 use axum::{
     extract::{Path, State},
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::middleware::JwtAuth;
 use crate::state::AppState;
 use rcommerce_core::payment::agnostic::*;
 use rcommerce_core::Error;
@@ -98,6 +99,7 @@ pub struct InitiatePaymentApiRequest {
 /// Initiate a payment
 pub async fn initiate_payment(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<InitiatePaymentApiRequest>,
 ) -> Result<Json<InitiatePaymentResponse>, Error> {
     // Parse amount
@@ -109,6 +111,8 @@ pub async fn initiate_payment(
     // Parse order_id
     let order_id = Uuid::parse_str(&request.order_id)
         .map_err(|_| Error::validation("Invalid order_id format"))?;
+
+    authorize_order_payment(&state, &auth, order_id, amount, &request.currency).await?;
 
     // Log idempotency key if provided
     if let Some(ref key) = request.idempotency_key {
@@ -180,9 +184,12 @@ pub struct CompletePaymentActionApiRequest {
 
 pub async fn complete_payment_action(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
     Json(request): Json<CompletePaymentActionApiRequest>,
 ) -> Result<Json<CompletePaymentActionResponse>, Error> {
+    authorize_payment(&state, &auth, &payment_id).await?;
+
     // Get the gateway - we need to determine which gateway this payment belongs to
     // For now, we'll use the default gateway from the payment service
     // In production, you'd look up the payment in the database to find the gateway
@@ -251,6 +258,79 @@ struct PaymentRow {
     updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The stored payment for a gateway payment id, if the caller may act on it: an
+/// admin, or the customer of the payment's order. Anything else is reported as
+/// not found so payment ids cannot be probed.
+async fn authorize_payment(
+    state: &AppState,
+    auth: &JwtAuth,
+    gateway_payment_id: &str,
+) -> Result<Option<PaymentRow>, Error> {
+    let row = find_payment_by_gateway_id(&state.db, gateway_payment_id).await?;
+    if auth.is_admin() {
+        return Ok(row);
+    }
+    let Some(row) = row else {
+        return Err(Error::not_found("Payment not found"));
+    };
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT customer_id FROM orders WHERE id = $1")
+        .bind(row.order_id)
+        .fetch_optional(state.db.pool())
+        .await?
+        .flatten();
+    if may_act_on_order(false, owner, auth.customer_id) {
+        Ok(Some(row))
+    } else {
+        Err(Error::not_found("Payment not found"))
+    }
+}
+
+/// The amount and currency of a new payment come from the client: they must
+/// match the order, and only the order's customer (or an admin) may pay it.
+/// Another customer's order is reported as not found.
+async fn authorize_order_payment(
+    state: &AppState,
+    auth: &JwtAuth,
+    order_id: Uuid,
+    amount: rust_decimal::Decimal,
+    currency: &str,
+) -> Result<(), Error> {
+    let order: Option<(Option<Uuid>, rust_decimal::Decimal, String)> =
+        sqlx::query_as("SELECT customer_id, total, currency::text FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    let Some((owner, total, order_currency)) = order else {
+        return Err(Error::not_found("Order not found"));
+    };
+    if !may_act_on_order(auth.is_admin(), owner, auth.customer_id) {
+        return Err(Error::not_found("Order not found"));
+    }
+    if !amount_matches_order(amount, currency, total, &order_currency) {
+        return Err(Error::validation(
+            "Amount and currency must match the order total",
+        ));
+    }
+    Ok(())
+}
+
+/// Admins may act on any order; customers only on their own (guest orders,
+/// with no customer, are not reachable through these authenticated routes)
+fn may_act_on_order(is_admin: bool, order_owner: Option<Uuid>, caller: Uuid) -> bool {
+    is_admin || order_owner == Some(caller)
+}
+
+/// A client-supplied amount and currency are only accepted when they are the
+/// order's own (currency codes compare case-insensitively)
+fn amount_matches_order(
+    amount: rust_decimal::Decimal,
+    currency: &str,
+    order_total: rust_decimal::Decimal,
+    order_currency: &str,
+) -> bool {
+    amount == order_total && currency.eq_ignore_ascii_case(order_currency)
+}
+
 /// Look up a stored payment by the gateway's payment/transaction id
 async fn find_payment_by_gateway_id(
     db: &rcommerce_core::repository::Database,
@@ -276,8 +356,11 @@ async fn find_payment_by_gateway_id(
 /// Get payment status
 pub async fn get_payment_status(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
 ) -> Result<Json<PaymentStatusResponse>, Error> {
+    let payment_row = authorize_payment(&state, &auth, &payment_id).await?;
+
     // Get the gateway
     let gateway = state
         .payment_service
@@ -286,9 +369,6 @@ pub async fn get_payment_status(
 
     // Get payment status from gateway
     let status = gateway.get_payment_status(&payment_id).await?;
-
-    // Enrich the response with the stored payment record when available
-    let payment_row = find_payment_by_gateway_id(&state.db, &payment_id).await?;
 
     info!("Retrieved payment status for {}: {:?}", payment_id, status);
 
@@ -332,9 +412,15 @@ pub struct RefundRequest {
 
 pub async fn refund_payment(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
     Json(request): Json<RefundRequest>,
 ) -> Result<Json<RefundResponse>, Error> {
+    // Refunds move money back: admins only, like POST /orders/:id/refund
+    if !auth.is_admin() {
+        return Err(Error::forbidden("Admin access required"));
+    }
+
     // Parse amount if provided
     let amount = match request.amount {
         Some(amt_str) => {
@@ -481,6 +567,7 @@ pub struct SavePaymentMethodRequest {
 
 pub async fn save_payment_method(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<SavePaymentMethodRequest>,
 ) -> Result<Json<PaymentMethodToken>, Error> {
     // Get the gateway
@@ -494,7 +581,8 @@ pub async fn save_payment_method(
         .tokenize_payment_method(request.payment_method_data)
         .await?;
 
-    info!("Payment method tokenized: {}", token.token);
+    // Never log the token itself: it is a reusable payment credential
+    info!("Payment method tokenized for customer {}", auth.customer_id);
 
     Ok(Json(token))
 }
@@ -502,8 +590,13 @@ pub async fn save_payment_method(
 /// Get saved payment methods for a customer
 pub async fn get_saved_payment_methods(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(customer_id): Path<String>,
 ) -> Result<Json<Vec<PaymentMethodInfo>>, Error> {
+    if !auth.is_admin() && customer_id != auth.customer_id.to_string() {
+        return Err(Error::not_found("Customer not found"));
+    }
+
     // Get the default gateway
     let gateway = state
         .payment_service
@@ -533,6 +626,7 @@ pub struct DeletePaymentMethodResponse {
 /// Delete a saved payment method
 pub async fn delete_payment_method(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(token): Path<String>,
 ) -> Result<Json<DeletePaymentMethodResponse>, Error> {
     // Get the default gateway
@@ -541,10 +635,23 @@ pub async fn delete_payment_method(
         .get_gateway(None)
         .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
 
+    // Customers may only delete their own saved methods
+    if !auth.is_admin() {
+        let own = gateway
+            .get_saved_payment_methods(&auth.customer_id.to_string())
+            .await?;
+        if !own
+            .iter()
+            .any(|m| m.token.as_deref() == Some(token.as_str()))
+        {
+            return Err(Error::not_found("Payment method not found"));
+        }
+    }
+
     // Delete the payment method
     gateway.delete_payment_method(&token).await?;
 
-    info!("Payment method deleted: {}", token);
+    info!("Payment method deleted for customer {}", auth.customer_id);
 
     Ok(Json(DeletePaymentMethodResponse {
         success: true,
@@ -1248,6 +1355,30 @@ pub fn payment_routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_admins_and_owners_act_on_an_order() {
+        let owner = Uuid::new_v4();
+        assert!(may_act_on_order(false, Some(owner), owner));
+        assert!(!may_act_on_order(false, Some(owner), Uuid::new_v4()));
+        assert!(!may_act_on_order(false, None, owner));
+        assert!(may_act_on_order(true, Some(owner), Uuid::new_v4()));
+        assert!(may_act_on_order(true, None, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn payment_amount_must_be_the_order_total() {
+        let total = rust_decimal::Decimal::new(22129, 2); // 221.29
+        assert!(amount_matches_order(total, "eur", total, "EUR"));
+        assert!(!amount_matches_order(
+            rust_decimal::Decimal::new(1, 2),
+            "EUR",
+            total,
+            "EUR"
+        ));
+        assert!(!amount_matches_order(total, "USD", total, "EUR"));
+        assert!(!amount_matches_order(total + total, "EUR", total, "EUR"));
+    }
 
     #[test]
     fn test_webhook_action_mapping() {
