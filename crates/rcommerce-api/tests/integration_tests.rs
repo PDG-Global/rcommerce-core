@@ -413,6 +413,16 @@ impl TestApp {
         Ok((customer, password))
     }
 
+    /// Create an admin account and return its access token
+    pub async fn admin_token(&self) -> anyhow::Result<String> {
+        let (customer, password) = self.create_test_customer().await?;
+        sqlx::query("UPDATE customers SET role = 'admin' WHERE id = $1")
+            .bind(customer.id)
+            .execute(&self.db_pool)
+            .await?;
+        self.login(&customer.email, &password).await
+    }
+
     /// Login a customer and return the JWT token
     pub async fn login(&self, email: &str, password: &str) -> anyhow::Result<String> {
         let response = self
@@ -1419,6 +1429,58 @@ async fn test_health_check() {
         "Expected success status, got {}",
         response.status()
     );
+}
+
+/// Test 11: Admin product management goes through the admin routes
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_admin_can_create_product() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let product = serde_json::json!({
+        "title": "Admin Test Product",
+        "slug": format!("admin-test-product-{}", Uuid::new_v4().simple()),
+        "product_type": "Simple",
+        "price": "12.50",
+        "currency": "EUR",
+        "inventory_quantity": 0,
+        "inventory_policy": "Deny",
+        "inventory_management": true,
+        "continues_selling_when_out_of_stock": false,
+        "requires_shipping": true,
+        "is_active": true,
+        "is_featured": false
+    });
+    let url = format!("{}/api/v1/products", app.base_url());
+
+    // A customer token is refused
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&customer_token)
+        .json(&product)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    // An admin creates the product (500 "Missing request extension" before
+    // the admin middleware passed the caller on)
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&admin)
+        .json(&product)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status, 201, "{body}");
+
+    app.cleanup().await.ok();
 }
 
 /// Helper macro for running tests with reporting

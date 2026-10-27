@@ -362,7 +362,7 @@ pub async fn rate_limit_middleware(
 /// Admin-only middleware
 pub async fn admin_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Get Authorization header
@@ -392,6 +392,13 @@ pub async fn admin_middleware(
     if !claims.permissions.contains(&"admin".to_string()) {
         return Err(StatusCode::FORBIDDEN);
     }
+
+    // Admin handlers read the caller from the request, as behind auth_middleware
+    request.extensions_mut().insert(JwtAuth {
+        customer_id: claims.sub,
+        email: claims.email,
+        permissions: claims.permissions,
+    });
 
     Ok(next.run(request).await)
 }
