@@ -327,8 +327,7 @@ async fn send_verification_email(
     let verification_token = state
         .auth_service
         .generate_email_verification_token(customer.id, &customer.email)?;
-    let store_url =
-        std::env::var("STOREFRONT_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let store_url = &state.storefront_url;
     let verification_link = format!(
         "{}/account/verify-email?token={}",
         store_url, verification_token
@@ -411,8 +410,7 @@ pub async fn request_password_reset(
         .generate_password_reset_token(customer.id, &customer.email)?;
 
     // Send reset email via SMTP if configured
-    let store_url =
-        std::env::var("STOREFRONT_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let store_url = &state.storefront_url;
     let reset_link = format!("{}/account/reset-password?token={}", store_url, reset_token);
 
     if let Some(ref notification_service) = state.notification_service {

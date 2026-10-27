@@ -1972,9 +1972,19 @@ async fn create_pool(config: &Config) -> Result<sqlx::PgPool> {
 }
 
 /// Run database migrations
+/// Migrate the database, or every store's database when the configuration
+/// defines several stores
 async fn run_migrations(config: &Config) -> Result<()> {
-    let pool = create_pool(config).await?;
-    rcommerce_core::auto_migrate(&pool).await?;
+    let stores = config.expand_stores()?;
+    if stores.is_empty() {
+        let pool = create_pool(config).await?;
+        rcommerce_core::auto_migrate(&pool).await?;
+    }
+    for store in &stores {
+        info!("Migrating store {}", store.definition.slug);
+        let pool = create_pool(&store.config).await?;
+        rcommerce_core::auto_migrate(&pool).await?;
+    }
     Ok(())
 }
 

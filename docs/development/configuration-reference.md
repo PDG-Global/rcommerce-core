@@ -452,6 +452,29 @@ RCOMMERCE_SECURITY_API_KEY_SECRET_LENGTH=40
 RCOMMERCE_SECURITY_WEBHOOK_VERIFY_SIGNATURES=true
 ```
 
+## Several Stores
+
+One process can serve several isolated stores, each with its own database, token secret and audience, upload directory and payment credentials, selected by host name. See [Several stores in one process](../deployment/multi-store.md).
+
+```toml
+[stores.shop-a]
+hostnames = ["shop-a.example"]
+role = "merchant"            # or "catalogue"
+
+[stores.shop-a.database]
+database = "rc_shop_a"
+
+[stores.shop-a.security.jwt]
+secret = "a-different-secret-of-at-least-32-bytes"
+```
+
+Related settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `security.jwt.audience` | `rcommerce-api` (`rcommerce-api:<store>` for a store) | `aud` of issued tokens, required on every token |
+| `server.trust_forwarded_host` | `false` | Choose the store from `X-Forwarded-Host` (trusted reverse proxy only) |
+
 ## Compatibility Configuration
 
 ```toml
