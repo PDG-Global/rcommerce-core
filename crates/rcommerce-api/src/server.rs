@@ -1114,6 +1114,8 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::newsletter_router())
         // Product reviews are publicly readable
         .merge(crate::routes::review_public_router())
+        // Branches and pickup points with their opening hours
+        .merge(crate::routes::location_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             optional_auth_middleware,
@@ -1156,6 +1158,7 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
     let admin_routes = Router::new()
         .merge(crate::routes::admin_router())
         .merge(crate::routes::product_admin_router())
+        .merge(crate::routes::location_admin_router())
         .merge(crate::routes::review_admin_router())
         .merge(crate::routes::statistics_router())
         .merge(crate::routes::coupon_router())

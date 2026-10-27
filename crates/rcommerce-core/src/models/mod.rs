@@ -7,6 +7,7 @@ pub mod address;
 pub mod cart;
 pub mod coupon;
 pub mod customer;
+pub mod location;
 pub mod newsletter;
 pub mod order;
 pub mod product;

@@ -12,6 +12,7 @@ pub mod category_repository;
 pub mod coupon_repository;
 pub mod fulfillment_repository;
 pub mod inventory_repository;
+pub mod location_repository;
 pub mod notification_repository;
 pub mod order_repository;
 pub mod statistics_repository;
@@ -27,6 +28,7 @@ pub use category_repository::{CategoryRepository, CategoryTreeNode, PostgresCate
 pub use coupon_repository::{CouponRepository, PgCouponRepository};
 pub use fulfillment_repository::{FulfillmentRepository, PostgresFulfillmentRepository};
 pub use inventory_repository::{InventoryRepository, PostgresInventoryRepository};
+pub use location_repository::LocationRepository;
 pub use notification_repository::{NotificationRepository, PostgresNotificationRepository};
 pub use order_repository::{OrderFilter, OrderRepository, PostgresOrderRepository};
 pub use statistics_repository::{
