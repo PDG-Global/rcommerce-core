@@ -316,6 +316,18 @@ health_check = true
 experimental = false
 
 # =============================================================================
+# CATALOGUE SEARCH
+# =============================================================================
+# PostgreSQL full-text search is the default. Uncomment to use Elasticsearch
+# (typo tolerance, accent-insensitive and compound-word matching); see
+# docs/development/configuration-reference.md#search-configuration
+# [search]
+# engine = "elasticsearch"
+# elasticsearch_url = "http://localhost:9200"
+# index = "rcommerce-products"
+# locales = ["en", "fr", "nl"]
+
+# =============================================================================
 # IMPORT & MIGRATIONS
 # =============================================================================
 [import]

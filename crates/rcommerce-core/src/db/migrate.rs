@@ -204,6 +204,11 @@ impl Migrator {
                 "default_warehouse",
                 include_str!("../../migrations/021_default_warehouse.sql"),
             ),
+            (
+                22,
+                "catalog_translations",
+                include_str!("../../migrations/022_catalog_translations.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {

@@ -66,6 +66,54 @@ pub struct Config {
     /// carts and anywhere a money amount needs a default currency.
     #[serde(default = "default_currency_string")]
     pub default_currency: String,
+
+    /// Catalogue search backend
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+/// Catalogue search: PostgreSQL full-text search (default) or Elasticsearch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// "postgres" or "elasticsearch"
+    #[serde(default = "default_search_engine")]
+    pub engine: String,
+    /// Elasticsearch base URL, e.g. "http://localhost:9200"
+    #[serde(default)]
+    pub elasticsearch_url: Option<String>,
+    /// Elasticsearch API key (sent as `Authorization: ApiKey <key>`)
+    #[serde(default)]
+    pub elasticsearch_api_key: Option<String>,
+    /// Index alias; each full reindex builds a new index and swaps the alias
+    #[serde(default = "default_search_index")]
+    pub index: String,
+    /// Languages to index; each gets language-specific analysed fields
+    #[serde(default = "default_search_locales")]
+    pub locales: Vec<String>,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            engine: default_search_engine(),
+            elasticsearch_url: None,
+            elasticsearch_api_key: None,
+            index: default_search_index(),
+            locales: default_search_locales(),
+        }
+    }
+}
+
+fn default_search_engine() -> String {
+    "postgres".to_string()
+}
+
+fn default_search_index() -> String {
+    "rcommerce-products".to_string()
+}
+
+fn default_search_locales() -> Vec<String> {
+    vec!["en".to_string()]
 }
 
 fn default_currency_string() -> String {

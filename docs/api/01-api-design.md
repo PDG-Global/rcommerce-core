@@ -402,6 +402,44 @@ the item does not exist. Inactive (draft) products are only returned to admins:
 other callers get `404`, category pages list active products only, and drafts
 cannot be added to a cart.
 
+**Languages (`?lang=`):** products and categories keep their base-language text in
+their own rows; translations are stored per language (`product_translations`,
+`category_translations`). Storefront routes take `?lang=fr` (or `fr-BE`, read as
+`fr`) and return the translated title, slug, description and SEO fields where a
+translation exists, the base text otherwise; the `locale` field says which. The
+language is a query parameter rather than `Accept-Language`, so caches key on the URL.
+
+- `GET /v1/products/:slug` resolves a slug in the requested language, then the base
+  slug, then any other language (a link shared from another language). The response
+  lists `alternates`: `[{"locale": "nl", "slug": "..."}]` for hreflang links.
+- `GET /v1/products?category=` accepts base or translated category slugs.
+- `GET /v1/categories?lang=` and `GET /v1/categories/:slug?lang=` return translated
+  names and slugs.
+
+**Search (`?q=`):** PostgreSQL full-text search, ranked, with the stemmer of the
+requested language (English, French, Dutch, German, Spanish, Italian, Portuguese;
+`simple` otherwise). Every word must match, either as the prefix of a title word
+("perc" finds "perceuse") or as a whole word in the title or description, so a short
+word does not match longer description words ("colle" vs "click & collect"). When
+nothing matches, titles are searched by substring, which finds words inside
+compounds the stemmers do not split (Dutch "boormachine" in "accuboormachine").
+Results are ordered by relevance, then newest first.
+
+**Managing translations** (admin):
+
+```
+GET    /v1/products/:id/translations            # All translations of a product
+PUT    /v1/products/:id/translations/:locale    # Create or replace one
+DELETE /v1/products/:id/translations/:locale
+PUT    /v1/categories/:id/translations/:locale
+DELETE /v1/categories/:id/translations/:locale
+```
+
+Body of the `PUT` routes: `{"title": "...", "slug": "...", "description": null,
+"seo_title": null, "seo_description": null}` (`name` is accepted instead of `title`
+for categories). Slugs are lowercase letters, digits and single hyphens and unique
+per language; a duplicate answers `400`.
+
 ### Orders
 
 ```

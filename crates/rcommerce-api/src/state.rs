@@ -149,6 +149,9 @@ pub struct AppState {
     pub default_currency: String,
     /// Airwallex settlement reconciliation client (None when unconfigured)
     pub settlement_sync: Option<Arc<rcommerce_core::accounting::SettlementSync>>,
+    /// Elasticsearch catalogue search (`[search] engine = "elasticsearch"`);
+    /// None = PostgreSQL full-text search
+    pub catalog_search: Option<Arc<rcommerce_core::search::ElasticsearchCatalog>>,
 }
 
 impl AppState {
@@ -268,6 +271,7 @@ impl AppState {
             accounting: params.accounting,
             default_currency: params.default_currency,
             settlement_sync,
+            catalog_search: None,
         }
     }
 }

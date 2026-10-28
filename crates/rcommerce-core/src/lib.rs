@@ -16,6 +16,7 @@ pub mod order;
 pub mod payment;
 pub mod performance;
 pub mod repository;
+pub mod search;
 pub mod services;
 pub mod shipping;
 pub mod tax;
