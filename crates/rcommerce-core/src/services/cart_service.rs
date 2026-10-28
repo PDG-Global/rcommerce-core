@@ -184,6 +184,51 @@ impl CartService {
         Ok(weights)
     }
 
+    /// Total component weight (kg) for each bundle product in `parent_ids`:
+    /// sum of component quantity x component product weight. Parents with no
+    /// components (or only weightless ones) are absent from the map. Used to
+    /// rate bundle parents that have no weight of their own (e.g. race packs).
+    pub async fn get_bundle_component_weights(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Decimal>> {
+        use std::collections::HashMap;
+
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::internal("Database not available"))?;
+        let mut derived = HashMap::new();
+
+        for chunk in parent_ids.chunks(100) {
+            let rows: Vec<(Uuid, Decimal)> = sqlx::query_as(
+                r#"
+                SELECT bc.bundle_product_id,
+                       SUM(bc.quantity * CASE p.weight_unit::text
+                           WHEN 'lb' THEN p.weight * 0.453592
+                           WHEN 'oz' THEN p.weight * 0.0283495
+                           ELSE p.weight
+                       END)
+                FROM bundle_components bc
+                JOIN products p ON bc.component_product_id = p.id
+                WHERE bc.bundle_product_id = ANY($1)
+                  AND bc.is_optional = false
+                  AND p.weight IS NOT NULL
+                GROUP BY bc.bundle_product_id
+                "#,
+            )
+            .bind(chunk)
+            .fetch_all(db.pool())
+            .await?;
+
+            for (parent_id, weight_kg) in rows {
+                derived.insert(parent_id, weight_kg);
+            }
+        }
+
+        Ok(derived)
+    }
+
     /// Get product categories for cart items (product_id -> category_slug)
     pub async fn get_product_categories(
         &self,

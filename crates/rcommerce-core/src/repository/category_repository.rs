@@ -79,6 +79,43 @@ impl PostgresCategoryRepository {
     pub fn new(db: sqlx::PgPool) -> Self {
         Self { db }
     }
+
+    /// Categories of several products in one query (listing pages), ordered like
+    /// `get_product_categories`
+    pub async fn categories_for_products(
+        &self,
+        product_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ProductCategory>>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            product_id: Uuid,
+            #[sqlx(flatten)]
+            category: ProductCategory,
+        }
+
+        let mut by_product: std::collections::HashMap<Uuid, Vec<ProductCategory>> =
+            std::collections::HashMap::new();
+        if product_ids.is_empty() {
+            return Ok(by_product);
+        }
+        let rows = sqlx::query_as::<_, Row>(
+            "SELECT pcr.product_id, c.* FROM product_categories c
+             INNER JOIN product_category_relations pcr ON c.id = pcr.category_id
+             WHERE pcr.product_id = ANY($1)
+             ORDER BY c.sort_order, c.name",
+        )
+        .bind(product_ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| Error::Other(format!("Failed to fetch product categories: {}", e)))?;
+        for row in rows {
+            by_product
+                .entry(row.product_id)
+                .or_default()
+                .push(row.category);
+        }
+        Ok(by_product)
+    }
 }
 
 #[async_trait]
@@ -297,7 +334,7 @@ impl CategoryRepository for PostgresCategoryRepository {
             r#"
             SELECT p.* FROM products p
             INNER JOIN product_category_relations pcr ON p.id = pcr.product_id
-            WHERE pcr.category_id = $1
+            WHERE pcr.category_id = $1 AND p.is_active = true
             ORDER BY p.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -358,5 +395,102 @@ impl CategoryRepository for PostgresCategoryRepository {
         .map_err(|e| Error::Other(format!("Failed to search categories: {}", e)))?;
 
         Ok(categories)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DB-backed tests: require PostgreSQL via TEST_DATABASE_URL; skipped without it
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Skipping DB test: cannot connect to {url}: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = crate::Migrator::new(pool.clone()).migrate().await {
+            eprintln!("Skipping DB test: migration failed: {e}");
+            return None;
+        }
+        Some(pool)
+    }
+
+    async fn insert_product(pool: &sqlx::PgPool, title: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO products (id, title, slug, price) VALUES ($1, $2, $3, 10.00)")
+            .bind(id)
+            .bind(title)
+            .bind(format!("batched-{id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn categories_for_products_matches_get_product_categories() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresCategoryRepository::new(pool.clone());
+        let product = insert_product(&pool, "Categorised").await;
+        let uncategorised = insert_product(&pool, "Uncategorised").await;
+        let mut category_ids = Vec::new();
+        for (name, sort_order) in [("Second", 2), ("First", 1)] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO product_categories (name, slug, sort_order) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(name)
+            .bind(format!("batched-{}", Uuid::new_v4()))
+            .bind(sort_order)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO product_category_relations (product_id, category_id) VALUES ($1, $2)",
+            )
+            .bind(product)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            category_ids.push(id);
+        }
+
+        let batched = repo
+            .categories_for_products(&[product, uncategorised])
+            .await
+            .unwrap();
+        let names: Vec<&str> = batched[&product].iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        let single: Vec<String> = repo
+            .get_product_categories(product)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, single);
+        assert!(!batched.contains_key(&uncategorised));
+
+        sqlx::query("DELETE FROM products WHERE id = ANY($1)")
+            .bind([product, uncategorised].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_categories WHERE id = ANY($1)")
+            .bind(category_ids.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

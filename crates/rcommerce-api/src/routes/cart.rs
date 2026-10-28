@@ -75,7 +75,10 @@ pub async fn get_customer_cart(
     // Get or create cart for authenticated customer
     let cart = state
         .cart_service
-        .get_or_create_cart(CartIdentifier::Customer(auth.customer_id), &state.default_currency)
+        .get_or_create_cart(
+            CartIdentifier::Customer(auth.customer_id),
+            &state.default_currency,
+        )
         .await?;
 
     // Return cart with items
@@ -120,6 +123,10 @@ pub async fn add_item_to_cart(
         .get_product(request.product_id)
         .await?
         .ok_or_else(|| Error::not_found("Product not found"))?;
+    // Inactive products are drafts: not for sale
+    if !product_detail.product.is_active {
+        return Err(Error::not_found("Product not found"));
+    }
 
     // Bundle products are expanded into their components.
     if product_detail.product.product_type == rcommerce_core::models::ProductType::Bundle {

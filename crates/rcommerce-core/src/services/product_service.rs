@@ -53,9 +53,7 @@ impl ProductService {
             None => return Ok(None),
         };
 
-        let variants = self.repository.find_variants(id).await?;
-        let images = self.repository.find_images(id).await?;
-        let options = self.repository.find_options(id).await?;
+        let (variants, images, options) = self.load_related(id).await?;
 
         Ok(Some(ProductDetail {
             product,
@@ -134,10 +132,7 @@ impl ProductService {
             None => return Ok(None),
         };
 
-        let product_id = product.id;
-        let variants = self.repository.find_variants(product_id).await?;
-        let images = self.repository.find_images(product_id).await?;
-        let options = self.repository.find_options(product_id).await?;
+        let (variants, images, options) = self.load_related(product.id).await?;
 
         Ok(Some(ProductDetail {
             product,
@@ -145,6 +140,24 @@ impl ProductService {
             images,
             options,
         }))
+    }
+}
+
+impl ProductService {
+    /// Variants, images and options of a product, fetched concurrently
+    async fn load_related(
+        &self,
+        product_id: Uuid,
+    ) -> Result<(
+        Vec<ProductVariant>,
+        Vec<ProductImage>,
+        Vec<(ProductOption, Vec<ProductOptionValue>)>,
+    )> {
+        tokio::try_join!(
+            self.repository.find_variants(product_id),
+            self.repository.find_images(product_id),
+            self.repository.find_options(product_id),
+        )
     }
 }
 

@@ -48,6 +48,10 @@ R Commerce supports two authentication methods with a unified middleware approac
 
 For customer and admin user sessions. JWT tokens are short-lived (24 hours by default) and provide role-based permissions.
 
+**Registration limits** (`POST /api/v1/auth/register`): the password must be 8–128 characters,
+`first_name` and `last_name` at most 100 characters, `email` at most 255 and `phone` at most 50.
+Longer values are rejected with `400 Validation error` before the password is hashed.
+
 **Login:**
 ```bash
 POST /api/v1/auth/login
@@ -84,6 +88,11 @@ Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
 **Token expiration:**
 - Access token: 24 hours (configurable via `security.jwt.expiry_hours`)
 - Refresh token: 7 days (configurable)
+
+**Token types:** only access tokens authenticate API requests. Refresh tokens are
+accepted by `POST /api/v1/auth/refresh` only, and password-reset and e-mail
+verification tokens only by their own endpoints; sent as a Bearer token they get
+`401 Unauthorized`.
 
 #### 2. API Key Authentication (Service-to-Service)
 
@@ -386,6 +395,12 @@ GET    /v1/categories/:id           # Get category
 - `sort` - Sort field and direction (e.g., `price:desc`, `created_at:asc`)
 - `q` - Search query
 - `page`, `per_page` - Pagination
+
+**Drafts and missing items:** `GET /v1/products/:id` (id or slug) and
+`GET /v1/categories/:slug` answer `404 Not Found` with the standard error body when
+the item does not exist. Inactive (draft) products are only returned to admins:
+other callers get `404`, category pages list active products only, and drafts
+cannot be added to a cart.
 
 ### Orders
 

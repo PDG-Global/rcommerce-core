@@ -38,7 +38,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 // Import API types
-use rcommerce_api::routes;
+use rcommerce_api::server::api_routes;
 use rcommerce_api::state::{AppState, AppStateParams};
 
 // Import core types
@@ -242,6 +242,7 @@ impl TestApp {
             None,               // No admin notification email for tests
             Default::default(), // Branding
             Default::default(), // Accounting
+            "USD".to_string(),  // Default currency
             None,               // No Airwallex for tests
         );
 
@@ -287,55 +288,16 @@ impl TestApp {
         })
     }
 
-    /// Build the API router (mirrors server.rs api_routes structure)
+    /// Build the API router from the server's own routes and auth middleware
     fn build_router(app_state: AppState) -> Router {
-        use axum::middleware;
-        use rcommerce_api::middleware::{admin_middleware, auth_middleware};
-
-        // Public routes (no auth required)
-        let public_routes = Router::new()
-            .merge(routes::auth_public_router())
-            .merge(routes::cart_public_router());
-
-        // Protected routes (JWT auth required)
-        let protected_routes = Router::new()
-            .merge(routes::product_router())
-            .merge(routes::customer_router())
-            .merge(routes::order_router())
-            .merge(routes::checkout_router())
-            .merge(routes::cart_protected_router())
-            .merge(routes::coupon_router())
-            .merge(routes::auth_protected_router())
-            .merge(routes::payment_router())
-            .route_layer(middleware::from_fn_with_state(
-                app_state.clone(),
-                auth_middleware,
-            ));
-
-        // Admin routes
-        let admin_routes = Router::new()
-            .nest("/admin", routes::admin_router())
-            .merge(routes::statistics_router())
-            .route_layer(middleware::from_fn_with_state(
-                app_state.clone(),
-                admin_middleware,
-            ));
-
-        // API v1 routes
-        let api_v1 = Router::new()
-            .merge(public_routes)
-            .merge(protected_routes)
-            .merge(admin_routes);
-
-        // Main router
         Router::new()
             .route("/health", get(|| async { "OK" }))
-            .nest("/api/v1", api_v1)
+            .nest("/api/v1", api_routes(app_state.clone()))
             .layer(tower_http::trace::TraceLayer::new_for_http())
             .with_state(app_state)
     }
 
-    /// Run database migrations using SQLx
+    /// Reset the schema and run the database migrations
     async fn run_migrations(pool: &Pool<Postgres>) -> anyhow::Result<()> {
         // Acquire lock to prevent concurrent migrations (causes deadlocks)
         let _guard = MIGRATION_LOCK.lock().await;
@@ -398,27 +360,11 @@ impl TestApp {
 
         sqlx::query(cleanup_sql).execute(pool).await.ok(); // Ignore errors - schema might not exist yet
 
-        // Define migration files in order
-        // Paths are relative to the test crate root (crates/rcommerce-api/)
-        let migration_files = [
-            "../rcommerce-core/migrations/001_complete_schema.sql",
-            "../rcommerce-core/migrations/002_tax_system.sql",
-            "../rcommerce-core/migrations/003_inventory_notifications_fulfillment.sql",
-            "../rcommerce-core/migrations/012_accounting_export.sql",
-        ];
-
-        for migration_file in &migration_files {
-            let migration_sql = std::fs::read_to_string(migration_file).map_err(|e| {
-                anyhow::anyhow!("Failed to read migration file {}: {}", migration_file, e)
-            })?;
-
-            sqlx::raw_sql(&migration_sql)
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to run migration {}: {}", migration_file, e)
-                })?;
-        }
+        // Apply the same migrations as the server, so the schema never drifts
+        rcommerce_core::Migrator::new(pool.clone())
+            .migrate()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to run migrations: {}", e))?;
 
         Ok(())
     }
@@ -450,13 +396,30 @@ impl TestApp {
         };
 
         let password_hash = self.app_state.auth_service.hash_password(&password)?;
-        let customer = self
+        let mut customer = self
             .app_state
             .customer_service
             .create_customer_with_password(request, password_hash)
             .await?;
 
+        // Login requires a verified email
+        self.app_state
+            .customer_service
+            .update_email_verified(customer.id, true)
+            .await?;
+        customer.email_verified = true;
+
         Ok((customer, password))
+    }
+
+    /// Create an admin account and return its access token
+    pub async fn admin_token(&self) -> anyhow::Result<String> {
+        let (customer, password) = self.create_test_customer().await?;
+        sqlx::query("UPDATE customers SET role = 'admin' WHERE id = $1")
+            .bind(customer.id)
+            .execute(&self.db_pool)
+            .await?;
+        self.login(&customer.email, &password).await
     }
 
     /// Login a customer and return the JWT token
@@ -518,6 +481,19 @@ impl TestApp {
         .bind(false)
         .execute(&self.db_pool)
         .await?;
+
+        // Carts check stock per location (inventory_levels), not the product column
+        if inventory > 0 {
+            let location_id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM inventory_locations WHERE is_active ORDER BY created_at LIMIT 1",
+            )
+            .fetch_one(&self.db_pool)
+            .await?;
+            self.app_state
+                .inventory_service
+                .receive_stock(product_id, location_id, inventory, None)
+                .await?;
+        }
 
         Ok(product_id)
     }
@@ -974,13 +950,47 @@ async fn test_auth_flows() {
         .expect("Failed to register");
 
     let status = response.status();
+    let body = response.text().await.unwrap_or_default();
     if status != 201 {
-        let body = response.text().await.unwrap_or_default();
         eprintln!("Registration failed with status {}: {}", status, body);
     }
     assert_eq!(status, 201);
+    let registered: serde_json::Value =
+        serde_json::from_str(&body).expect("Failed to parse registration response");
+    let customer_id: Uuid = registered["customer"]["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("No customer id");
 
-    // 2. Login with credentials
+    // 2. Login is refused until the email is verified
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/auth/login", app.base_url()))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": original_password
+        }))
+        .send()
+        .await
+        .expect("Failed to login");
+    assert_eq!(response.status(), 403);
+
+    // 3. Verify the email with the token the verification email links to
+    let token = app
+        .app_state
+        .auth_service
+        .generate_email_verification_token(customer_id, &email)
+        .expect("Failed to create verification token");
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/auth/verify-email", app.base_url()))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .expect("Failed to verify email");
+    assert!(response.status().is_success());
+
+    // 4. Login with credentials
     let response = app
         .http_client
         .post(format!("{}/api/v1/auth/login", app.base_url()))
@@ -1000,7 +1010,7 @@ async fn test_auth_flows() {
     let original_token = auth.access_token;
     let refresh_token = auth.refresh_token;
 
-    // 3. Access protected endpoint with token
+    // 5. Access protected endpoint with token
     let response = app
         .http_client
         .get(format!("{}/api/v1/carts/me", app.base_url()))
@@ -1016,7 +1026,7 @@ async fn test_auth_flows() {
     }
     assert!(status.is_success());
 
-    // 4. Refresh token
+    // 6. Refresh token
     let response = app
         .http_client
         .post(format!("{}/api/v1/auth/refresh", app.base_url()))
@@ -1034,7 +1044,7 @@ async fn test_auth_flows() {
             .expect("Failed to parse refresh response");
         let new_token = refresh["access_token"].as_str().expect("No access token");
 
-        // 5. Access with new token
+        // 7. Access with new token
         let response = app
             .http_client
             .get(format!("{}/api/v1/carts/me", app.base_url()))
@@ -1184,10 +1194,13 @@ async fn test_tax_and_shipping_calculation() {
 
     // Note: Checkout may return various statuses depending on implementation
     // For now, we just verify the endpoint responds appropriately
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
     assert!(
-        response.status().is_success() || response.status() == 400 || response.status() == 422,
-        "Checkout returned unexpected status: {}",
-        response.status()
+        status.is_success() || status == 400 || status == 422,
+        "Checkout returned unexpected status: {} {}",
+        status,
+        body
     );
 
     // Cleanup
@@ -1415,6 +1428,58 @@ async fn test_health_check() {
         "Expected success status, got {}",
         response.status()
     );
+}
+
+/// Test 11: Admin product management goes through the admin routes
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_admin_can_create_product() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let product = serde_json::json!({
+        "title": "Admin Test Product",
+        "slug": format!("admin-test-product-{}", Uuid::new_v4().simple()),
+        "product_type": "Simple",
+        "price": "12.50",
+        "currency": "EUR",
+        "inventory_quantity": 0,
+        "inventory_policy": "Deny",
+        "inventory_management": true,
+        "continues_selling_when_out_of_stock": false,
+        "requires_shipping": true,
+        "is_active": true,
+        "is_featured": false
+    });
+    let url = format!("{}/api/v1/products", app.base_url());
+
+    // A customer token is refused
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&customer_token)
+        .json(&product)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    // An admin creates the product (500 "Missing request extension" before
+    // the admin middleware passed the caller on)
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&admin)
+        .json(&product)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status, 201, "{body}");
+
+    app.cleanup().await.ok();
 }
 
 /// Helper macro for running tests with reporting

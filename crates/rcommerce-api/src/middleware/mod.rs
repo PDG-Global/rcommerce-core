@@ -155,7 +155,7 @@ pub async fn auth_middleware(
     tracing::debug!("Extracted bearer token");
 
     // Verify token
-    match state.auth_service.verify_token(token) {
+    match state.auth_service.verify_access_token(token) {
         Ok(claims) => {
             tracing::debug!("Token verified for customer: {}", claims.sub);
 
@@ -192,7 +192,7 @@ pub async fn optional_auth_middleware(
         .and_then(|h| h.to_str().ok())
     {
         if let Some(token) = AuthService::extract_bearer_token(header) {
-            if let Ok(claims) = state.auth_service.verify_token(token) {
+            if let Ok(claims) = state.auth_service.verify_access_token(token) {
                 let auth = JwtAuth {
                     customer_id: claims.sub,
                     email: claims.email,
@@ -362,7 +362,7 @@ pub async fn rate_limit_middleware(
 /// Admin-only middleware
 pub async fn admin_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Get Authorization header
@@ -385,13 +385,20 @@ pub async fn admin_middleware(
     // Verify token
     let claims = state
         .auth_service
-        .verify_token(token)
+        .verify_access_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     // Check for admin permission
     if !claims.permissions.contains(&"admin".to_string()) {
         return Err(StatusCode::FORBIDDEN);
     }
+
+    // Admin handlers read the caller from the request, as behind auth_middleware
+    request.extensions_mut().insert(JwtAuth {
+        customer_id: claims.sub,
+        email: claims.email,
+        permissions: claims.permissions,
+    });
 
     Ok(next.run(request).await)
 }

@@ -332,13 +332,28 @@ impl WooCommerceImporter {
     /// Determine effective stock quantity from WooCommerce fields.
     /// Falls back to a default when manage_stock is false and the product is in stock.
     fn effective_stock_quantity(&self, product: &WooCommerceProduct) -> i32 {
-        if let Some(qty) = product.stock_quantity {
+        Self::effective_stock(
+            product.stock_quantity,
+            product.manage_stock,
+            product.stock_status.as_deref(),
+        )
+    }
+
+    /// Shared stock semantics for products and variations: an explicit
+    /// quantity wins; otherwise unmanaged in-stock items get a fallback so
+    /// they remain sellable (WooCommerce reports `null` quantity for those).
+    fn effective_stock(
+        stock_quantity: Option<i32>,
+        manage_stock: bool,
+        stock_status: Option<&str>,
+    ) -> i32 {
+        if let Some(qty) = stock_quantity {
             return qty;
         }
-        if product.manage_stock {
+        if manage_stock {
             return 0;
         }
-        match product.stock_status.as_deref() {
+        match stock_status {
             Some("instock") | Some("onbackorder") => 100,
             _ => 0,
         }
@@ -2170,9 +2185,8 @@ impl WooCommerceImporter {
 
         let outcome = match updated {
             Ok(result) if result.rows_affected() > 0 => Ok(()),
-            Ok(_) => {
-                sqlx::query(
-                    r#"
+            Ok(_) => sqlx::query(
+                r#"
                     INSERT INTO inventory_levels (
                         id, product_id, variant_id, location_id, available_quantity,
                         reserved_quantity, incoming_quantity, reorder_point, reorder_quantity,
@@ -2180,22 +2194,21 @@ impl WooCommerceImporter {
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
                     "#,
-                )
-                .bind(Uuid::new_v4())
-                .bind(product_id)
-                .bind(variant_id)
-                .bind(location_id)
-                .bind(quantity)
-                .bind(0i32)
-                .bind(0i32)
-                .bind(0i32)
-                .bind(0i32)
-                .bind(None::<Decimal>)
-                .bind(None::<chrono::DateTime<chrono::Utc>>)
-                .execute(pool)
-                .await
-                .map(|_| ())
-            }
+            )
+            .bind(Uuid::new_v4())
+            .bind(product_id)
+            .bind(variant_id)
+            .bind(location_id)
+            .bind(quantity)
+            .bind(0i32)
+            .bind(0i32)
+            .bind(0i32)
+            .bind(0i32)
+            .bind(None::<Decimal>)
+            .bind(None::<chrono::DateTime<chrono::Utc>>)
+            .execute(pool)
+            .await
+            .map(|_| ()),
             Err(e) => Err(e),
         };
 
@@ -2260,7 +2273,14 @@ impl WooCommerceImporter {
             .bind(variant_id)
             .bind(position as i32)
             .bind(local_url)
-            .bind(image.alt.clone())
+            // product_images.alt_text is varchar(255); Woo alt text can exceed it
+            .bind(image.alt.clone().map(|a| {
+                let mut truncated: String = a.chars().take(255).collect();
+                while truncated.len() > 255 {
+                    truncated.pop();
+                }
+                truncated
+            }))
             .bind(None::<i32>)
             .bind(None::<i32>)
             .execute(pool)
@@ -2363,7 +2383,11 @@ impl WooCommerceImporter {
                     .join(", ")
             };
 
-            let inventory_quantity = variation.stock_quantity.unwrap_or(0);
+            let inventory_quantity = Self::effective_stock(
+                variation.stock_quantity,
+                variation.manage_stock,
+                variation.stock_status.as_deref(),
+            );
             let variant_id = Uuid::new_v4();
 
             sqlx::query(
@@ -2584,6 +2608,10 @@ struct WooCommerceVariation {
     sale_price: String,
     #[serde(rename = "stock_quantity")]
     stock_quantity: Option<i32>,
+    #[serde(rename = "stock_status", default)]
+    stock_status: Option<String>,
+    #[serde(rename = "manage_stock", default)]
+    manage_stock: bool,
     status: String,
     image: Option<WooCommerceImage>,
     #[serde(default)]

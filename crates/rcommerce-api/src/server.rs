@@ -1089,8 +1089,9 @@ async fn init_redis(config: &Config) -> Option<RedisPool> {
     }
 }
 
-/// API v1 routes
-fn api_routes(app_state: AppState) -> Router<AppState> {
+/// All `/api/v1` routes with their auth middleware (public, customer, API key
+/// and admin groups). Public so integration tests serve the real routing.
+pub fn api_routes(app_state: AppState) -> Router<AppState> {
     // Public storefront routes (no auth required)
     let public_routes = Router::new()
         // Product catalog

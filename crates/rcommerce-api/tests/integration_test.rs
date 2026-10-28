@@ -149,6 +149,7 @@ async fn test_api_info() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_complete_customer_flow() {
     let harness = TestHarness::new()
         .await
@@ -219,6 +220,7 @@ async fn test_complete_customer_flow() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_product_listing() {
     let harness = TestHarness::new()
         .await
@@ -245,6 +247,7 @@ async fn test_product_listing() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_order_creation_flow() {
     let harness = TestHarness::new()
         .await
@@ -324,6 +327,7 @@ async fn test_order_creation_flow() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_payment_methods() {
     let harness = TestHarness::new()
         .await
@@ -355,6 +359,7 @@ async fn test_payment_methods() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_webhook_handling() {
     let harness = TestHarness::new()
         .await
@@ -392,6 +397,7 @@ async fn test_webhook_handling() {
 }
 
 #[tokio::test]
+#[ignore = "Requires running server at TEST_SERVER_URL"]
 async fn test_error_handling() {
     let harness = TestHarness::new()
         .await

@@ -94,6 +94,34 @@ pub struct RegisterRequest {
     pub phone: Option<String>,
 }
 
+impl RegisterRequest {
+    /// Checked before hashing: hashing cost grows with the password length,
+    /// and the other fields must fit the `customers` columns (email 255,
+    /// names 100, phone 50) or the insert fails with a database error.
+    fn validate(&self) -> Result<(), Error> {
+        if self.password.len() < 8 {
+            return Err(Error::validation("Password must be at least 8 characters"));
+        }
+        if self.password.len() > 128 {
+            return Err(Error::validation("Password must be at most 128 characters"));
+        }
+        if self.email.chars().count() > 255 {
+            return Err(Error::validation("Email must be at most 255 characters"));
+        }
+        if self.first_name.chars().count() > 100 || self.last_name.chars().count() > 100 {
+            return Err(Error::validation("Names must be at most 100 characters"));
+        }
+        if self
+            .phone
+            .as_deref()
+            .is_some_and(|p| p.chars().count() > 50)
+        {
+            return Err(Error::validation("Phone must be at most 50 characters"));
+        }
+        Ok(())
+    }
+}
+
 /// Register response
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
@@ -247,9 +275,7 @@ pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), Error> {
-    if payload.password.len() < 8 {
-        return Err(Error::validation("Password must be at least 8 characters"));
-    }
+    payload.validate()?;
 
     let password_hash = state.auth_service.hash_password(&payload.password)?;
 
@@ -542,4 +568,54 @@ pub fn public_router() -> Router<AppState> {
 /// Protected auth routes (API key required)
 pub fn protected_router() -> Router<AppState> {
     Router::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegisterRequest;
+
+    fn request() -> RegisterRequest {
+        RegisterRequest {
+            email: "jane@example.com".to_string(),
+            password: "correct-horse-battery".to_string(),
+            first_name: "Jane".to_string(),
+            last_name: "Doe".to_string(),
+            phone: Some("+32 2 000 00 00".to_string()),
+        }
+    }
+
+    #[test]
+    fn accepts_a_normal_registration() {
+        assert!(request().validate().is_ok());
+    }
+
+    #[test]
+    fn password_length_is_bounded() {
+        let mut r = request();
+        r.password = "short".to_string();
+        assert!(r.validate().is_err());
+        r.password = "x".repeat(129);
+        assert!(r.validate().is_err());
+        r.password = "x".repeat(128);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn fields_must_fit_their_columns() {
+        let mut r = request();
+        r.first_name = "A".repeat(101);
+        assert!(r.validate().is_err());
+
+        let mut r = request();
+        r.last_name = "é".repeat(100); // limits count characters, not bytes
+        assert!(r.validate().is_ok());
+
+        let mut r = request();
+        r.email = format!("{}@example.com", "a".repeat(250));
+        assert!(r.validate().is_err());
+
+        let mut r = request();
+        r.phone = Some("1".repeat(51));
+        assert!(r.validate().is_err());
+    }
 }

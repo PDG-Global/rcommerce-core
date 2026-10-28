@@ -1868,10 +1868,7 @@ free_shipping = true
         assert_eq!(zones.len(), 2);
         assert_eq!(zones[0].name, "Australia");
         assert_eq!(zones[0].countries, vec!["AU".to_string()]);
-        assert_eq!(
-            zones[0].rate_per_half_kg,
-            rust_decimal::Decimal::new(0, 0)
-        );
+        assert_eq!(zones[0].rate_per_half_kg, rust_decimal::Decimal::new(0, 0));
         assert_eq!(zones[0].base_rate, rust_decimal::Decimal::new(0, 0));
         assert_eq!(zones[0].delivery_days, 5);
         assert!(zones[0].free_shipping);

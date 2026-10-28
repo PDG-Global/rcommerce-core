@@ -131,7 +131,9 @@ async fn seed_variable_product(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
 
 #[tokio::test]
 async fn inventory_reserve_variant_does_not_use_other_variants_stock() {
-    let Some((pool, service)) = setup().await else { return };
+    let Some((pool, service)) = setup().await else {
+        return;
+    };
     let (product_id, variant_a, variant_b, location_id) = seed_variable_product(&pool).await;
     let expires = chrono::Utc::now() + Duration::minutes(30);
 
@@ -184,7 +186,9 @@ async fn inventory_reserve_variant_does_not_use_other_variants_stock() {
 
 #[tokio::test]
 async fn inventory_commit_reservation_no_matching_row_does_not_fail() {
-    let Some((pool, service)) = setup().await else { return };
+    let Some((pool, service)) = setup().await else {
+        return;
+    };
     let (product_id, variant_a, _variant_b, location_id) = seed_variable_product(&pool).await;
 
     // A reservation whose inventory row is missing (e.g. NULL-variant
@@ -230,7 +234,10 @@ async fn inventory_commit_reservation_no_matching_row_does_not_fail() {
         .commit_reservation(orphan_id)
         .await
         .expect("commit with no matching inventory row must not error");
-    assert!(!committed, "no row was updated, so commit must report false");
+    assert!(
+        !committed,
+        "no row was updated, so commit must report false"
+    );
 
     let status: String =
         sqlx::query_scalar("SELECT status::text FROM stock_reservations WHERE id = $1")
@@ -245,7 +252,9 @@ async fn inventory_commit_reservation_no_matching_row_does_not_fail() {
 
 #[tokio::test]
 async fn inventory_simple_product_reservation_uses_null_variant_rows() {
-    let Some((pool, service)) = setup().await else { return };
+    let Some((pool, service)) = setup().await else {
+        return;
+    };
     let product_id = Uuid::new_v4();
     let location_id = Uuid::new_v4();
     let expires = chrono::Utc::now() + Duration::minutes(30);
@@ -260,12 +269,14 @@ async fn inventory_simple_product_reservation_uses_null_variant_rows() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO products (id, title, slug, price) VALUES ($1, 'Simple Test', $2, 5.00)")
-        .bind(product_id)
-        .bind(format!("simple-test-{}", product_id))
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO products (id, title, slug, price) VALUES ($1, 'Simple Test', $2, 5.00)",
+    )
+    .bind(product_id)
+    .bind(format!("simple-test-{}", product_id))
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Test Warehouse 2', $2)",
     )
@@ -312,7 +323,10 @@ async fn inventory_simple_product_reservation_uses_null_variant_rows() {
 
     // receive_stock must accumulate onto the existing NULL-variant row
     // (update-then-insert), not create a duplicate row.
-    service.receive_stock(product_id, location_id, 3, None).await.unwrap();
+    service
+        .receive_stock(product_id, location_id, 3, None)
+        .await
+        .unwrap();
     let row_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inventory_levels WHERE product_id = $1 AND location_id = $2",
     )
@@ -328,7 +342,9 @@ async fn inventory_simple_product_reservation_uses_null_variant_rows() {
 
 #[tokio::test]
 async fn inventory_product_level_availability_is_variant_aware() {
-    let Some((pool, service)) = setup().await else { return };
+    let Some((pool, service)) = setup().await else {
+        return;
+    };
     let (product_id, variant_a, variant_b, location_id) = seed_variable_product(&pool).await;
 
     // Variant-scoped availability.

@@ -133,10 +133,7 @@ impl EmailNotificationFactory {
                 discount_amount
             );
             vars.insert("discount_row", discount_row);
-            vars.insert(
-                "discount_line",
-                format!("{label}: -${}\n", discount_amount),
-            );
+            vars.insert("discount_line", format!("{label}: -${}\n", discount_amount));
         } else {
             vars.insert("discount_row", "");
             vars.insert("discount_line", "");
@@ -468,7 +465,11 @@ mod tests {
 
         let html = EmailNotificationFactory::format_order_items(&items);
         assert!(html.contains("Skate Tool"));
-        assert_eq!(html.matches("padding-top:2px").count(), 1, "only the SKU line");
+        assert_eq!(
+            html.matches("padding-top:2px").count(),
+            1,
+            "only the SKU line"
+        );
     }
 
     #[test]

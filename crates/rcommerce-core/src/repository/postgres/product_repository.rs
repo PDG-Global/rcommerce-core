@@ -234,18 +234,49 @@ impl PostgresProductRepository {
         .fetch_all(self.db.pool())
         .await?;
 
-        let mut result = Vec::new();
-        for option in options {
-            let values = sqlx::query_as::<_, ProductOptionValue>(
-                "SELECT * FROM product_option_values WHERE option_id = $1 ORDER BY value",
-            )
-            .bind(option.id)
-            .fetch_all(self.db.pool())
-            .await?;
-            result.push((option, values));
+        if options.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(result)
+        // All values in one query instead of one query per option
+        let option_ids: Vec<Uuid> = options.iter().map(|o| o.id).collect();
+        let values = sqlx::query_as::<_, ProductOptionValue>(
+            "SELECT * FROM product_option_values WHERE option_id = ANY($1) ORDER BY value",
+        )
+        .bind(&option_ids)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut by_option: std::collections::HashMap<Uuid, Vec<ProductOptionValue>> =
+            std::collections::HashMap::new();
+        for value in values {
+            by_option.entry(value.option_id).or_default().push(value);
+        }
+        Ok(options
+            .into_iter()
+            .map(|option| {
+                let values = by_option.remove(&option.id).unwrap_or_default();
+                (option, values)
+            })
+            .collect())
+    }
+
+    /// First image (lowest position) of several products, in one query
+    pub async fn find_first_images(
+        &self,
+        product_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        if product_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT DISTINCT ON (product_id) product_id, src FROM product_images
+             WHERE product_id = ANY($1) ORDER BY product_id, position",
+        )
+        .bind(product_ids)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 }
 
@@ -478,5 +509,116 @@ impl ProductRepositoryTrait for PostgresProductRepository {
         product_id: Uuid,
     ) -> Result<Vec<(ProductOption, Vec<ProductOptionValue>)>> {
         self.find_options(product_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DB-backed tests: require PostgreSQL via TEST_DATABASE_URL; skipped without it
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Skipping DB test: cannot connect to {url}: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = crate::Migrator::new(pool.clone()).migrate().await {
+            eprintln!("Skipping DB test: migration failed: {e}");
+            return None;
+        }
+        Some(pool)
+    }
+
+    async fn insert_product(pool: &sqlx::PgPool, title: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO products (id, title, slug, price) VALUES ($1, $2, $3, 10.00)")
+            .bind(id)
+            .bind(title)
+            .bind(format!("batched-{id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn batched_lookups_return_the_same_data() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let with_images = insert_product(&pool, "With images").await;
+        let without_images = insert_product(&pool, "Without images").await;
+        for (position, src) in [(2, "second.jpg"), (0, "first.jpg")] {
+            sqlx::query(
+                "INSERT INTO product_images (product_id, position, src) VALUES ($1, $2, $3)",
+            )
+            .bind(with_images)
+            .bind(position)
+            .bind(src)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let first = repo
+            .find_first_images(&[with_images, without_images])
+            .await
+            .unwrap();
+        assert_eq!(
+            first.get(&with_images).map(String::as_str),
+            Some("first.jpg")
+        );
+        assert!(!first.contains_key(&without_images));
+        assert!(repo.find_first_images(&[]).await.unwrap().is_empty());
+
+        // One option ("Size") with a value per variant, grouped under the option
+        let option_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO product_options (product_id, name) VALUES ($1, 'Size') RETURNING id",
+        )
+        .bind(with_images)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for value in ["M", "L", "S"] {
+            let variant_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO product_variants (product_id, title, price) VALUES ($1, $2, 10.00) RETURNING id",
+            )
+            .bind(with_images)
+            .bind(value)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO product_option_values (option_id, variant_id, value) VALUES ($1, $2, $3)")
+                .bind(option_id)
+                .bind(variant_id)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let options = repo.find_options(with_images).await.unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].0.name, "Size");
+        let values: Vec<&str> = options[0].1.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["L", "M", "S"]);
+        assert!(repo.find_options(without_images).await.unwrap().is_empty());
+
+        sqlx::query("DELETE FROM products WHERE id = ANY($1)")
+            .bind([with_images, without_images].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

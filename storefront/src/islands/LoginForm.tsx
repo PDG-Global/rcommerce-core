@@ -16,6 +16,8 @@ export default function LoginForm({ redirectTo = '/' }: Props) {
   const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
   const [resetSent, setResetSent] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  const [forgotSent, setForgotSent] = useState(false);
+  const [forgotLoading, setForgotLoading] = useState(false);
   const [verificationSent, setVerificationSent] = useState(false);
   const [verificationLoading, setVerificationLoading] = useState(false);
 
@@ -81,6 +83,33 @@ export default function LoginForm({ redirectTo = '/' }: Props) {
     }
   };
 
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      setError('Enter your email address above first, then click "Forgot password?" again.');
+      return;
+    }
+    setForgotLoading(true);
+    setError(null);
+    try {
+      const res = await apiFetch('/auth/password-reset', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      if (res.ok) {
+        setForgotSent(true);
+        setError(null);
+      } else {
+        const text = await res.text().catch(() => 'Failed to send reset email');
+        setError(text || 'Failed to send reset email');
+      }
+    } catch (e: any) {
+      setError(e.message || 'Failed to send reset email');
+    } finally {
+      setForgotLoading(false);
+    }
+  };
+
   const handleResendVerification = async () => {
     if (!unverifiedEmail) return;
     setVerificationLoading(true);
@@ -130,7 +159,17 @@ export default function LoginForm({ redirectTo = '/' }: Props) {
         />
       </div>
       <div>
-        <label className="block text-sm font-medium text-rcommerce-700 mb-1">Password</label>
+        <div className="flex items-center justify-between mb-1">
+          <label className="block text-sm font-medium text-rcommerce-700">Password</label>
+          <button
+            type="button"
+            onClick={handleForgotPassword}
+            disabled={forgotLoading}
+            className="text-sm text-rcommerce-accent hover:underline disabled:opacity-50"
+          >
+            {forgotLoading ? 'Sending...' : 'Forgot password?'}
+          </button>
+        </div>
         <input
           type="password"
           value={password}
@@ -140,6 +179,11 @@ export default function LoginForm({ redirectTo = '/' }: Props) {
           autoComplete="current-password"
         />
       </div>
+      {forgotSent && (
+        <p className="text-sm text-green-700 bg-green-50 p-3 rounded" aria-live="polite">
+          A password reset link has been sent to {email.trim()}. Please check your inbox.
+        </p>
+      )}
       <label className="flex items-center space-x-2 text-sm text-rcommerce-700">
         <input
           type="checkbox"

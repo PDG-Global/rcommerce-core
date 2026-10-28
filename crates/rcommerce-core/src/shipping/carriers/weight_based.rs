@@ -67,7 +67,11 @@ impl WeightBasedProvider {
 
     /// Sorted list of all shippable 2-letter country codes across all zones.
     pub fn shippable_countries(&self) -> Vec<String> {
-        let mut codes: Vec<String> = self.zones.iter().flat_map(|z| z.countries.clone()).collect();
+        let mut codes: Vec<String> = self
+            .zones
+            .iter()
+            .flat_map(|z| z.countries.clone())
+            .collect();
         codes.sort_unstable();
         codes.dedup();
         codes
@@ -270,9 +274,23 @@ fn default_zones() -> Vec<ShippingZone> {
             false,
         ),
         // Canada: $5/0.5kg
-        zone("Standard Shipping", &["CA"], dec!(5.00), dec!(0.00), 10, false),
+        zone(
+            "Standard Shipping",
+            &["CA"],
+            dec!(5.00),
+            dec!(0.00),
+            10,
+            false,
+        ),
         // Russia: $9/0.5kg
-        zone("Standard Shipping", &["RU"], dec!(9.00), dec!(0.00), 21, false),
+        zone(
+            "Standard Shipping",
+            &["RU"],
+            dec!(9.00),
+            dec!(0.00),
+            21,
+            false,
+        ),
         // South Africa: $16/0.5kg
         zone(
             "Standard Shipping",
@@ -287,8 +305,7 @@ fn default_zones() -> Vec<ShippingZone> {
         zone(
             "Standard Shipping",
             &[
-                "AR", "BR", "CL", "CO", "CR", "DO", "EC", "SV", "HN", "JM", "LR", "NI", "PA",
-                "UY",
+                "AR", "BR", "CL", "CO", "CR", "DO", "EC", "SV", "HN", "JM", "LR", "NI", "PA", "UY",
             ],
             dec!(12.50),
             dec!(0.00),
@@ -299,9 +316,8 @@ fn default_zones() -> Vec<ShippingZone> {
         zone(
             "Standard Shipping",
             &[
-                "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU",
-                "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES",
-                "SE",
+                "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+                "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
             ],
             dec!(4.50),
             dec!(0.00),
@@ -314,10 +330,10 @@ fn default_zones() -> Vec<ShippingZone> {
             "Standard Shipping",
             &[
                 // Non-EU Europe
-                "GB", "NO", "IS", "LI", "MC", "AD", "SM", "AL", "RS", "ME", "MK", "BA", "MD",
-                "XK", "GI", "GG", "JE", "IM", "FO", // Asia-Pacific / Asia
-                "JP", "KR", "AU", "NZ", "MY", "TH", "VN", "ID", "PH", "IN", "BD", "LK", "NP",
-                "KH", "LA", "BN", "PG", "FJ", "MN", "AE",
+                "GB", "NO", "IS", "LI", "MC", "AD", "SM", "AL", "RS", "ME", "MK", "BA", "MD", "XK",
+                "GI", "GG", "JE", "IM", "FO", // Asia-Pacific / Asia
+                "JP", "KR", "AU", "NZ", "MY", "TH", "VN", "ID", "PH", "IN", "BD", "LK", "NP", "KH",
+                "LA", "BN", "PG", "FJ", "MN", "AE",
             ],
             dec!(3.50),
             dec!(0.00),
@@ -327,7 +343,14 @@ fn default_zones() -> Vec<ShippingZone> {
         // China: free via SF Express
         zone("SF Express", &["CN"], dec!(0.00), dec!(0.00), 10, true),
         // Hong Kong / Taiwan / Singapore: $2.5/0.5kg via SF Express
-        zone("SF Express", &["HK", "TW", "SG"], dec!(2.50), dec!(0.00), 7, false),
+        zone(
+            "SF Express",
+            &["HK", "TW", "SG"],
+            dec!(2.50),
+            dec!(0.00),
+            7,
+            false,
+        ),
     ]
 }
 
@@ -439,7 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rates_returns_empty_for_disallowed_country() {        let provider = WeightBasedProvider::new();
+    fn test_get_rates_returns_empty_for_disallowed_country() {
+        let provider = WeightBasedProvider::new();
         let mut addr = test_address("IL");
         let package = Package {
             weight: dec!(1.0),
@@ -564,10 +588,7 @@ mod tests {
                 .unwrap();
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].total_cost, dec!(0.00));
-        assert_eq!(
-            rates[0].service_name,
-            "Free Shipping (Standard Shipping)"
-        );
+        assert_eq!(rates[0].service_name, "Free Shipping (Standard Shipping)");
         assert_eq!(rates[0].delivery_days, Some(5));
 
         // US produces no rates at all
@@ -578,7 +599,8 @@ mod tests {
         assert!(rates.is_empty(), "US must produce no rates");
     }
 
-    fn test_address(country: &str) -> Address {        Address {
+    fn test_address(country: &str) -> Address {
+        Address {
             id: uuid::Uuid::new_v4(),
             customer_id: uuid::Uuid::nil(),
             first_name: "Test".to_string(),

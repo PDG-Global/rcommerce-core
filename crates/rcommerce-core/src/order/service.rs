@@ -661,7 +661,10 @@ impl OrderService {
         // Record coupon usage once the payment is confirmed; racing callers
         // are deduplicated by the NOT EXISTS guard inside.
         if let Err(e) = self.record_coupon_usage(&order).await {
-            warn!("Failed to record coupon usage for order {}: {}", order_id, e);
+            warn!(
+                "Failed to record coupon usage for order {}: {}",
+                order_id, e
+            );
         }
 
         self.commit_inventory_reservations(order_id).await?;
@@ -1042,6 +1045,21 @@ impl OrderService {
         Ok(items)
     }
 
+    /// Whether a gateway payment id was recorded for this order (at checkout)
+    pub async fn payment_belongs_to_order(
+        &self,
+        order_id: Uuid,
+        gateway_payment_id: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM payments WHERE order_id = $1 AND gateway_payment_id = $2)",
+        )
+        .bind(order_id)
+        .bind(gateway_payment_id)
+        .fetch_one(self.db.pool())
+        .await?)
+    }
+
     /// Record a payment for an order (idempotent on gateway + transaction id)
     pub async fn record_payment(
         &self,
@@ -1141,11 +1159,13 @@ impl OrderService {
         // warehouse migration) — create one rather than failing order
         // creation, mirroring the checkout service's behaviour.
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Default Warehouse', $2)")
-            .bind(id)
-            .bind(format!("MAIN-{}", &id.to_string()[..8]))
-            .execute(self.db.pool())
-            .await?;
+        sqlx::query(
+            "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Default Warehouse', $2)",
+        )
+        .bind(id)
+        .bind(format!("MAIN-{}", &id.to_string()[..8]))
+        .execute(self.db.pool())
+        .await?;
         Ok(id)
     }
 
