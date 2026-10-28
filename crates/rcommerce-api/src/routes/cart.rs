@@ -11,7 +11,7 @@ use crate::middleware::JwtAuth;
 use crate::state::AppState;
 use axum::{
     extract::{Extension, Path, State},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -19,12 +19,54 @@ use rcommerce_core::{
     models::{
         AddToCartInput, ApplyCouponInput, CartIdentifier, CartWithItems, UpdateCartItemInput,
     },
-    services::cart_service::ProductDetails,
+    services::{cart_service::ProductDetails, AuthService},
     Error,
 };
 use serde::Deserialize;
 
 use uuid::Uuid;
+
+/// Who may use a cart: guest carts (no owner) are addressable by their random
+/// id, a customer's cart only by that customer
+fn cart_owner_allows(owner: Option<Uuid>, caller: Option<Uuid>) -> bool {
+    match owner {
+        None => true,
+        Some(owner) => caller == Some(owner),
+    }
+}
+
+/// Apply `cart_owner_allows` for the caller of this request (Bearer access
+/// token, if any). Refusals look like a missing cart so they do not confirm
+/// that the id exists.
+async fn authorize_cart(state: &AppState, headers: &HeaderMap, cart_id: Uuid) -> Result<(), Error> {
+    let caller = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(AuthService::extract_bearer_token)
+        .and_then(|token| state.auth_service.verify_access_token(token).ok())
+        .map(|claims| claims.sub);
+    cart_access_allowed(state, cart_id, caller).await
+}
+
+/// The rule of `authorize_cart` for an already-authenticated caller (checkout routes)
+pub(crate) async fn cart_access_allowed(
+    state: &AppState,
+    cart_id: Uuid,
+    caller: Option<Uuid>,
+) -> Result<(), Error> {
+    let not_found = || Error::not_found("Cart not found");
+    let owner: Option<Uuid> =
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT customer_id FROM carts WHERE id = $1")
+            .bind(cart_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(not_found)?;
+    if cart_owner_allows(owner, caller) {
+        Ok(())
+    } else {
+        Err(not_found())
+    }
+}
 
 /// Create a new guest cart
 #[derive(Debug, Deserialize, Default)]
@@ -90,8 +132,11 @@ pub async fn get_customer_cart(
 /// Get cart by ID
 pub async fn get_cart(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
 ) -> Result<Json<CartWithItems>, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Get cart with items from service
     let cart_with_items = state.cart_service.get_cart_with_items(cart_id).await?;
 
@@ -109,9 +154,12 @@ pub struct AddItemRequest {
 /// Add item to cart
 pub async fn add_item_to_cart(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
     Json(request): Json<AddItemRequest>,
 ) -> Result<Json<rcommerce_core::models::CartItem>, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Validate quantity
     if request.quantity <= 0 {
         return Err(Error::validation("Quantity must be greater than 0"));
@@ -343,9 +391,12 @@ pub struct UpdateItemRequest {
 /// Update cart item
 pub async fn update_cart_item(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((cart_id, item_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateItemRequest>,
 ) -> Result<Json<rcommerce_core::models::CartItem>, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Validate quantity (0 is allowed - removes item)
     if request.quantity < 0 {
         return Err(Error::validation("Quantity cannot be negative"));
@@ -369,8 +420,11 @@ pub async fn update_cart_item(
 /// Remove item from cart
 pub async fn remove_cart_item(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((cart_id, item_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Remove item via service
     state.cart_service.remove_item(cart_id, item_id).await?;
 
@@ -380,8 +434,11 @@ pub async fn remove_cart_item(
 /// Clear all items from cart
 pub async fn clear_cart(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Clear cart via service
     state.cart_service.clear_cart(cart_id).await?;
 
@@ -423,9 +480,12 @@ pub struct ApplyCouponRequest {
 /// Apply coupon to cart
 pub async fn apply_coupon(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
     Json(request): Json<ApplyCouponRequest>,
 ) -> Result<Json<CartWithItems>, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Validate coupon code is not empty
     if request.coupon_code.trim().is_empty() {
         return Err(Error::validation("Coupon code is required"));
@@ -447,8 +507,11 @@ pub async fn apply_coupon(
 /// Remove coupon from cart
 pub async fn remove_coupon(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
 ) -> Result<Json<CartWithItems>, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Remove coupon via service
     let cart = state.cart_service.remove_coupon(cart_id).await?;
 
@@ -461,8 +524,11 @@ pub async fn remove_coupon(
 /// Delete cart
 pub async fn delete_cart(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(cart_id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
+    authorize_cart(&state, &headers, cart_id).await?;
+
     // Delete cart via service
     state.cart_service.delete_cart(cart_id).await?;
 
@@ -509,4 +575,24 @@ pub fn router() -> Router<AppState> {
     // The server should use public_router() and protected_router() separately
     // with appropriate middleware
     public_router().merge(protected_router())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cart_owner_allows;
+    use uuid::Uuid;
+
+    #[test]
+    fn guest_carts_are_open_to_anyone_with_the_id() {
+        assert!(cart_owner_allows(None, None));
+        assert!(cart_owner_allows(None, Some(Uuid::new_v4())));
+    }
+
+    #[test]
+    fn customer_carts_only_for_their_owner() {
+        let owner = Uuid::new_v4();
+        assert!(cart_owner_allows(Some(owner), Some(owner)));
+        assert!(!cart_owner_allows(Some(owner), None));
+        assert!(!cart_owner_allows(Some(owner), Some(Uuid::new_v4())));
+    }
 }

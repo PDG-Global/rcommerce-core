@@ -370,11 +370,34 @@ impl From<CheckoutResult> for CheckoutResultResponse {
 /// Initiate checkout endpoint
 ///
 /// Calculates totals, tax, and available shipping rates for the customer's cart
+/// Checkout runs on a cart: apply the cart routes' ownership rule (a customer's
+/// cart only for that customer) and map refusals to this module's error shape
+async fn check_cart_access(
+    state: &AppState,
+    cart_id: Uuid,
+    auth: &Option<JwtAuth>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    super::cart::cart_access_allowed(state, cart_id, auth.as_ref().map(|a| a.customer_id))
+        .await
+        .map_err(|e| {
+            let status =
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let message = if status.is_server_error() {
+                tracing::error!("cart access check failed: {}", e);
+                "Internal server error".to_string()
+            } else {
+                e.to_string()
+            };
+            (status, Json(serde_json::json!({ "error": message })))
+        })
+}
+
 pub async fn initiate_checkout(
     State(state): State<AppState>,
     Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<InitiateCheckoutApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    check_cart_access(&state, request.cart_id, &auth).await?;
     super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -427,9 +450,10 @@ pub async fn initiate_checkout(
 /// Updates the checkout with the selected shipping method and recalculates totals
 pub async fn select_shipping(
     State(state): State<AppState>,
-    Extension(_auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<SelectShippingApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    check_cart_access(&state, request.cart_id, &auth).await?;
     super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -482,6 +506,7 @@ pub async fn complete_checkout(
     Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<CompleteCheckoutApiRequest>,
 ) -> Result<(StatusCode, Json<CheckoutResultResponse>), (StatusCode, Json<serde_json::Value>)> {
+    check_cart_access(&state, request.cart_id, &auth).await?;
     // Validate email
     if request.customer_email.is_empty() || !request.customer_email.contains('@') {
         return Err((
@@ -827,9 +852,10 @@ pub(crate) async fn finalize_subscription_for_order(state: &AppState, order_id: 
 /// Verifies a client-side confirmed payment (e.g., Stripe Elements) and finalizes the order
 pub async fn confirm_checkout(
     State(state): State<AppState>,
-    Extension(_auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<ConfirmCheckoutApiRequest>,
 ) -> Result<(StatusCode, Json<CheckoutResultResponse>), (StatusCode, Json<serde_json::Value>)> {
+    check_cart_access(&state, request.cart_id, &auth).await?;
     let core_request = rcommerce_core::services::ConfirmCheckoutRequest {
         order_id: request.order_id,
         payment_intent_id: request.payment_intent_id,
