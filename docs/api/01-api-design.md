@@ -485,6 +485,18 @@ DELETE /v1/payment-methods/:token   # Delete saved payment method
 POST   /v1/webhooks/:gateway       # Receive webhooks from payment providers
 ```
 
+**Authorization** (all routes except webhooks need a JWT):
+
+| Route | Allowed callers |
+|---|---|
+| `POST /payments` | The order's customer (or an admin); `amount` and `currency` must equal the order's total and currency |
+| `GET /payments/:id`, `POST /payments/:id/complete` | The customer of the payment's order (or an admin) |
+| `POST /payments/:id/refund` | Admins only (like `POST /orders/:id/refund`) |
+| `GET /customers/:id/payment-methods` | That customer (or an admin) |
+| `DELETE /payment-methods/:token` | The customer the method belongs to (or an admin) |
+
+Other callers get `404 Not Found` (`403` for refunds), so payment ids cannot be probed.
+
 **Supported Payment Gateways:**
 - Stripe (Full support)
 - Airwallex (Full support - Demo/Production ready)
