@@ -140,7 +140,7 @@ jsonwebtoken = "9.2"
 # jwt-simple = "0.12"  # Removed - using jsonwebtoken instead
 
 # Scheduling and time utilities
-chrono-tz = { version = "0.8", features = ["serde"] }
+chrono-tz = "0.9"
 cron = "0.13"
 
 # Time utilities

@@ -1482,6 +1482,148 @@ async fn test_admin_can_create_product() {
     app.cleanup().await.ok();
 }
 
+/// Test 12: Store locations (branches, opening hours, pickup time)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_store_locations() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let url = |path: &str| format!("{}/api/v1{}", app.base_url(), path);
+    let location = |code: &str, slug: &str, public: bool| {
+        serde_json::json!({
+            "name": format!("Branch {code}"), "code": code, "slug": slug,
+            "is_public": public, "is_pickup_point": public,
+            "timezone": "Europe/Brussels", "country_code": "BE",
+            "latitude": 50.8467, "longitude": 4.3525,
+            "services": ["pickup", "showroom"]
+        })
+    };
+
+    // Customers cannot manage locations
+    let response = app
+        .http_client
+        .post(url("/admin/locations"))
+        .bearer_auth(&customer_token)
+        .json(&location("CUST", "cust", true))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status() == 401 || response.status() == 403);
+
+    // Invalid input is a 400
+    let mut bad = location("BAD", "bad", true);
+    bad["timezone"] = serde_json::json!("Brussels");
+    let response = app
+        .http_client
+        .post(url("/admin/locations"))
+        .bearer_auth(&admin)
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    // A public pickup point and a private warehouse
+    let response = app
+        .http_client
+        .post(url("/admin/locations"))
+        .bearer_auth(&admin)
+        .json(&location("CEN", "central", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let created: serde_json::Value = response.json().await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let response = app
+        .http_client
+        .post(url("/admin/locations"))
+        .bearer_auth(&admin)
+        .json(&location("WH", "warehouse", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    // Open every day, all day: always open (or opening at midnight), and an
+    // order placed now is ready about an hour later
+    let ranges: Vec<_> = (1..=7)
+        .map(|d| serde_json::json!({"weekday": d, "opens_at": "00:00:00", "closes_at": "23:59:00"}))
+        .collect();
+    let response = app
+        .http_client
+        .put(url(&format!("/admin/locations/{id}/opening-hours")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "ranges": ranges }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    // A special day and a Dutch description
+    let response = app
+        .http_client
+        .post(url(&format!("/admin/locations/{id}/closures")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"date": "2099-12-25", "reason": "Noël"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let response = app
+        .http_client
+        .put(url(&format!("/admin/locations/{id}/translations/nl")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"description": "Bouwmaterialen en showroom"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    // The storefront lists the public location only, nearest first
+    let list: Vec<serde_json::Value> = app
+        .http_client
+        .get(url("/locations?near=51.2194,4.4025&lang=nl"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1, "only the public location: {list:?}");
+    let branch = &list[0];
+    assert_eq!(branch["slug"], "central");
+    assert_eq!(branch["opening_hours"].as_array().unwrap().len(), 7);
+    assert_eq!(branch["description"], "Bouwmaterialen en showroom");
+    assert_eq!(branch["locale"], "nl");
+    assert!(branch["distance_km"].as_f64().unwrap() > 30.0);
+    assert!(branch["pickup_ready_at"].is_string());
+    assert!(
+        branch["status"]["is_open"] == true || branch["status"]["next_opening"].is_string(),
+        "{branch}"
+    );
+
+    // By slug; the private warehouse is not public
+    let response = app
+        .http_client
+        .get(url("/locations/central"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = app
+        .http_client
+        .get(url("/locations/warehouse"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {

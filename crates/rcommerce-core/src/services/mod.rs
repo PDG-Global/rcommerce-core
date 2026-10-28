@@ -7,6 +7,7 @@ pub mod coupon_service;
 pub mod customer_service;
 pub mod digital_product_service;
 pub mod dunning_service;
+pub mod location_service;
 pub mod newsletter_service;
 pub mod order_service;
 pub mod product_service;
