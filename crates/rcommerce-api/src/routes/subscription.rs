@@ -248,12 +248,7 @@ async fn create_consent(
         .customer_service
         .find_by_id(auth.customer_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-        })?
+        .map_err(super::error_json)?
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -267,12 +262,7 @@ async fn create_consent(
             .bind(auth.customer_id)
             .fetch_optional(state.db.pool())
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-            })?
+            .map_err(super::error_json)?
             .flatten();
 
     let gateway_customer_id = match existing {
@@ -282,23 +272,13 @@ async fn create_consent(
             let id = gateway
                 .create_customer(&customer.email, &name)
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
+                .map_err(super::error_json)?;
             sqlx::query("UPDATE customers SET airwallex_customer_id = $1 WHERE id = $2")
                 .bind(&id)
                 .bind(auth.customer_id)
                 .execute(state.db.pool())
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
+                .map_err(super::error_json)?;
             id
         }
     };
@@ -316,12 +296,7 @@ async fn create_consent(
             &request.merchant_trigger_reason,
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-        })?;
+        .map_err(super::error_json)?;
 
     Ok(Json(serde_json::json!({
         "success": true,

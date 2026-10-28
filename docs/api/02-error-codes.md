@@ -102,6 +102,9 @@ All errors follow a consistent JSON format:
 - **Note**: server errors (5xx) never carry internal details such as SQL errors,
   constraint names or file paths. The detail is logged server-side (`ERROR`
   level, with the error category) for operators.
+  The checkout and saved-card consent endpoints, which answer `{"error": "..."}`,
+  follow the same rule: 400 with the message for client errors, and the real 5xx
+  status with a generic message for server failures.
 
 #### `not_implemented`
 - **Status**: 501
