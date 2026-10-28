@@ -149,6 +149,8 @@ pub struct AppState {
     pub default_currency: String,
     /// Airwallex settlement reconciliation client (None when unconfigured)
     pub settlement_sync: Option<Arc<rcommerce_core::accounting::SettlementSync>>,
+    /// Catalogue sync from `[catalogue] source_url` (None when unconfigured)
+    pub catalogue_sync: Option<Arc<rcommerce_core::catalogue::CatalogueSync>>,
 }
 
 impl AppState {
@@ -268,6 +270,7 @@ impl AppState {
             accounting: params.accounting,
             default_currency: params.default_currency,
             settlement_sync,
+            catalogue_sync: None,
         }
     }
 }
