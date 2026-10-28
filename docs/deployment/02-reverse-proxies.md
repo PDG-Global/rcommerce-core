@@ -156,6 +156,22 @@ server {
 }
 ```
 
+### Client IP and the built-in rate limiter
+
+The API's per-IP limiter (`[rate_limiting]`) reads `X-Forwarded-For` only from
+**trusted proxies**: by default loopback and private networks, which covers a proxy
+on the same host, in Docker or on a private network. The entries are read from the
+right, so a client cannot pick its own IP by sending the header itself.
+
+If a CDN or load balancer reaches the API from public addresses, add them:
+
+```toml
+[rate_limiting]
+trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "173.245.48.0/20"]  # + your CDN's ranges
+```
+
+Otherwise each CDN edge counts as one client.
+
 ## Caddy
 
 Caddy is a modern, easy-to-use web server with automatic HTTPS.

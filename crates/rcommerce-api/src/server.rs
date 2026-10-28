@@ -77,9 +77,13 @@ async fn run_http_server(config: Config) -> Result<()> {
         .await
         .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
+    // Peer addresses feed the per-IP rate limiter
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
 
     Ok(())
 }
@@ -204,7 +208,7 @@ async fn start_manual_tls_server(
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             error!("HTTPS server error: {}", e);
@@ -274,7 +278,7 @@ async fn start_lets_encrypt_server(
     let handle = tokio::spawn(async move {
         if let Err(e) = axum_server::bind(addr)
             .acceptor(acceptor)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             error!("HTTPS server error: {}", e);

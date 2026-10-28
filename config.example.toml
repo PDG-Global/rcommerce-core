@@ -259,6 +259,12 @@ smtp_tls = true
 # Enable rate limiting (default: true)
 enabled = true
 
+# Proxies whose X-Forwarded-For is believed (addresses or networks). Requests from
+# other peers are limited by the peer address, so clients cannot forge their IP.
+# The default trusts loopback and private networks: a reverse proxy on the same
+# host or network. Add your CDN's ranges if it connects to the API directly.
+# trusted_proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+
 # Maximum requests per minute from a single IP (default: 60)
 requests_per_minute = 60
 

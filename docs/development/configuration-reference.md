@@ -62,6 +62,22 @@ RCOMMERCE_SERVER_WORKER_THREADS=4
 RCOMMERCE_SERVER_RATE_LIMIT_PER_MINUTE=5000
 ```
 
+## Rate Limiting
+
+```toml
+[rate_limiting]
+enabled = true
+requests_per_minute = 60      # per client IP
+allowlist = []                # IPs never limited
+blocklist = []                # IPs always refused
+# Peers whose X-Forwarded-For is believed; default: loopback and private networks
+trusted_proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+```
+
+The client IP is the TCP peer. When the peer is a trusted proxy, `X-Forwarded-For` is
+read from the right, skipping trusted proxies, and the first other address is the
+client. An empty `trusted_proxies` ignores the header.
+
 ## Database Configuration
 
 ### PostgreSQL Configuration
