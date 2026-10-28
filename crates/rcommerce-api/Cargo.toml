@@ -37,6 +37,7 @@ serde_json = { workspace = true }
 
 # UUID
 uuid = { workspace = true }
+ipnet = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

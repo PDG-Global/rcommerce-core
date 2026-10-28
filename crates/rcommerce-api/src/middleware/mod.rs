@@ -9,7 +9,7 @@ use axum::{
     Json,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -231,6 +231,7 @@ pub struct RateLimiter {
     allowlist: Vec<String>,
     blocklist: Vec<String>,
     expose_headers: bool,
+    trusted_proxies: Vec<ipnet::IpNet>,
     store: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
@@ -243,6 +244,7 @@ impl RateLimiter {
             allowlist: config.allowlist.clone(),
             blocklist: config.blocklist.clone(),
             expose_headers: config.expose_headers,
+            trusted_proxies: parse_networks(&config.trusted_proxies),
             store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -297,21 +299,66 @@ impl RateLimiter {
     }
 }
 
-/// Resolve the client IP, honoring X-Forwarded-For when behind a reverse proxy
-fn client_ip(request: &Request<Body>) -> String {
-    let addr = request
+/// IP networks from the configuration ("10.0.0.0/8", or a single address).
+/// Invalid entries are logged and ignored.
+fn parse_networks(entries: &[String]) -> Vec<ipnet::IpNet> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            let net = entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<IpAddr>().map(ipnet::IpNet::from));
+            if net.is_err() {
+                tracing::warn!(
+                    "rate_limiting.trusted_proxies: ignoring invalid entry {:?}",
+                    entry
+                );
+            }
+            net.ok()
+        })
+        .collect()
+}
+
+/// Client IP for rate limiting: the TCP peer, unless the peer is a trusted
+/// proxy. Then the `X-Forwarded-For` entries are read from the right, skipping
+/// trusted proxies: the first other address is the client. Entries further left
+/// were written by the client and are never used, so they cannot be forged to
+/// get a fresh limit.
+fn client_ip(request: &Request<Body>, trusted_proxies: &[ipnet::IpNet]) -> String {
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-
-    request
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let trusted = |ip: &IpAddr| trusted_proxies.iter().any(|net| net.contains(ip));
+    if !trusted(&peer) {
+        return peer.to_string();
+    }
+    let hops: Vec<&str> = request
         .headers()
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string())
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|h| h.split(','))
+        .map(str::trim)
+        .collect();
+    let mut client = peer;
+    for hop in hops.iter().rev() {
+        let Some(ip) = parse_hop(hop) else { break };
+        client = ip;
+        if !trusted(&ip) {
+            break;
+        }
+    }
+    client.to_string()
+}
+
+/// One `X-Forwarded-For` entry: an address, possibly with a port
+fn parse_hop(hop: &str) -> Option<IpAddr> {
+    hop.parse::<IpAddr>()
+        .or_else(|_| hop.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()
 }
 
 /// Rate limiting middleware - enforces the `[rate_limiting]` config per client IP
@@ -320,7 +367,7 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let ip = client_ip(&request);
+    let ip = client_ip(&request, &limiter.trusted_proxies);
 
     match limiter.check(&ip).await {
         RateLimitCheck::Allowed(remaining) => {
@@ -461,6 +508,57 @@ pub async fn security_headers_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_from(peer: &str, forwarded_for: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri("/api/v1/products");
+        if let Some(value) = forwarded_for {
+            builder = builder.header("x-forwarded-for", value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        request
+    }
+
+    fn default_proxies() -> Vec<ipnet::IpNet> {
+        parse_networks(&RateLimitConfig::default().trusted_proxies)
+    }
+
+    #[test]
+    fn a_direct_client_cannot_forge_its_address() {
+        let request = request_from("198.51.100.7:51000", Some("1.2.3.4"));
+        assert_eq!(client_ip(&request, &default_proxies()), "198.51.100.7");
+    }
+
+    #[test]
+    fn behind_a_local_proxy_the_appended_address_is_used() {
+        // The client forged "6.6.6.6"; nginx on a private network appended the real one
+        let request = request_from("10.0.0.2:51000", Some("6.6.6.6, 203.0.113.9"));
+        assert_eq!(client_ip(&request, &default_proxies()), "203.0.113.9");
+        // Two proxies: a CDN listed as trusted, then nginx
+        let proxies = parse_networks(&["10.0.0.0/8".into(), "198.51.100.0/24".into()]);
+        let request = request_from("10.0.0.2:51000", Some("203.0.113.9, 198.51.100.20"));
+        assert_eq!(client_ip(&request, &proxies), "203.0.113.9");
+        // No header: the proxy itself
+        let request = request_from("10.0.0.2:51000", None);
+        assert_eq!(client_ip(&request, &default_proxies()), "10.0.0.2");
+    }
+
+    #[test]
+    fn forwarded_for_is_ignored_without_trusted_proxies() {
+        let request = request_from("10.0.0.2:51000", Some("203.0.113.9"));
+        assert_eq!(client_ip(&request, &[]), "10.0.0.2");
+    }
+
+    #[test]
+    fn hops_with_ports_and_junk() {
+        let request = request_from("127.0.0.1:51000", Some("203.0.113.9:4711"));
+        assert_eq!(client_ip(&request, &default_proxies()), "203.0.113.9");
+        let request = request_from("127.0.0.1:51000", Some("not-an-ip"));
+        assert_eq!(client_ip(&request, &default_proxies()), "127.0.0.1");
+        assert_eq!(parse_networks(&["bad".into(), "192.0.2.1".into()]).len(), 1);
+    }
 
     fn test_config(requests_per_minute: u32) -> RateLimitConfig {
         RateLimitConfig {

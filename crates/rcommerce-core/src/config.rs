@@ -817,6 +817,15 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub allowlist: Vec<String>,
 
+    /// Reverse proxies and load balancers whose `X-Forwarded-For` header is
+    /// believed, as IP addresses or networks ("10.0.0.0/8"). Requests from any
+    /// other peer are limited by the peer address, so clients cannot pick their
+    /// own IP with a forged header. The default trusts loopback and private
+    /// networks (a proxy on the same host or network); an empty list ignores
+    /// `X-Forwarded-For`.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+
     /// Enable DDoS protection mode (stricter limits under attack)
     #[serde(default = "default_true")]
     pub ddos_protection: bool,
@@ -846,6 +855,7 @@ impl Default for RateLimitConfig {
             api_key_requests_per_minute: 1000,
             blocklist: vec![],
             allowlist: vec![],
+            trusted_proxies: default_trusted_proxies(),
             ddos_protection: true,
             expose_headers: true,
             use_redis: false,
@@ -855,6 +865,19 @@ impl Default for RateLimitConfig {
 }
 
 // Default value helper functions
+fn default_trusted_proxies() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 fn default_true() -> bool {
     true
 }
