@@ -79,6 +79,11 @@ Content-Type: application/json
 }
 ```
 
+**Failed logins:** a wrong password and an unknown e-mail both get the same
+`401 Invalid email or password`. Unknown e-mails cost the same password-hashing
+time, and the "verify your e-mail" response is only given after a correct
+password, so the login endpoint does not reveal which e-mails have accounts.
+
 **Using the token:**
 ```http
 GET /api/v1/customers

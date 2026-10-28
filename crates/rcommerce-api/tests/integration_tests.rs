@@ -1060,6 +1060,50 @@ async fn test_auth_flows() {
     app.cleanup().await.ok();
 }
 
+/// Test 4b: Login answers the same for a wrong password and an unknown e-mail,
+/// and only the password holder learns that the e-mail is not verified
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_login_does_not_reveal_accounts() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let email = format!("enum_test_{}@example.com", Uuid::new_v4());
+    let password = "TestPassword123!";
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/auth/register", app.base_url()))
+        .json(&serde_json::json!({
+            "email": email, "password": password,
+            "first_name": "Enum", "last_name": "Test"
+        }))
+        .send()
+        .await
+        .expect("Failed to register");
+    assert_eq!(response.status(), 201);
+
+    let login = |email: String, password: &'static str| {
+        let request = app
+            .http_client
+            .post(format!("{}/api/v1/auth/login", app.base_url()))
+            .json(&serde_json::json!({ "email": email, "password": password }));
+        async move {
+            let response = request.send().await.expect("Failed to login");
+            (response.status(), response.text().await.unwrap_or_default())
+        }
+    };
+    // Unverified account, wrong password: no hint that the account exists
+    let (status, known) = login(email.clone(), "Wrong-Password-1").await;
+    assert_eq!(status, 401, "{known}");
+    let unknown_email = format!("nobody_{}@example.com", Uuid::new_v4());
+    let (status, unknown) = login(unknown_email, "Wrong-Password-1").await;
+    assert_eq!(status, 401);
+    assert_eq!(known, unknown, "both failures must look the same");
+    // The right password is told to verify the e-mail first
+    let (status, body) = login(email, password).await;
+    assert_eq!(status, 403, "{body}");
+
+    app.cleanup().await.ok();
+}
+
 /// Test 5: Coupon application
 #[tokio::test]
 #[ignore = "Requires PostgreSQL database with proper permissions"]

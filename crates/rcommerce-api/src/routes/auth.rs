@@ -10,8 +10,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::state::AppState;
+
 use rcommerce_core::{
-    models::CreateCustomerRequest,
+    models::{CreateCustomerRequest, Customer},
     notification::{Notification, NotificationChannel, NotificationPriority},
     Error,
 };
@@ -175,30 +176,17 @@ pub struct ResendVerificationResponse {
     pub message: String,
 }
 
+/// Argon2 hash verified for unknown e-mails, so they cost as much as known ones
+static DUMMY_PASSWORD_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Login endpoint
 pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, Response> {
-    // Find customer by email
-    let customer = state
-        .customer_service
-        .find_by_email(&payload.email)
-        .await
-        .map_err(|e| e.into_response())?
-        .ok_or_else(|| Error::unauthorized("Invalid email or password").into_response())?;
+    let (customer, needs_rehash) = check_credentials(&state, &payload).await.map_err(|e| *e)?;
 
-    // Imported accounts without a local password must reset their password before logging in.
-    if customer.is_imported && customer.password_hash.is_none() {
-        return Err(ImportedAccountResponse {
-            message: "This account was imported. Please reset your password to continue."
-                .to_string(),
-            requires_password_reset: true,
-        }
-        .into_response());
-    }
-
-    // Email must be verified before logging in.
+    // Email must be verified before logging in (only told to the password holder).
     if !customer.email_verified {
         return Err(EmailVerificationRequiredResponse {
             message: "Please verify your email before logging in.".to_string(),
@@ -207,56 +195,114 @@ pub async fn login(
         .into_response());
     }
 
-    // Verify password
-    let password_hash = customer
-        .password_hash
-        .as_ref()
-        .ok_or_else(|| Error::unauthorized("Invalid email or password").into_response())?;
+    // Rehash password if it was using legacy format (PHPass or bcrypt)
+    if needs_rehash {
+        rehash_password(&state, customer.id, &payload.password)
+            .await
+            .map_err(|e| e.into_response())?;
+    }
 
+    login_response(&state, customer, payload.remember_me)
+        .map(Json)
+        .map_err(|e| e.into_response())
+}
+
+/// The account matching the login credentials, and whether its password hash
+/// uses a legacy format. An unknown e-mail costs the same hashing work and gets
+/// the same answer as a wrong password.
+async fn check_credentials(
+    state: &AppState,
+    payload: &LoginRequest,
+) -> Result<(Customer, bool), Box<Response>> {
+    let invalid = || Box::new(Error::unauthorized("Invalid email or password").into_response());
+    let customer = state
+        .customer_service
+        .find_by_email(&payload.email)
+        .await
+        .map_err(|e| Box::new(e.into_response()))?;
+    let Some(customer) = customer else {
+        verify_dummy_password(state, &payload.password).map_err(|e| Box::new(e.into_response()))?;
+        return Err(invalid());
+    };
+
+    // Imported accounts without a local password must reset their password before logging in.
+    if customer.is_imported && customer.password_hash.is_none() {
+        return Err(Box::new(
+            ImportedAccountResponse {
+                message: "This account was imported. Please reset your password to continue."
+                    .to_string(),
+                requires_password_reset: true,
+            }
+            .into_response(),
+        ));
+    }
+
+    // Verify the password before revealing anything else about the account
+    let password_hash = customer.password_hash.as_ref().ok_or_else(invalid)?;
     let (valid, needs_rehash) = state
         .auth_service
         .verify_password(&payload.password, password_hash)
-        .map_err(|e| e.into_response())?;
-
+        .map_err(|e| Box::new(e.into_response()))?;
     if !valid {
-        return Err(Error::unauthorized("Invalid email or password").into_response());
+        return Err(invalid());
     }
+    Ok((customer, needs_rehash))
+}
 
-    // Rehash password if it was using legacy format (PHPass or bcrypt)
-    if needs_rehash {
-        let new_hash = state
-            .auth_service
-            .hash_password(&payload.password)
-            .map_err(|e| e.into_response())?;
-        if let Err(e) = state
-            .customer_service
-            .update_password_hash(customer.id, &new_hash)
-            .await
-        {
-            tracing::warn!(
-                "Failed to rehash password for customer {}: {}",
-                customer.id,
-                e
-            );
-        } else {
-            tracing::info!(
-                "Password rehashed with Argon2id for customer {}",
-                customer.id
-            );
+/// Verify a password against a dummy hash: the same work as for a real
+/// account, so the response time does not reveal which e-mails are registered
+fn verify_dummy_password(state: &AppState, password: &str) -> Result<(), Error> {
+    let dummy = match DUMMY_PASSWORD_HASH.get() {
+        Some(hash) => hash,
+        None => {
+            let hash = state
+                .auth_service
+                .hash_password("rcommerce-dummy-password")?;
+            DUMMY_PASSWORD_HASH.get_or_init(|| hash)
         }
-    }
+    };
+    let _ = state.auth_service.verify_password(password, dummy);
+    Ok(())
+}
 
-    // Generate tokens with role-based permissions
-    let access_token = state
-        .auth_service
-        .generate_access_token(customer.id, &customer.email, &customer.role)
-        .map_err(|e| e.into_response())?;
+/// Store an Argon2id hash in place of a legacy one (PHPass or bcrypt). A
+/// failure to store it is logged and the login goes on.
+async fn rehash_password(state: &AppState, customer_id: Uuid, password: &str) -> Result<(), Error> {
+    let new_hash = state.auth_service.hash_password(password)?;
+    if let Err(e) = state
+        .customer_service
+        .update_password_hash(customer_id, &new_hash)
+        .await
+    {
+        tracing::warn!(
+            "Failed to rehash password for customer {}: {}",
+            customer_id,
+            e
+        );
+    } else {
+        tracing::info!(
+            "Password rehashed with Argon2id for customer {}",
+            customer_id
+        );
+    }
+    Ok(())
+}
+
+/// Access and refresh tokens, with role-based permissions, for a logged-in customer
+fn login_response(
+    state: &AppState,
+    customer: Customer,
+    remember_me: bool,
+) -> Result<LoginResponse, Error> {
+    let access_token =
+        state
+            .auth_service
+            .generate_access_token(customer.id, &customer.email, &customer.role)?;
     let refresh_token = state
         .auth_service
-        .generate_refresh_token(customer.id, payload.remember_me)
-        .map_err(|e| e.into_response())?;
+        .generate_refresh_token(customer.id, remember_me)?;
 
-    Ok(Json(LoginResponse {
+    Ok(LoginResponse {
         access_token,
         refresh_token,
         token_type: "Bearer".to_string(),
@@ -267,7 +313,7 @@ pub async fn login(
             first_name: customer.first_name,
             last_name: customer.last_name,
         },
-    }))
+    })
 }
 
 /// Register endpoint
