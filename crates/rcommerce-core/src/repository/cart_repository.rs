@@ -60,6 +60,14 @@ pub trait CartRepository: Send + Sync {
     /// Update cart item
     async fn update_item(&self, item: &CartItem) -> Result<()>;
 
+    /// Set a line's discount (and its total from its current subtotal) without
+    /// rewriting quantity or price, so a concurrent add to the line is kept
+    async fn set_item_discount(
+        &self,
+        item_id: Uuid,
+        discount_amount: rust_decimal::Decimal,
+    ) -> Result<()>;
+
     /// Remove item from cart
     async fn remove_item(&self, item_id: Uuid) -> Result<()>;
 
@@ -345,6 +353,15 @@ impl CartRepository for PgCartRepository {
                 subtotal, discount_amount, total, sku, title, variant_title, image_url,
                 requires_shipping, is_gift_card, custom_attributes, created_at, updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            -- Adding a product the cart already holds increments that line in the same
+            -- statement, so simultaneous adds neither fail on idx_cart_items_unique nor
+            -- lose quantity
+            ON CONFLICT (cart_id, product_id, COALESCE(variant_id, '00000000-0000-0000-0000-000000000000'))
+            DO UPDATE SET
+                quantity = cart_items.quantity + EXCLUDED.quantity,
+                subtotal = (cart_items.quantity + EXCLUDED.quantity) * cart_items.unit_price,
+                total = (cart_items.quantity + EXCLUDED.quantity) * cart_items.unit_price - cart_items.discount_amount,
+                updated_at = EXCLUDED.updated_at
             "#
         )
         .bind(item.id)
@@ -370,6 +387,23 @@ impl CartRepository for PgCartRepository {
         .await
         .map_err(Error::Database)?;
 
+        Ok(())
+    }
+
+    async fn set_item_discount(
+        &self,
+        item_id: Uuid,
+        discount_amount: rust_decimal::Decimal,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE cart_items SET discount_amount = $2, total = subtotal - $2, updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(item_id)
+        .bind(discount_amount)
+        .execute(&self.pool)
+        .await
+        .map_err(Error::Database)?;
         Ok(())
     }
 

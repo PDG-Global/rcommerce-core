@@ -319,24 +319,9 @@ impl CartService {
             ));
         }
 
-        // Check if item already exists in cart
-        if let Some(mut existing_item) = self
-            .cart_repo
-            .find_item(cart_id, input.product_id, input.variant_id)
-            .await?
-        {
-            // Update quantity
-            existing_item.quantity += input.quantity;
-            existing_item.calculate_totals();
-            self.cart_repo.update_item(&existing_item).await?;
-
-            // Recalculate cart totals
-            self.recalculate_cart(cart_id).await?;
-
-            return Ok(existing_item);
-        }
-
-        // Create new cart item
+        // Insert the line, or add to an existing one in the same statement (the
+        // repository upserts): a read-modify-write here lost quantity, or failed on
+        // the unique index, when the same product was added twice at once
         let mut item = CartItem {
             id: Uuid::new_v4(),
             cart_id,
@@ -365,7 +350,12 @@ impl CartService {
         // Recalculate cart totals
         self.recalculate_cart(cart_id).await?;
 
-        Ok(item)
+        // Return the line as stored: the insert may have merged into an existing one
+        Ok(self
+            .cart_repo
+            .find_item(cart_id, input.product_id, input.variant_id)
+            .await?
+            .unwrap_or(item))
     }
 
     /// Add a bundle product to cart (expands into components)
@@ -663,15 +653,21 @@ impl CartService {
             .filter(|i| !self.is_bundle_component(i))
             .cloned()
             .collect();
-        for mut item in parent_items {
+        for item in parent_items {
             let item_ratio = if cart.subtotal > Decimal::ZERO {
                 item.subtotal / cart.subtotal
             } else {
                 Decimal::ZERO
             };
-            item.discount_amount = (cart.discount_total * item_ratio).round_dp(2);
-            item.total = item.subtotal - item.discount_amount;
-            self.cart_repo.update_item(&item).await?;
+            let discount_amount = (cart.discount_total * item_ratio).round_dp(2);
+            // Only the discount changes here: writing the whole line read above would
+            // overwrite a quantity added concurrently (and costs one UPDATE per line
+            // on every cart change)
+            if item.discount_amount != discount_amount {
+                self.cart_repo
+                    .set_item_discount(item.id, discount_amount)
+                    .await?;
+            }
         }
 
         // Calculate tax if we have shipping address and tax service
@@ -965,5 +961,98 @@ mod tests {
         assert_eq!(tax_addr.country_code, "DE");
         assert_eq!(tax_addr.region_code, Some("BE".to_string()));
         assert_eq!(tax_addr.postal_code, Some("10115".to_string()));
+    }
+
+    /// DB-backed: requires PostgreSQL via TEST_DATABASE_URL; skipped without it
+    #[tokio::test]
+    async fn test_simultaneous_adds_of_one_product_all_count() {
+        use crate::repository::{PgCartRepository, PgCouponRepository};
+
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Skipping cart concurrency test: cannot connect to {url}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = crate::Migrator::new(pool.clone()).migrate().await {
+            eprintln!("Skipping cart concurrency test: migration failed: {e}");
+            return;
+        }
+
+        let product_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO products (id, title, slug, price) VALUES ($1, 'Concurrent add', $2, 10.00)")
+            .bind(product_id)
+            .bind(format!("concurrent-add-{product_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cart_repo: Arc<dyn CartRepository> = Arc::new(PgCartRepository::new(pool.clone()));
+        let coupon_repo: Arc<dyn CouponRepository> =
+            Arc::new(PgCouponRepository::new(pool.clone()));
+        let coupon_service = Arc::new(CouponService::new(coupon_repo.clone(), cart_repo.clone()));
+        let service = Arc::new(CartService::new(cart_repo, coupon_repo, coupon_service));
+        let cart = service
+            .get_or_create_cart(
+                CartIdentifier::Session(format!("sess_{}", Uuid::new_v4())),
+                "USD",
+            )
+            .await
+            .unwrap();
+
+        let adds: Vec<_> = (0..6)
+            .map(|_| {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .add_item(
+                            cart.id,
+                            AddToCartInput {
+                                product_id,
+                                variant_id: None,
+                                quantity: 1,
+                                custom_attributes: None,
+                            },
+                            ProductDetails {
+                                unit_price: dec!(10.00),
+                                original_price: dec!(10.00),
+                                sku: None,
+                                title: "Concurrent add".to_string(),
+                                variant_title: None,
+                                image_url: None,
+                                requires_shipping: true,
+                                is_gift_card: false,
+                            },
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for add in adds {
+            add.await.unwrap().expect("every add must succeed");
+        }
+
+        let lines = service.get_cart_with_items(cart.id).await.unwrap().items;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].quantity, 6);
+        assert_eq!(lines[0].subtotal, dec!(60.00));
+
+        sqlx::query("DELETE FROM carts WHERE id = $1")
+            .bind(cart.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM products WHERE id = $1")
+            .bind(product_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

@@ -219,13 +219,16 @@ Authorization: Bearer <jwt_token>
 2. Fetches product details from `ProductService`
 3. If variant specified, validates variant exists
 4. Builds `ProductDetails` with pricing information
-5. Calls `cart_service.add_item(cart_id, input, product_details)`
-6. Recalculates cart totals automatically
+5. Checks stock: the units already in the cart plus the requested quantity must not
+   exceed the available stock
+6. Calls `cart_service.add_item(cart_id, input, product_details)`; adding a product
+   the cart already holds increments that line atomically, so simultaneous adds
+   (double clicks, parallel requests) all count
+7. Recalculates cart totals automatically
 
 **Error Responses:**
-- `400 Bad Request` - Invalid quantity (must be > 0)
+- `400 Bad Request` - Invalid quantity (must be > 0), or not enough stock
 - `404 Not Found` - Product or variant not found
-- `422 Unprocessable Entity` - Product out of stock
 
 ### Update Cart Item
 
@@ -247,6 +250,7 @@ Returns the updated cart item.
 
 **Implementation Details:**
 - Validates quantity >= 0
+- A quantity above the available stock is rejected with `400 Bad Request`
 - Calls `cart_service.update_item(cart_id, item_id, input)`
 - If quantity is 0, item is removed
 - Recalculates cart totals
