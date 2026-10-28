@@ -149,6 +149,11 @@ pub struct AppState {
     pub default_currency: String,
     /// Airwallex settlement reconciliation client (None when unconfigured)
     pub settlement_sync: Option<Arc<rcommerce_core::accounting::SettlementSync>>,
+    /// Store this state serves ("default" for a single store)
+    pub store_slug: String,
+    /// Base URL of the storefront, for links in e-mails (password reset,
+    /// e-mail verification)
+    pub storefront_url: String,
 }
 
 impl AppState {
@@ -268,6 +273,8 @@ impl AppState {
             accounting: params.accounting,
             default_currency: params.default_currency,
             settlement_sync,
+            store_slug: "default".to_string(),
+            storefront_url: "http://localhost:3000".to_string(),
         }
     }
 }

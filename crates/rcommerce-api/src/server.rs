@@ -1,10 +1,15 @@
 use axum::{
+    body::Body,
+    http::{header, Request, StatusCode},
     middleware,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -61,13 +66,7 @@ async fn run_http_server(config: Config) -> Result<()> {
         config.server.port,
     ));
 
-    // Initialize application state
-    let app_state = create_app_state(&config).await?;
-    spawn_abandoned_order_sweeper(&config, &app_state);
-    spawn_subscription_billing_loop(&config, &app_state);
-
-    // Build router
-    let app = build_router(app_state, None, &config.server.cors, &config.rate_limiting);
+    let app = build_app(&config).await?;
 
     info!("R Commerce API server listening on http://{}", addr);
     log_routes(&config);
@@ -84,6 +83,134 @@ async fn run_http_server(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// The HTTP application: one store, or one router per `[stores]` entry,
+/// chosen by host name. Background loops (order sweeper, subscription
+/// billing) start for each store.
+pub async fn build_app(config: &Config) -> Result<Router> {
+    let stores = config.expand_stores()?;
+    if stores.is_empty() {
+        let app_state = create_app_state(config).await?;
+        spawn_abandoned_order_sweeper(config, &app_state);
+        spawn_subscription_billing_loop(config, &app_state);
+        Ok(build_router(
+            app_state,
+            None,
+            &config.server.cors,
+            &config.rate_limiting,
+        ))
+    } else {
+        build_multi_store_router(config, stores).await
+    }
+}
+
+/// One router per store, chosen by the request's host name. Per-IP rate
+/// limiting applies once across all stores, so a client does not get a
+/// separate budget per store.
+async fn build_multi_store_router(
+    config: &Config,
+    stores: Vec<rcommerce_core::stores::StoreConfig>,
+) -> Result<Router> {
+    let store_rate_limit = RateLimitConfig {
+        enabled: false,
+        ..config.rate_limiting.clone()
+    };
+    let mut routers = HashMap::new();
+    for store in stores {
+        info!(
+            "Store {} ({:?}): {}",
+            store.definition.slug,
+            store.definition.role,
+            store.definition.hostnames.join(", ")
+        );
+        let app_state = create_app_state(&store.config).await?;
+        spawn_abandoned_order_sweeper(&store.config, &app_state);
+        spawn_subscription_billing_loop(&store.config, &app_state);
+        let router = build_router(
+            app_state,
+            None,
+            &store.config.server.cors,
+            &store_rate_limit,
+        );
+        for host in store.definition.hostnames {
+            routers.insert(host, router.clone());
+        }
+    }
+
+    let dispatcher = StoreDispatcher {
+        routers: Arc::new(routers),
+        trust_forwarded_host: config.server.trust_forwarded_host,
+    };
+    let mut app = Router::new().fallback(move |request: Request<Body>| {
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.dispatch(request).await }
+    });
+    if config.rate_limiting.enabled {
+        app = app.layer(middleware::from_fn_with_state(
+            RateLimiter::new(&config.rate_limiting),
+            rate_limit_middleware,
+        ));
+    }
+    Ok(app)
+}
+
+/// Routes each request to the store serving its host name
+#[derive(Clone)]
+struct StoreDispatcher {
+    routers: Arc<HashMap<String, Router>>,
+    trust_forwarded_host: bool,
+}
+
+impl StoreDispatcher {
+    async fn dispatch(&self, request: Request<Body>) -> Response {
+        let router = request_host(&request, self.trust_forwarded_host)
+            .and_then(|host| self.routers.get(&host).cloned());
+        match router {
+            Some(mut router) => {
+                let ready = std::future::poll_fn(|cx| {
+                    Service::<Request<Body>>::poll_ready(&mut router, cx)
+                })
+                .await;
+                match ready {
+                    Ok(()) => match router.call(request).await {
+                        Ok(response) => response,
+                        Err(never) => match never {},
+                    },
+                    Err(never) => match never {},
+                }
+            }
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": { "message": "Unknown store", "code": 404, "category": "not_found" }
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// The host name a request is for: `Host` (or the HTTP/2 authority), or the
+/// first `X-Forwarded-Host` value when a trusted proxy sets it
+fn request_host(request: &Request<Body>, trust_forwarded_host: bool) -> Option<String> {
+    let headers = request.headers();
+    let forwarded = trust_forwarded_host
+        .then(|| headers.get("x-forwarded-host"))
+        .flatten()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::to_string);
+    let host = forwarded
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()))?;
+    let host = rcommerce_core::stores::normalize_hostname(&host);
+    (!host.is_empty()).then_some(host)
+}
+
 /// Run HTTPS server with TLS
 ///
 /// This implementation:
@@ -92,6 +219,13 @@ async fn run_http_server(config: Config) -> Result<()> {
 /// 3. Starts an HTTPS server on port 443
 /// 4. Supports both manual certificates and Let's Encrypt
 async fn run_tls_server(config: Config) -> Result<()> {
+    if !config.stores.is_empty() {
+        return Err(rcommerce_core::Error::Config(
+            "Several stores need TLS terminated by a reverse proxy: set tls.enabled = false              and serve HTTP behind the proxy (see docs/deployment/multi-store.md)"
+                .to_string(),
+        ));
+    }
+
     // Validate TLS configuration
     if let Err(e) = config.tls.validate() {
         return Err(rcommerce_core::Error::Config(format!(
@@ -396,14 +530,17 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             .stripe
             .secret_key
             .clone()
-            .or_else(|| std::env::var("STRIPE_API_KEY").ok())
+            .or_else(|| env_fallback(config, "STRIPE_API_KEY"))
         {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
+            let webhook_secret =
+                config
+                    .payment
+                    .stripe
+                    .webhook_secret
+                    .clone()
+                    .unwrap_or_else(|| {
+                        env_fallback(config, "STRIPE_WEBHOOK_SECRET").unwrap_or_default()
+                    });
             let stripe_gateway = Box::new(StripeAgnosticGateway::new(stripe_key, webhook_secret));
             payment_service.register_gateway("stripe".to_string(), stripe_gateway);
             info!("Stripe gateway registered");
@@ -420,31 +557,31 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                 .wechatpay
                 .mch_id
                 .clone()
-                .or_else(|| std::env::var("WECHATPAY_MCH_ID").ok()),
+                .or_else(|| env_fallback(config, "WECHATPAY_MCH_ID")),
             config
                 .payment
                 .wechatpay
                 .app_id
                 .clone()
-                .or_else(|| std::env::var("WECHATPAY_APP_ID").ok()),
+                .or_else(|| env_fallback(config, "WECHATPAY_APP_ID")),
             config
                 .payment
                 .wechatpay
                 .api_key
                 .clone()
-                .or_else(|| std::env::var("WECHATPAY_API_KEY").ok()),
+                .or_else(|| env_fallback(config, "WECHATPAY_API_KEY")),
             config
                 .payment
                 .wechatpay
                 .serial_no
                 .clone()
-                .or_else(|| std::env::var("WECHATPAY_SERIAL_NO").ok()),
+                .or_else(|| env_fallback(config, "WECHATPAY_SERIAL_NO")),
             config
                 .payment
                 .wechatpay
                 .private_key
                 .clone()
-                .or_else(|| std::env::var("WECHATPAY_PRIVATE_KEY").ok()),
+                .or_else(|| env_fallback(config, "WECHATPAY_PRIVATE_KEY")),
         ) {
             let wechatpay_gateway = Box::new(WeChatPayAgnosticGateway::new(
                 mch_id,
@@ -472,19 +609,19 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                 .alipay
                 .app_id
                 .clone()
-                .or_else(|| std::env::var("ALIPAY_APP_ID").ok()),
+                .or_else(|| env_fallback(config, "ALIPAY_APP_ID")),
             config
                 .payment
                 .alipay
                 .private_key
                 .clone()
-                .or_else(|| std::env::var("ALIPAY_PRIVATE_KEY").ok()),
+                .or_else(|| env_fallback(config, "ALIPAY_PRIVATE_KEY")),
             config
                 .payment
                 .alipay
                 .alipay_public_key
                 .clone()
-                .or_else(|| std::env::var("ALIPAY_PUBLIC_KEY").ok()),
+                .or_else(|| env_fallback(config, "ALIPAY_PUBLIC_KEY")),
         ) {
             let alipay_gateway = Box::new(AliPayAgnosticGateway::new(
                 app_id,
@@ -511,13 +648,13 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                     .airwallex
                     .client_id
                     .clone()
-                    .or_else(|| std::env::var("AIRWALLEX_CLIENT_ID").ok()),
+                    .or_else(|| env_fallback(config, "AIRWALLEX_CLIENT_ID")),
                 config
                     .payment
                     .airwallex
                     .api_key
                     .clone()
-                    .or_else(|| std::env::var("AIRWALLEX_API_KEY").ok()),
+                    .or_else(|| env_fallback(config, "AIRWALLEX_API_KEY")),
             ) {
                 let webhook_secret = config
                     .payment
@@ -525,7 +662,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                     .webhook_secret
                     .clone()
                     .unwrap_or_else(|| {
-                        std::env::var("AIRWALLEX_WEBHOOK_SECRET").unwrap_or_default()
+                        env_fallback(config, "AIRWALLEX_WEBHOOK_SECRET").unwrap_or_default()
                     });
                 let airwallex_gateway = Box::new(AirwallexAgnosticGateway::new(
                     client_id.clone(),
@@ -576,19 +713,22 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                 .stripe
                 .secret_key
                 .clone()
-                .or_else(|| std::env::var("STRIPE_API_KEY").ok())
+                .or_else(|| env_fallback(config, "STRIPE_API_KEY"))
         } else {
             None
         };
 
     let order_payment_gateway: Box<dyn rcommerce_core::payment::PaymentGateway> =
         if let Some(stripe_key) = &stripe_legacy_config {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
+            let webhook_secret =
+                config
+                    .payment
+                    .stripe
+                    .webhook_secret
+                    .clone()
+                    .unwrap_or_else(|| {
+                        env_fallback(config, "STRIPE_WEBHOOK_SECRET").unwrap_or_default()
+                    });
             Box::new(StripeGateway::new(stripe_key.clone(), webhook_secret))
         } else if let Some((client_id, api_key, webhook_secret, _demo)) = &airwallex_config {
             Box::new(AirwallexGateway::new(
@@ -632,18 +772,21 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             .accounting
             .site_url
             .clone()
-            .or_else(|| std::env::var("STOREFRONT_URL").ok()),
+            .or_else(|| env_fallback(config, "STOREFRONT_URL")),
         subscription_discount_percent: config.subscriptions.discount_percent,
         ..CheckoutConfig::default()
     };
     let checkout_payment_gateway: Arc<dyn rcommerce_core::payment::PaymentGateway> =
         if let Some(stripe_key) = &stripe_legacy_config {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
+            let webhook_secret =
+                config
+                    .payment
+                    .stripe
+                    .webhook_secret
+                    .clone()
+                    .unwrap_or_else(|| {
+                        env_fallback(config, "STRIPE_WEBHOOK_SECRET").unwrap_or_default()
+                    });
             Arc::new(StripeGateway::new(stripe_key.clone(), webhook_secret))
         } else if let Some((client_id, api_key, webhook_secret, _demo)) = &airwallex_config {
             Arc::new(AirwallexGateway::new(
@@ -730,7 +873,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     };
 
     // Create app state
-    Ok(AppState::new(AppStateParams::new(
+    let mut app_state = AppState::new(AppStateParams::new(
         product_service,
         customer_service,
         auth_service,
@@ -760,7 +903,30 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         config.default_currency.clone(),
         Some(config.payment.airwallex.clone()),
     ))
-    .await)
+    .await;
+    if let Some(store) = &config.store {
+        app_state.store_slug = store.slug.clone();
+    }
+    if let Some(url) = config
+        .accounting
+        .site_url
+        .clone()
+        .or_else(|| env_fallback(config, "STOREFRONT_URL"))
+    {
+        app_state.storefront_url = url.trim_end_matches('/').to_string();
+    }
+    Ok(app_state)
+}
+
+/// A process environment variable, for a single store only: a store of a
+/// multi-store process must state its secrets and URLs in its own
+/// configuration, so it can never use another store's credentials
+fn env_fallback(config: &Config, name: &str) -> Option<String> {
+    if config.store.is_some() {
+        None
+    } else {
+        std::env::var(name).ok()
+    }
 }
 
 /// Build CORS layer from configuration
@@ -1060,7 +1226,7 @@ async fn init_redis(config: &Config) -> Option<RedisPool> {
         .cache
         .redis_url
         .clone()
-        .or_else(|| std::env::var("REDIS_URL").ok());
+        .or_else(|| env_fallback(config, "REDIS_URL"));
 
     if let Some(url) = redis_url {
         info!("Connecting to Redis at {}...", url);
@@ -1186,6 +1352,67 @@ async fn root() -> axum::Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(host: Option<&str>, forwarded: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri("/");
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        if let Some(forwarded) = forwarded {
+            builder = builder.header("x-forwarded-host", forwarded);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn store_host_comes_from_host_unless_a_proxy_is_trusted() {
+        let r = request(Some("Shop.Example.com:8080"), Some("other.example.com"));
+        assert_eq!(request_host(&r, false).as_deref(), Some("shop.example.com"));
+        assert_eq!(request_host(&r, true).as_deref(), Some("other.example.com"));
+        let chained = request(Some("proxy.internal"), Some("a.example.com, b.example.com"));
+        assert_eq!(
+            request_host(&chained, true).as_deref(),
+            Some("a.example.com")
+        );
+        assert_eq!(request_host(&request(None, None), false), None);
+    }
+
+    #[tokio::test]
+    async fn requests_reach_the_store_of_their_host() {
+        let store = |name: &'static str| Router::new().route("/", get(move || async move { name }));
+        let mut routers = HashMap::new();
+        routers.insert("a.example.com".to_string(), store("store a"));
+        routers.insert("b.example.com".to_string(), store("store b"));
+        let dispatcher = StoreDispatcher {
+            routers: Arc::new(routers),
+            trust_forwarded_host: false,
+        };
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        let a = dispatcher
+            .dispatch(request(Some("A.example.com:443"), None))
+            .await;
+        assert_eq!(body(a).await, "store a");
+        let b = dispatcher
+            .dispatch(request(Some("b.example.com"), None))
+            .await;
+        assert_eq!(body(b).await, "store b");
+
+        // An unknown host, or a forged forwarded host without a trusted proxy
+        let unknown = dispatcher
+            .dispatch(request(Some("c.example.com"), None))
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let forged = dispatcher
+            .dispatch(request(Some("c.example.com"), Some("a.example.com")))
+            .await;
+        assert_eq!(forged.status(), StatusCode::NOT_FOUND);
+    }
 
     #[tokio::test]
     async fn test_health_check() {

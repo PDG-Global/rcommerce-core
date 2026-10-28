@@ -316,6 +316,20 @@ health_check = true
 experimental = false
 
 # =============================================================================
+# SEVERAL STORES (optional)
+# =============================================================================
+# One process can serve several isolated stores, each with its own database,
+# token secret, upload directory and payment credentials, selected by host name.
+# Each [stores.<name>] table overrides any section above. See
+# docs/deployment/multi-store.md
+# [stores.shop-a]
+# hostnames = ["shop-a.example", "www.shop-a.example"]
+# [stores.shop-a.database]
+# database = "rc_shop_a"
+# [stores.shop-a.security.jwt]
+# secret = "a-different-secret-of-at-least-32-bytes"
+
+# =============================================================================
 # IMPORT & MIGRATIONS
 # =============================================================================
 [import]

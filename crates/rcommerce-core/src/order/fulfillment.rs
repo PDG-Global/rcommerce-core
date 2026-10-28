@@ -98,18 +98,14 @@ pub enum TrackingStatus {
 }
 
 /// Fulfillment service
-#[derive(Default)]
 pub struct FulfillmentService {
-    // In production, this would have:
-    // - Shipping provider integrations
-    // - Tracking update service
-    // - Return management
-    // - Warehouse integration
+    pool: sqlx::PgPool,
 }
 
 impl FulfillmentService {
-    pub fn new() -> Self {
-        Self::default()
+    /// A fulfillment service on the store's connection pool
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
     }
 
     /// Create a fulfillment from order
@@ -117,7 +113,7 @@ impl FulfillmentService {
         // Get order items
         let order = sqlx::query_as::<_, crate::order::Order>("SELECT * FROM orders WHERE id = $1")
             .bind(order_id)
-            .fetch_optional(&*crate::db::get_pool().await?)
+            .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| Error::not_found("Order not found"))?;
 
@@ -138,7 +134,7 @@ impl FulfillmentService {
         )
         .bind(fulfillment_id)
         .bind(order_id)
-        .fetch_one(&*crate::db::get_pool().await?)
+        .fetch_one(&self.pool)
         .await?;
 
         // Create fulfillment items (all order items initially)
@@ -156,7 +152,7 @@ impl FulfillmentService {
         let fulfillment =
             sqlx::query_as::<_, Fulfillment>("SELECT * FROM fulfillments WHERE id = $1")
                 .bind(fulfillment_id)
-                .fetch_optional(&*crate::db::get_pool().await?)
+                .fetch_optional(&self.pool)
                 .await?
                 .ok_or_else(|| Error::not_found("Fulfillment not found"))?;
 
@@ -187,7 +183,7 @@ impl FulfillmentService {
         .bind(shipped_at)
         .bind(delivered_at)
         .bind(fulfillment_id)
-        .fetch_one(&*crate::db::get_pool().await?)
+        .fetch_one(&self.pool)
         .await?;
 
         Ok(updated)
@@ -213,7 +209,7 @@ impl FulfillmentService {
         .bind(carrier)
         .bind(tracking_url)
         .bind(fulfillment_id)
-        .fetch_one(&*crate::db::get_pool().await?)
+        .fetch_one(&self.pool)
         .await?;
 
         Ok(fulfillment)
@@ -254,7 +250,7 @@ impl FulfillmentService {
         sqlx::query("UPDATE fulfillments SET metadata = jsonb_set(metadata, '{return_reason}', $1) WHERE id = $2")
             .bind(serde_json::json!(return_reason))
             .bind(fulfillment_id)
-            .execute(&*crate::db::get_pool().await?)
+            .execute(&self.pool)
             .await?;
 
         self.update_status(fulfillment_id, FulfillmentStatus::Returned)
