@@ -452,6 +452,24 @@ RCOMMERCE_SECURITY_API_KEY_SECRET_LENGTH=40
 RCOMMERCE_SECURITY_WEBHOOK_VERIFY_SIGNATURES=true
 ```
 
+## Catalogue Sync
+
+A catalogue store publishes its products; merchant stores copy their assortment
+from it. See [Catalogue sync](../deployment/catalogue-sync.md).
+
+```toml
+[catalogue]
+publish_changes = false          # true in the catalogue store
+# source_url = "postgres://catalogue_reader:secret@localhost:5432/rc_catalogue"
+sync_interval_seconds = 300      # 0 = only POST /admin/catalogue/sync
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `publish_changes` | `false` | Log product and category changes for the stores that sync from this database |
+| `source_url` | none | Catalogue database to copy from; no sync without it |
+| `sync_interval_seconds` | `300` | Seconds between automatic syncs; `0` = only on demand |
+
 ## Compatibility Configuration
 
 ```toml

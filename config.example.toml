@@ -316,6 +316,19 @@ health_check = true
 experimental = false
 
 # =============================================================================
+# CATALOGUE SYNC (optional)
+# =============================================================================
+# A catalogue store publishes its products; merchant stores copy their
+# assortment from it. See docs/deployment/catalogue-sync.md
+[catalogue]
+# This database publishes its catalogue (logs product and category changes)
+publish_changes = false
+# Copy from this catalogue database (merchant stores)
+# source_url = "postgres://catalogue_reader:secret@localhost:5432/rc_catalogue"
+# Seconds between automatic syncs (0 = only POST /admin/catalogue/sync)
+sync_interval_seconds = 300
+
+# =============================================================================
 # IMPORT & MIGRATIONS
 # =============================================================================
 [import]

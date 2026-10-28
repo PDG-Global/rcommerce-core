@@ -204,6 +204,11 @@ impl Migrator {
                 "default_warehouse",
                 include_str!("../../migrations/021_default_warehouse.sql"),
             ),
+            (
+                24,
+                "catalogue_sync",
+                include_str!("../../migrations/024_catalogue_sync.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {

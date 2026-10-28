@@ -1,5 +1,6 @@
 pub mod accounting;
 pub mod cache;
+pub mod catalogue;
 pub mod common;
 pub mod config;
 pub mod db;
