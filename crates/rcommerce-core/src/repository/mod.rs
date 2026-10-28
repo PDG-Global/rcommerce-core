@@ -8,6 +8,7 @@ pub mod traits;
 // Cart, Coupon, API Key, Statistics, Order, Inventory, Fulfillment, Notification, and Category repositories
 pub mod api_key_repository;
 pub mod cart_repository;
+pub mod catalog_i18n;
 pub mod category_repository;
 pub mod coupon_repository;
 pub mod fulfillment_repository;
@@ -23,6 +24,10 @@ pub use api_key_repository::{
     ApiKeyRecord, ApiKeyRepository, CreateApiKeyRequest, PostgresApiKeyRepository,
 };
 pub use cart_repository::{CartRepository, PgCartRepository};
+pub use catalog_i18n::{
+    normalize_locale, search_tsqueries, CatalogI18nRepository, CategoryTranslation,
+    ProductTranslation, SearchPage,
+};
 pub use category_repository::{CategoryRepository, CategoryTreeNode, PostgresCategoryRepository};
 pub use coupon_repository::{CouponRepository, PgCouponRepository};
 pub use fulfillment_repository::{FulfillmentRepository, PostgresFulfillmentRepository};
