@@ -61,6 +61,16 @@ export AIRWALLEX_TEST_WEBHOOK_SECRET="your_webhook_secret"
 
 ### Quick Test (Mock Gateway)
 
+The mock gateway approves every payment, so the server only uses it when
+`[payment] test_mode = true`. Without Stripe or Airwallex credentials and without
+test mode, the server still starts, but card checkout refuses every payment
+instead of accepting orders as paid:
+
+```toml
+[payment]
+test_mode = true   # development only
+```
+
 ```bash
 cd /Users/jeremy/Development/gokart
 cargo test -p rcommerce-core --lib payment::gateways::tests
