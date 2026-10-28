@@ -352,6 +352,64 @@ impl AgnosticPaymentGateway for MockPaymentGateway {
     }
 }
 
+/// Card gateway used when no Stripe or Airwallex credentials are configured
+/// and test mode is off: every operation fails, so an order is never marked
+/// paid without a real payment. Checkout reports the error to the customer.
+#[derive(Debug, Clone, Default)]
+pub struct UnavailablePaymentGateway;
+
+impl UnavailablePaymentGateway {
+    fn error() -> crate::Error {
+        crate::Error::payment_error(
+            "No card payment gateway is configured: set [payment.stripe] or              [payment.airwallex] credentials (or payment.test_mode = true in development)",
+        )
+    }
+}
+
+#[async_trait]
+impl PaymentGateway for UnavailablePaymentGateway {
+    fn id(&self) -> &'static str {
+        "unavailable"
+    }
+
+    fn name(&self) -> &'static str {
+        "No card gateway configured"
+    }
+
+    async fn create_payment(&self, _request: CreatePaymentRequest) -> Result<PaymentSession> {
+        Err(Self::error())
+    }
+
+    async fn confirm_payment(&self, _payment_id: &str) -> Result<Payment> {
+        Err(Self::error())
+    }
+
+    async fn capture_payment(
+        &self,
+        _payment_id: &str,
+        _amount: Option<Decimal>,
+    ) -> Result<Payment> {
+        Err(Self::error())
+    }
+
+    async fn refund_payment(
+        &self,
+        _payment_id: &str,
+        _amount: Option<Decimal>,
+        _reason: &str,
+    ) -> Result<Refund> {
+        Err(Self::error())
+    }
+
+    async fn get_payment(&self, _payment_id: &str) -> Result<Payment> {
+        Err(Self::error())
+    }
+
+    async fn handle_webhook(&self, _payload: &[u8], _signature: &str) -> Result<WebhookEvent> {
+        Err(Self::error())
+    }
+}
+
 #[cfg(test)]
 mod integration_tests;
 
@@ -360,6 +418,16 @@ mod tests {
     use super::*;
     use rust_decimal::Decimal;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn unavailable_gateway_never_takes_a_payment() {
+        let gateway = UnavailablePaymentGateway;
+        assert_eq!(gateway.id(), "unavailable");
+        assert!(gateway.confirm_payment("pi_any").await.is_err());
+        assert!(gateway.get_payment("pi_any").await.is_err());
+        assert!(gateway.capture_payment("pi_any", None).await.is_err());
+        assert!(gateway.handle_webhook(b"{}", "sig").await.is_err());
+    }
 
     #[tokio::test]
     async fn test_mock_gateway_create_payment() {

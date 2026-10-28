@@ -428,8 +428,11 @@ format = "Json"
 # Options: "mock", "stripe", "wechatpay", "alipay", "airwallex"
 default_gateway = "mock"
 
-# Enable test mode for all payments (default: false)
-test_mode = false
+# Test mode registers the "mock" gateway, which approves every payment, and uses it
+# for card checkout when no Stripe or Airwallex credentials are set. With test mode
+# off and no credentials, card checkout refuses payments instead.
+# Development only: production sets real credentials and test_mode = false.
+test_mode = true
 
 # Stripe configuration
 [payment.stripe]

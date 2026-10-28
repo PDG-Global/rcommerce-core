@@ -27,7 +27,7 @@ use rcommerce_core::payment::gateways::alipay_agnostic::AliPayAgnosticGateway;
 use rcommerce_core::payment::gateways::stripe::StripeGateway;
 use rcommerce_core::payment::gateways::stripe_agnostic::StripeAgnosticGateway;
 use rcommerce_core::payment::gateways::wechatpay_agnostic::WeChatPayAgnosticGateway;
-use rcommerce_core::payment::gateways::MockPaymentGateway;
+use rcommerce_core::payment::gateways::{MockPaymentGateway, UnavailablePaymentGateway};
 use rcommerce_core::repository::{
     create_pool, CustomerRepository, Database, PgCartRepository, PgCouponRepository,
     PostgresApiKeyRepository, PostgresSubscriptionRepository, ProductRepository,
@@ -384,10 +384,12 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     let default_gateway = config.payment.default_gateway.clone();
     let mut payment_service = PaymentService::new(default_gateway);
 
-    // Register mock gateway for testing/development
-    let mock_gateway = Box::new(MockPaymentGateway::new());
-    payment_service.register_gateway("mock".to_string(), mock_gateway);
-    info!("Mock payment gateway registered");
+    // The mock gateway approves every payment: development and tests only
+    if config.payment.test_mode {
+        let mock_gateway = Box::new(MockPaymentGateway::new());
+        payment_service.register_gateway("mock".to_string(), mock_gateway);
+        warn!("payment.test_mode is on: mock payment gateway registered (approves every payment)");
+    }
 
     // Register Stripe gateway if enabled and API key is available
     if config.payment.stripe.enabled {
@@ -597,8 +599,13 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                 webhook_secret.clone(),
             ))
         } else {
-            Box::new(MockPaymentGateway::new())
+            card_fallback_gateway(config.payment.test_mode)
         };
+    if stripe_legacy_config.is_none() && airwallex_config.is_none() && !config.payment.test_mode {
+        warn!(
+            "No Stripe or Airwallex credentials: card checkout is disabled              (set them, or payment.test_mode = true in development)"
+        );
+    }
     let order_service = Arc::new(
         OrderService::new(
             db.clone(),
@@ -652,7 +659,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
                 webhook_secret.clone(),
             ))
         } else {
-            Arc::new(MockPaymentGateway::new())
+            Arc::from(card_fallback_gateway(config.payment.test_mode))
         };
     let checkout_service = Arc::new(CheckoutService::with_coupon_service(
         cart_service.clone(),
@@ -761,6 +768,17 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         Some(config.payment.airwallex.clone()),
     ))
     .await)
+}
+
+/// Card gateway for orders and checkout when neither Stripe nor Airwallex is
+/// configured: the mock gateway (approves every payment) in test mode, otherwise
+/// one that refuses every payment, so no order is ever marked paid by mistake
+fn card_fallback_gateway(test_mode: bool) -> Box<dyn rcommerce_core::payment::PaymentGateway> {
+    if test_mode {
+        Box::new(MockPaymentGateway::new())
+    } else {
+        Box::new(UnavailablePaymentGateway)
+    }
 }
 
 /// Build CORS layer from configuration
@@ -1186,6 +1204,12 @@ async fn root() -> axum::Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mock_gateway_needs_test_mode() {
+        assert_eq!(card_fallback_gateway(true).id(), "mock");
+        assert_eq!(card_fallback_gateway(false).id(), "unavailable");
+    }
 
     #[tokio::test]
     async fn test_health_check() {
