@@ -204,6 +204,16 @@ impl Migrator {
                 "default_warehouse",
                 include_str!("../../migrations/021_default_warehouse.sql"),
             ),
+            (
+                22,
+                "saved_payment_method_ownership",
+                include_str!("../../migrations/022_saved_payment_method_ownership.sql"),
+            ),
+            (
+                23,
+                "subscription_order_unique",
+                include_str!("../../migrations/023_subscription_order_unique.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {
@@ -415,5 +425,40 @@ pub struct DbStatus {
 pub async fn auto_migrate(pool: &PgPool) -> Result<()> {
     let migrator = Migrator::new(pool.clone());
     migrator.migrate().await?;
+    Ok(())
+}
+
+/// Ensure the test schema exists, running the migrations at most once per
+/// database per process.
+///
+/// Tests used to call `Migrator::migrate()` in every setup, which made many
+/// tests issue DDL concurrently. DDL takes `AccessExclusiveLock`s that can
+/// deadlock against the `RowExclusiveLock`s of tests already inserting data
+/// (observed as 40P01 on PostgreSQL 16). This helper serializes the first
+/// migration run per database name; later calls are no-ops, so after the
+/// first setup no test performs DDL at all.
+pub async fn ensure_test_migrations(pool: &PgPool) -> Result<()> {
+    static DONE: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let done = DONE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // Serialize so concurrent first-time setups can't run DDL in parallel.
+    let mut done = done.lock().await;
+    let key = pool
+        .connect_options()
+        .get_database()
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+    if done.contains(&key) {
+        return Ok(());
+    }
+    Migrator::new(pool.clone()).migrate().await?;
+    // Some pre-existing test databases recorded migration 13 before the
+    // schema fix stuck; re-apply it once so stock_reservations matches the
+    // code. On healthy databases this is a no-op-ish drop/recreate of two
+    // indexes.
+    let fixup = include_str!("../../migrations/013_stock_reservations_order_id_nullable.sql");
+    sqlx::raw_sql(fixup).execute(pool).await?;
+    done.insert(key);
     Ok(())
 }

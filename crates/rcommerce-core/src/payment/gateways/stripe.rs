@@ -1,8 +1,9 @@
+use super::stripe_agnostic::{
+    map_refund_reason, stripe_amount_from_minor_units, stripe_amount_to_minor_units,
+};
 use async_trait::async_trait;
 use reqwest;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 use crate::payment::{
@@ -60,24 +61,7 @@ impl PaymentGateway for StripeGateway {
     }
 
     async fn create_payment(&self, request: CreatePaymentRequest) -> Result<PaymentSession> {
-        let amount_in_cents = (request.amount * dec!(100))
-            .to_i64()
-            .ok_or_else(|| Error::validation("Invalid amount"))?;
-
-        let mut params = std::collections::HashMap::new();
-        params.insert("amount", amount_in_cents.to_string());
-        params.insert("currency", request.currency.to_lowercase());
-        params.insert("metadata[order_id]", request.order_id.to_string());
-        params.insert("payment_method_types[]", "card".to_string());
-
-        if let Some(customer_id) = request.customer_id {
-            params.insert("metadata[customer_id]", customer_id.to_string());
-        }
-
-        // Add customer email for receipt
-        if !request.customer_email.is_empty() {
-            params.insert("receipt_email", request.customer_email);
-        }
+        let params = build_create_payment_params(&request)?;
 
         let response = self
             .client
@@ -150,7 +134,7 @@ impl PaymentGateway for StripeGateway {
         Ok(Payment {
             id: format!("pay_{}", uuid::Uuid::new_v4()),
             gateway: self.id().to_string(),
-            amount: Decimal::from(stripe_payment.amount) / dec!(100),
+            amount: stripe_amount_from_minor_units(stripe_payment.amount, &stripe_payment.currency),
             currency: stripe_payment.currency,
             status: Self::map_stripe_status(&stripe_payment.status),
             order_id: uuid::Uuid::parse_str(
@@ -175,11 +159,11 @@ impl PaymentGateway for StripeGateway {
     }
 
     async fn capture_payment(&self, payment_id: &str, amount: Option<Decimal>) -> Result<Payment> {
-        let amount_in_cents = amount.map(|a| (a * dec!(100)).to_string());
-
         let mut params = std::collections::HashMap::new();
-        if let Some(amt) = amount_in_cents {
-            params.insert("amount_to_capture", amt);
+        if let Some(amount) = amount {
+            let payment = self.get_payment(payment_id).await?;
+            let amount_to_capture = stripe_amount_to_minor_units(amount, &payment.currency)?;
+            params.insert("amount_to_capture", amount_to_capture.to_string());
         }
 
         let response = self
@@ -222,13 +206,12 @@ impl PaymentGateway for StripeGateway {
         amount: Option<Decimal>,
         reason: &str,
     ) -> Result<Refund> {
-        let mut params = std::collections::HashMap::new();
-        params.insert("payment_intent", payment_id.to_string());
-        params.insert("reason", reason.to_string());
-
-        if let Some(amt) = amount {
-            params.insert("amount", (amt * dec!(100)).to_string());
-        }
+        let currency = if amount.is_some() {
+            Some(self.get_payment(payment_id).await?.currency)
+        } else {
+            None
+        };
+        let params = build_refund_payment_params(payment_id, amount, currency.as_deref(), reason)?;
 
         let response = self
             .client
@@ -258,7 +241,7 @@ impl PaymentGateway for StripeGateway {
         Ok(Refund {
             id: stripe_refund.id,
             payment_id: payment_id.to_string(),
-            amount: Decimal::from(stripe_refund.amount) / dec!(100),
+            amount: stripe_amount_from_minor_units(stripe_refund.amount, &stripe_refund.currency),
             currency: stripe_refund.currency,
             status: Self::map_stripe_refund_status(&stripe_refund.status),
             reason: reason.to_string(),
@@ -309,7 +292,7 @@ impl PaymentGateway for StripeGateway {
         Ok(Payment {
             id: format!("pay_{}", uuid::Uuid::new_v4()),
             gateway: self.id().to_string(),
-            amount: Decimal::from(stripe_payment.amount) / dec!(100),
+            amount: stripe_amount_from_minor_units(stripe_payment.amount, &stripe_payment.currency),
             currency: stripe_payment.currency,
             status: Self::map_stripe_status(&stripe_payment.status),
             order_id: uuid::Uuid::parse_str(
@@ -395,6 +378,42 @@ impl PaymentGateway for StripeGateway {
                 .map_err(|e| Error::Network(format!("Failed to parse Stripe response: {}", e)))?,
         })
     }
+}
+
+fn build_create_payment_params(
+    request: &CreatePaymentRequest,
+) -> Result<std::collections::HashMap<&'static str, String>> {
+    let amount = stripe_amount_to_minor_units(request.amount, &request.currency)?;
+    let mut params = std::collections::HashMap::new();
+    params.insert("amount", amount.to_string());
+    params.insert("currency", request.currency.to_lowercase());
+    params.insert("metadata[order_id]", request.order_id.to_string());
+    params.insert("payment_method_types[]", "card".to_string());
+    if let Some(customer_id) = request.customer_id {
+        params.insert("metadata[customer_id]", customer_id.to_string());
+    }
+    if !request.customer_email.is_empty() {
+        params.insert("receipt_email", request.customer_email.clone());
+    }
+    Ok(params)
+}
+
+fn build_refund_payment_params(
+    payment_id: &str,
+    amount: Option<Decimal>,
+    currency: Option<&str>,
+    reason: &str,
+) -> Result<std::collections::HashMap<&'static str, String>> {
+    let mut params = std::collections::HashMap::new();
+    params.insert("payment_intent", payment_id.to_string());
+    params.insert("reason", map_refund_reason(reason));
+    if let Some(amount) = amount {
+        let currency = currency
+            .ok_or_else(|| Error::validation("Currency is required for a partial Stripe refund"))?;
+        let amount = stripe_amount_to_minor_units(amount, currency)?;
+        params.insert("amount", amount.to_string());
+    }
+    Ok(params)
 }
 
 // Stripe API response types
@@ -505,6 +524,22 @@ struct StripeEventData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
+
+    fn create_request(amount: Decimal, currency: &str) -> CreatePaymentRequest {
+        CreatePaymentRequest {
+            amount,
+            currency: currency.to_string(),
+            order_id: uuid::Uuid::nil(),
+            customer_id: None,
+            customer_email: String::new(),
+            payment_method: crate::payment::PaymentMethod::StripeElements,
+            billing_address: None,
+            payment_consent_id: None,
+            merchant_initiated: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
 
     #[tokio::test]
     async fn test_stripe_gateway_creation() {
@@ -512,5 +547,53 @@ mod tests {
 
         assert_eq!(gateway.id(), "stripe");
         assert_eq!(gateway.name(), "Stripe");
+    }
+
+    #[test]
+    fn create_payload_uses_checked_currency_minor_units() {
+        let jpy = build_create_payment_params(&create_request(dec!(1234), "JPY")).unwrap();
+        assert_eq!(jpy.get("amount").map(String::as_str), Some("1234"));
+        assert_eq!(jpy.get("currency").map(String::as_str), Some("jpy"));
+
+        let usd = build_create_payment_params(&create_request(dec!(12.34), "USD")).unwrap();
+        assert_eq!(usd.get("amount").map(String::as_str), Some("1234"));
+    }
+
+    #[test]
+    fn refund_payload_uses_jpy_units_and_maps_default_reason() {
+        let params = build_refund_payment_params(
+            "pi_jpy",
+            Some(dec!(1234)),
+            Some("JPY"),
+            "Refunded via API",
+        )
+        .unwrap();
+        assert_eq!(params.get("amount").map(String::as_str), Some("1234"));
+        assert_eq!(
+            params.get("reason").map(String::as_str),
+            Some("requested_by_customer")
+        );
+
+        let duplicate = build_refund_payment_params("pi_usd", None, None, "duplicate").unwrap();
+        assert_eq!(
+            duplicate.get("reason").map(String::as_str),
+            Some("duplicate")
+        );
+        assert!(!duplicate.contains_key("amount"));
+    }
+
+    #[test]
+    fn legacy_payload_overflow_is_a_validation_error() {
+        let create = build_create_payment_params(&create_request(Decimal::MAX, "USD")).unwrap_err();
+        assert!(matches!(create, Error::Validation(_)));
+
+        let refund = build_refund_payment_params(
+            "pi_jpy",
+            Some(Decimal::MAX),
+            Some("JPY"),
+            "Refunded via API",
+        )
+        .unwrap_err();
+        assert!(matches!(refund, Error::Validation(_)));
     }
 }

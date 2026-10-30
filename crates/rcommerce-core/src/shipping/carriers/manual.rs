@@ -78,8 +78,9 @@ impl ShippingProvider for ManualProvider {
         _from_address: &Address,
         _to_address: &Address,
         _package: &Package,
-        _options: &RateOptions,
+        options: &RateOptions,
     ) -> Result<Vec<ShippingRate>> {
+        let currency = options.currency.as_deref().unwrap_or("USD");
         Ok(self
             .rates
             .iter()
@@ -90,7 +91,7 @@ impl ShippingProvider for ManualProvider {
                     &r.service_code,
                     &r.service_name,
                     r.rate,
-                    "USD",
+                    currency,
                 )
                 .with_delivery(r.delivery_days.unwrap_or(5), None)
             })
@@ -159,5 +160,57 @@ impl ShippingProvider for ManualProvider {
             .and_then(|r| r.delivery_days)
             .unwrap_or(5);
         Ok(Some(Utc::now() + chrono::Duration::days(days.into())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rates_use_requested_currency_without_changing_amounts() {
+        let provider = ManualProvider::new();
+        let address = Address {
+            id: uuid::Uuid::new_v4(),
+            customer_id: uuid::Uuid::nil(),
+            first_name: "Test".to_string(),
+            last_name: "Buyer".to_string(),
+            company: None,
+            phone: None,
+            address1: "1 Test St".to_string(),
+            address2: None,
+            city: "Testville".to_string(),
+            state: None,
+            country: "AU".to_string(),
+            zip: "2000".to_string(),
+            is_default_shipping: false,
+            is_default_billing: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let package = Package {
+            weight: dec!(1.0),
+            weight_unit: "kg".to_string(),
+            length: None,
+            width: None,
+            height: None,
+            dimension_unit: None,
+            predefined_package: None,
+        };
+        let options = RateOptions {
+            currency: Some("AUD".to_string()),
+            ..Default::default()
+        };
+
+        let rates = provider
+            .get_rates(&address, &address, &package, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(rates.len(), 3);
+        assert!(rates.iter().all(|rate| rate.currency == "AUD"));
+        assert_eq!(rates[0].total_cost, dec!(10.00));
+        assert_eq!(rates[1].total_cost, dec!(25.00));
+        assert_eq!(rates[2].total_cost, Decimal::ZERO);
     }
 }

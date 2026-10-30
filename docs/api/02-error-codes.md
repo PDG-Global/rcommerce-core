@@ -51,9 +51,14 @@ All errors follow a consistent JSON format:
 
 #### `unauthorized`
 - **Status**: 401
-- **Message**: "Authentication is required"
-- **Common Causes**: Missing or invalid API key
-- **Solution**: Include valid `Authorization: Bearer <api_key>` header
+- **Message**: "Authentication is required" (or "Invalid email or password" for failed login)
+- **Common Causes**: Missing or invalid credentials
+- **Solution**: Include valid authentication, or request a password reset when appropriate
+- **Login privacy**: Unknown accounts, wrong passwords, imported accounts without
+  a local password, and other no-password accounts return the same generic 401.
+  Imported customers use password reset; there is no separate imported-account
+  login response. Email-verification status is revealed only after password
+  validation succeeds.
 
 #### `forbidden`
 - **Status**: 403
@@ -90,9 +95,12 @@ All errors follow a consistent JSON format:
 
 #### `too_many_requests`
 - **Status**: 429
-- **Message**: "Rate limit exceeded"
-- **Common Causes**: Too many requests in time window
-- **Solution**: Wait and retry with exponential backoff
+- **Message**: "Rate limit exceeded" (login uses "Too many login attempts. Please try again later.")
+- **Common Causes**: Too many requests or login attempts in the configured window
+- **Solution**: Wait for the `Retry-After` interval before retrying
+- **Login throttling**: Bounded per-process counters limit total attempts per
+  source IP and failures per source-IP/email pair. The response does not reveal
+  which budget tripped or whether the account exists.
 
 #### `internal_error`
 - **Status**: 500

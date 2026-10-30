@@ -30,10 +30,14 @@ struct ProductOrderDetails {
     sku: Option<String>,
 }
 
+pub type PaymentGatewayResolver =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn PaymentGateway>> + Send + Sync>;
+
 /// Order service with integrated tax calculation
 pub struct OrderService {
     db: Database,
     payment_gateway: Box<dyn PaymentGateway>,
+    payment_gateway_resolver: Option<PaymentGatewayResolver>,
     inventory_service: InventoryService,
     event_dispatcher: OrderEventDispatcher,
     tax_service: Option<Arc<dyn TaxService>>,
@@ -53,11 +57,17 @@ impl OrderService {
         Self {
             db,
             payment_gateway,
+            payment_gateway_resolver: None,
             inventory_service,
             event_dispatcher,
             tax_service: None,
             store_code: None,
         }
+    }
+
+    pub fn with_payment_gateway_resolver(mut self, resolver: PaymentGatewayResolver) -> Self {
+        self.payment_gateway_resolver = Some(resolver);
+        self
     }
 
     /// Set the store code used for store-prefixed invoice numbers
@@ -630,9 +640,15 @@ impl OrderService {
 
     /// Mark an order as paid after a successful external payment and commit inventory.
     pub async fn confirm_order_after_payment(&self, order_id: Uuid) -> Result<OrderDetail> {
-        // Only transition orders still awaiting payment; a racing duplicate
-        // (webhook vs client confirm) finds no row to update and falls through
-        // to the current order, keeping this idempotent.
+        self.confirm_order_after_payment_transition(order_id)
+            .await
+            .map(|(detail, _)| detail)
+    }
+
+    pub async fn confirm_order_after_payment_transition(
+        &self,
+        order_id: Uuid,
+    ) -> Result<(OrderDetail, bool)> {
         let updated = sqlx::query_as::<_, Order>(
             r#"
             UPDATE orders
@@ -646,10 +662,9 @@ impl OrderService {
         .bind(order_id)
         .fetch_optional(self.db.pool())
         .await?;
+        let transitioned = updated.is_some();
         let order = match updated {
             Some(order) => order,
-            // Already confirmed by a racing webhook/client confirm; return the
-            // current row so this stays idempotent.
             None => {
                 sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = $1")
                     .bind(order_id)
@@ -658,8 +673,6 @@ impl OrderService {
             }
         };
 
-        // Record coupon usage once the payment is confirmed; racing callers
-        // are deduplicated by the NOT EXISTS guard inside.
         if let Err(e) = self.record_coupon_usage(&order).await {
             warn!(
                 "Failed to record coupon usage for order {}: {}",
@@ -670,7 +683,7 @@ impl OrderService {
         self.commit_inventory_reservations(order_id).await?;
         let items = self.get_order_items(order_id).await?;
 
-        Ok(OrderDetail { order, items })
+        Ok((OrderDetail { order, items }, transitioned))
     }
     ///
     /// Record coupon usage for a newly confirmed order (idempotent).
@@ -862,8 +875,8 @@ impl OrderService {
         Ok(canceled_order)
     }
 
-    /// Refund a paid (or authorized) order through the payment gateway,
-    /// restock its items, and mark the order as refunded.
+    /// Refund a paid (or authorized) order through the payment gateway.
+    /// Only a fully settled refund restocks items and marks the order refunded.
     pub async fn refund_order(
         &self,
         order_id: Uuid,
@@ -875,6 +888,24 @@ impl OrderService {
             .await?
             .ok_or_else(|| Error::not_found("Order not found"))?;
 
+        if detail.order.payment_status == PaymentStatus::Refunded {
+            return Ok(detail.order);
+        }
+        let payment_already_refunded = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM payments WHERE order_id = $1 AND status = 'refunded')",
+        )
+        .bind(order_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if payment_already_refunded {
+            self.reconcile_order_refund(order_id).await?;
+            return self
+                .get_order(order_id)
+                .await?
+                .map(|detail| detail.order)
+                .ok_or_else(|| Error::not_found("Order not found"));
+        }
+
         // Only orders with captured or authorized funds can be refunded
         match detail.order.payment_status {
             PaymentStatus::Paid | PaymentStatus::Authorized => {}
@@ -885,46 +916,118 @@ impl OrderService {
             }
         }
 
-        // Process the refund through the gateway using the recorded transaction id
         let refund = self
             .process_refund(order_id, amount, reason.clone())
             .await?;
+        let fully_refunded = self.reconcile_order_refund(order_id).await?;
+        let refunded_order = self
+            .get_order(order_id)
+            .await?
+            .map(|detail| detail.order)
+            .ok_or_else(|| Error::not_found("Order not found"))?;
 
-        // Restock the ordered items
-        for item in &detail.items {
+        info!(
+            "Refund processed: order={}, amount={}, refund_id={}, fully_refunded={}",
+            order_id, refund.amount, refund.id, fully_refunded
+        );
+        if fully_refunded {
+            self.event_dispatcher
+                .order_refunded(&refunded_order, refund.id, refund.amount, reason)
+                .await?;
+        }
+
+        Ok(refunded_order)
+    }
+
+    pub async fn reconcile_order_refund(&self, order_id: Uuid) -> Result<bool> {
+        let fully_refunded = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT p.status = 'refunded'
+               AND COALESCE((
+                   SELECT SUM(r.amount) FROM refunds r
+                   WHERE r.payment_id = p.id AND r.status = 'refunded'
+               ), 0) >= p.amount
+            FROM payments p
+            WHERE p.order_id = $1
+            ORDER BY p.created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(order_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .unwrap_or(false);
+        if !fully_refunded {
+            return Ok(false);
+        }
+
+        let location_id = self.get_default_location_id().await?;
+        let items = self.get_order_items(order_id).await?;
+        let mut transaction = self.db.pool().begin().await?;
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE orders SET status = 'refunded', payment_status = 'refunded', updated_at = NOW() \
+             WHERE id = $1 AND status NOT IN ('refunded', 'cancelled') RETURNING id",
+        )
+        .bind(order_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if claimed.is_none() {
+            return Ok(false);
+        }
+
+        for item in items {
+            let product_type: String =
+                sqlx::query_scalar("SELECT product_type::text FROM products WHERE id = $1")
+                    .bind(item.product_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            if product_type == "bundle" {
+                continue;
+            }
             sqlx::query(
                 "UPDATE products SET inventory_quantity = inventory_quantity + $1, updated_at = NOW() WHERE id = $2",
             )
             .bind(item.quantity)
             .bind(item.product_id)
-            .execute(self.db.pool())
+            .execute(&mut *transaction)
+            .await?;
+            let updated = sqlx::query(
+                "UPDATE inventory_levels SET available_quantity = available_quantity + $3, updated_at = NOW() \
+                 WHERE product_id = $1 AND location_id = $2 AND variant_id IS NOT DISTINCT FROM $4",
+            )
+            .bind(item.product_id)
+            .bind(location_id)
+            .bind(item.quantity)
+            .bind(item.variant_id)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() == 0 {
+                sqlx::query(
+                    "INSERT INTO inventory_levels (id, product_id, variant_id, location_id, available_quantity, incoming_quantity) \
+                     VALUES ($1, $2, $3, $4, $5, 0)",
+                )
+                .bind(Uuid::new_v4())
+                .bind(item.product_id)
+                .bind(item.variant_id)
+                .bind(location_id)
+                .bind(item.quantity)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO stock_movements (id, product_id, variant_id, location_id, quantity, movement_type, reference) \
+                 VALUES ($1, $2, $3, $4, $5, 'in', 'order_refund')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(item.product_id)
+            .bind(item.variant_id)
+            .bind(location_id)
+            .bind(item.quantity)
+            .execute(&mut *transaction)
             .await?;
         }
-
-        // Update payment status
-        sqlx::query(
-            "UPDATE orders SET payment_status = 'refunded', updated_at = NOW() WHERE id = $1",
-        )
-        .bind(order_id)
-        .execute(self.db.pool())
-        .await?;
-
-        // Update order status (validated against allowed transitions)
-        let refunded_order = self
-            .update_order_status(order_id, OrderStatus::Refunded)
-            .await?;
-
-        info!(
-            "Order refunded: id={}, amount={}, refund_id={}",
-            order_id, refund.amount, refund.id
-        );
-
-        // Dispatch refund event
-        self.event_dispatcher
-            .order_refunded(&refunded_order, refund.id, refund.amount, reason)
-            .await?;
-
-        Ok(refunded_order)
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Fulfill an order
@@ -1235,20 +1338,21 @@ impl OrderService {
             gateway_payment_id, payment.gateway, order_id, reason
         );
 
-        // Refund through the configured payment gateway
-        let refund = self
-            .payment_gateway
-            .refund_payment(&gateway_payment_id, amount, &reason)
-            .await?;
-
-        // Mark the payment record as refunded
-        sqlx::query(
-            "UPDATE payments SET status = 'refunded' WHERE gateway = $1 AND gateway_payment_id = $2",
-        )
-        .bind(&payment.gateway)
-        .bind(&gateway_payment_id)
-        .execute(self.db.pool())
-        .await?;
+        let refund = if let Some(resolve) = &self.payment_gateway_resolver {
+            let gateway = resolve(&payment.gateway).ok_or_else(|| {
+                Error::payment_error(format!(
+                    "Stored payment gateway '{}' is not configured",
+                    payment.gateway
+                ))
+            })?;
+            gateway
+                .refund_payment(&gateway_payment_id, amount, &reason)
+                .await?
+        } else {
+            self.payment_gateway
+                .refund_payment(&gateway_payment_id, amount, &reason)
+                .await?
+        };
 
         // Record the refund so order detail APIs and accounting exports can
         // report it; skip if a row with the same gateway refund id exists
@@ -1281,6 +1385,26 @@ impl OrderService {
         .bind(settled_at)
         .execute(self.db.pool())
         .await?;
+
+        let settled: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE payment_id = $1 AND status = 'refunded'",
+        )
+        .bind(payment.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        let payment_amount: Decimal =
+            sqlx::query_scalar("SELECT amount FROM payments WHERE id = $1")
+                .bind(payment.id)
+                .fetch_one(self.db.pool())
+                .await?;
+        if settled >= payment_amount {
+            sqlx::query(
+                "UPDATE payments SET status = 'refunded', updated_at = NOW() WHERE id = $1",
+            )
+            .bind(payment.id)
+            .execute(self.db.pool())
+            .await?;
+        }
 
         Ok(refund)
     }

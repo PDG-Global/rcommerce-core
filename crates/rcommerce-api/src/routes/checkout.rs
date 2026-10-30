@@ -367,6 +367,15 @@ impl From<CheckoutResult> for CheckoutResultResponse {
     }
 }
 
+fn cart_access_error(error: rcommerce_core::Error) -> (StatusCode, Json<serde_json::Value>) {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+}
+
 /// Initiate checkout endpoint
 ///
 /// Calculates totals, tax, and available shipping rates for the customer's cart
@@ -375,6 +384,10 @@ pub async fn initiate_checkout(
     Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<InitiateCheckoutApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    super::cart::get_cart_for_request(&state, request.cart_id, auth.as_ref())
+        .await
+        .map_err(cart_access_error)?;
+
     super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -427,9 +440,13 @@ pub async fn initiate_checkout(
 /// Updates the checkout with the selected shipping method and recalculates totals
 pub async fn select_shipping(
     State(state): State<AppState>,
-    Extension(_auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<SelectShippingApiRequest>,
 ) -> Result<Json<CheckoutSummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    super::cart::get_cart_for_request(&state, request.cart_id, auth.as_ref())
+        .await
+        .map_err(cart_access_error)?;
+
     super::require_address_phone(&request.shipping_address.phone).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -482,6 +499,10 @@ pub async fn complete_checkout(
     Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<CompleteCheckoutApiRequest>,
 ) -> Result<(StatusCode, Json<CheckoutResultResponse>), (StatusCode, Json<serde_json::Value>)> {
+    super::cart::get_cart_for_request(&state, request.cart_id, auth.as_ref())
+        .await
+        .map_err(cart_access_error)?;
+
     // Validate email
     if request.customer_email.is_empty() || !request.customer_email.contains('@') {
         return Err((
@@ -581,18 +602,18 @@ pub async fn complete_checkout(
     match state.checkout_service.complete_checkout(core_request).await {
         Ok(result) => {
             let order_id = result.order.order.id;
+            let payment_transitioned = result.payment_transitioned;
             let response: CheckoutResultResponse = result.into();
             // No admin notification here: orders that still require payment
             // confirmation are not real orders yet. The shop operator is
             // emailed exactly when payment confirms (webhook or /checkout/confirm).
 
-            // A paid one-shot (mock gateway path): the subscription starts now.
-            if !response.requires_confirmation {
+            if payment_transitioned {
                 finalize_subscription_for_order(&state, order_id).await;
             }
 
             // Fire-and-forget order confirmation email if SMTP configured
-            if !response.requires_confirmation {
+            if payment_transitioned {
                 if let Some(ref svc) = state.notification_service {
                     let order_id = response.order.id;
                     let customer_email = response.order.customer_email.clone();
@@ -827,34 +848,29 @@ pub(crate) async fn finalize_subscription_for_order(state: &AppState, order_id: 
 /// Verifies a client-side confirmed payment (e.g., Stripe Elements) and finalizes the order
 pub async fn confirm_checkout(
     State(state): State<AppState>,
-    Extension(_auth): Extension<Option<JwtAuth>>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Json(request): Json<ConfirmCheckoutApiRequest>,
 ) -> Result<(StatusCode, Json<CheckoutResultResponse>), (StatusCode, Json<serde_json::Value>)> {
+    super::cart::get_cart_for_request(&state, request.cart_id, auth.as_ref())
+        .await
+        .map_err(cart_access_error)?;
+
     let core_request = rcommerce_core::services::ConfirmCheckoutRequest {
         order_id: request.order_id,
         payment_intent_id: request.payment_intent_id,
         cart_id: request.cart_id,
     };
 
-    // Remember whether this call is the one transitioning the order: only a
-    // pending order is a real payment-confirmation transition; a racing
-    // duplicate (webhook beating us, or a client retry) must not re-notify.
-    let was_pending = matches!(
-        sqlx::query_scalar::<_, String>("SELECT status::text FROM orders WHERE id = $1")
-            .bind(request.order_id)
-            .fetch_optional(state.db.pool())
-            .await,
-        Ok(Some(s)) if s == "pending"
-    );
-
-    match state.checkout_service.confirm_checkout(core_request).await {
-        Ok(result) => {
+    match state
+        .checkout_service
+        .confirm_checkout_with_transition(core_request)
+        .await
+    {
+        Ok((result, transitioned)) => {
             let response: CheckoutResultResponse = result.into();
-            // Only a pending order is a real payment-confirmation transition. A
-            // racing duplicate (webhook beating us, or a client retry) must not
-            // re-notify: the admin email, customer confirmation and Xero sync
-            // all fire exactly once per order.
-            if was_pending {
+            // Only the caller that won the pending-to-confirmed transition may
+            // send notifications or create the subscription.
+            if transitioned {
                 // The payment is confirmed: start the subscription when this
                 // order carries subscription options.
                 finalize_subscription_for_order(&state, response.order.id).await;
@@ -903,10 +919,12 @@ pub async fn confirm_checkout(
         }
         Err(e) => {
             tracing::error!("Failed to confirm checkout: {}", e);
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            ))
+            let status = if matches!(&e, rcommerce_core::Error::NotFound(_)) {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err((status, Json(serde_json::json!({"error": e.to_string()}))))
         }
     }
 }

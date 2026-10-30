@@ -60,7 +60,20 @@ pub struct OrderResponse {
     pub billing_address: Option<serde_json::Value>,
     pub shipping_address: Option<serde_json::Value>,
     pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fulfillments: Vec<OrderFulfillmentResponse>,
     pub created_at: String,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct OrderFulfillmentResponse {
+    pub id: Uuid,
+    pub status: String,
+    pub tracking_number: Option<String>,
+    pub tracking_url: Option<String>,
+    pub tracking_company: Option<String>,
+    pub shipped_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +192,7 @@ pub async fn list_orders(
                     billing_address: o.billing_address.clone(),
                     shipping_address: o.shipping_address.clone(),
                     notes: o.notes.clone(),
+                    fulfillments: vec![],
                     created_at: o.created_at.to_rfc3339(),
                 })
                 .collect();
@@ -312,6 +326,13 @@ pub async fn get_order(
         })
         .collect();
     attach_refunds(&state, order.id, &mut payment_responses).await;
+    let fulfillments = load_fulfillments(&state, order.id).await.map_err(|e| {
+        tracing::error!("Failed to load fulfillments for order {}: {}", order.id, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Database error"})),
+        )
+    })?;
 
     Ok(Json(OrderResponse {
         id: order.id,
@@ -333,6 +354,7 @@ pub async fn get_order(
         billing_address: order.billing_address.clone(),
         shipping_address: order.shipping_address.clone(),
         notes: order.notes.clone(),
+        fulfillments,
         created_at: order.created_at.to_rfc3339(),
     }))
 }
@@ -343,9 +365,21 @@ pub async fn get_order(
 /// For a full checkout flow with shipping selection, use the /checkout endpoints.
 pub async fn create_order(
     State(state): State<AppState>,
-    Extension(_auth): Extension<JwtAuth>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<(StatusCode, Json<OrderResponse>), (StatusCode, Json<serde_json::Value>)> {
+    let customer_id = resolve_order_customer(&auth, request.customer_id);
+    let currency = state
+        .default_currency
+        .parse::<rcommerce_core::models::Currency>()
+        .map_err(|e| {
+            tracing::error!("Invalid configured store currency: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Invalid store currency configuration"})),
+            )
+        })?;
+
     // Validate email
     if request.customer_email.is_empty() || !request.customer_email.contains('@') {
         return Err((
@@ -454,7 +488,7 @@ pub async fn create_order(
         // Calculate tax based on shipping address
         let tax_context = rcommerce_core::tax::TaxContext {
             customer: rcommerce_core::tax::CustomerTaxInfo {
-                customer_id: request.customer_id,
+                customer_id,
                 is_tax_exempt: false,
                 vat_id: None,
                 exemptions: vec![],
@@ -471,7 +505,7 @@ pub async fn create_order(
                 postal_code: Some(address.zip.clone()),
                 city: Some(address.city.clone()),
             },
-            currency: rcommerce_core::models::Currency::USD,
+            currency,
             transaction_type: rcommerce_core::tax::TransactionType::B2C,
         };
 
@@ -534,7 +568,7 @@ pub async fn create_order(
             adult_signature: false,
             saturday_delivery: false,
             hold_for_pickup: false,
-            currency: Some("USD".to_string()),
+            currency: Some(currency.to_string()),
         };
 
         let shipping_cost = match state.shipping_factory.get_available().first() {
@@ -566,10 +600,10 @@ pub async fn create_order(
     let order_id = Uuid::new_v4();
 
     // Create order
-    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(
+    let create_order_query = format!(
         r#"
         INSERT INTO orders (
-            id, order_number, customer_id, email,
+            id, order_number, customer_id, customer_email,
             status, payment_status, fulfillment_status,
             currency, subtotal, tax_total, shipping_total, discount_total, total,
             notes, tags, metadata, draft, order_type
@@ -577,23 +611,26 @@ pub async fn create_order(
         VALUES (
             $1, $2, $3, $4,
             'pending', 'pending', 'pending',
-            'USD', $5, $6, $7, 0, $8,
-            $9, ARRAY[]::TEXT[], '{}'::JSONB, false, 'one_time'
+            $5, $6, $7, $8, 0, $9,
+            $10, ARRAY[]::TEXT[], '{{}}'::JSONB, false, 'one_time'
         )
-        RETURNING *
+        RETURNING {}
         "#,
-    )
-    .bind(order_id)
-    .bind(&order_number)
-    .bind(request.customer_id)
-    .bind(&request.customer_email)
-    .bind(subtotal)
-    .bind(tax_total)
-    .bind(shipping_total)
-    .bind(total)
-    .bind(request.notes)
-    .fetch_one(state.db.pool())
-    .await
+        ORDER_COLUMNS
+    );
+    let order = match sqlx::query_as::<_, rcommerce_core::models::Order>(&create_order_query)
+        .bind(order_id)
+        .bind(&order_number)
+        .bind(customer_id)
+        .bind(&request.customer_email)
+        .bind(currency)
+        .bind(subtotal)
+        .bind(tax_total)
+        .bind(shipping_total)
+        .bind(total)
+        .bind(request.notes)
+        .fetch_one(state.db.pool())
+        .await
     {
         Ok(o) => o,
         Err(e) => {
@@ -696,10 +733,19 @@ pub async fn create_order(
         billing_address: order.billing_address.clone(),
         shipping_address: order.shipping_address.clone(),
         notes: order.notes.clone(),
+        fulfillments: vec![],
         created_at: order.created_at.to_rfc3339(),
     };
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+fn resolve_order_customer(auth: &JwtAuth, requested_customer_id: Option<Uuid>) -> Option<Uuid> {
+    if auth.is_admin() {
+        requested_customer_id
+    } else {
+        Some(auth.customer_id)
+    }
 }
 
 /// Generate unique order number
@@ -868,6 +914,178 @@ pub async fn refund_order(
     Ok(Json(build_order_response(&state, order).await?))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateFulfillmentRequest {
+    pub carrier: String,
+    pub tracking_number: String,
+}
+
+/// POST /orders/:id/fulfillments - Manually mark an entire order as shipped (admin only)
+pub async fn create_fulfillment(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CreateFulfillmentRequest>,
+) -> Result<(StatusCode, Json<OrderResponse>), Error> {
+    if !auth.is_admin() {
+        return Err(Error::forbidden("Admin access required"));
+    }
+
+    let carrier = canonical_carrier(&request.carrier)
+        .ok_or_else(|| Error::validation("Unsupported shipping carrier"))?;
+    let tracking_number = validate_tracking_number(&request.tracking_number)?;
+    let tracking_url = carrier_tracking_url(carrier, &tracking_number);
+
+    persist_manual_fulfillment(&state, id, carrier, &tracking_number, &tracking_url).await?;
+    super::email_helpers::send_order_shipped_email(
+        &state,
+        id,
+        &tracking_number,
+        Some(carrier),
+        Some(&tracking_url),
+    )
+    .await;
+
+    let order = fetch_order(&state, id).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(build_order_response(&state, order).await?),
+    ))
+}
+
+async fn persist_manual_fulfillment(
+    state: &AppState,
+    order_id: Uuid,
+    carrier: &str,
+    tracking_number: &str,
+    tracking_url: &str,
+) -> Result<(), Error> {
+    let mut tx = state.db.pool().begin().await?;
+    let order = sqlx::query_as::<_, rcommerce_core::models::Order>(&format!(
+        "SELECT {} FROM orders WHERE id = $1 FOR UPDATE",
+        ORDER_COLUMNS
+    ))
+    .bind(order_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| Error::not_found("Order not found"))?;
+
+    let order_eligible = matches!(
+        order.status,
+        rcommerce_core::models::OrderStatus::Confirmed
+            | rcommerce_core::models::OrderStatus::Processing
+    );
+    let fulfillment_eligible = matches!(
+        order.fulfillment_status,
+        rcommerce_core::models::FulfillmentStatus::Pending
+            | rcommerce_core::models::FulfillmentStatus::Processing
+    );
+    if !order_eligible || !fulfillment_eligible {
+        return Err(Error::validation(
+            "Order is not eligible for manual fulfillment",
+        ));
+    }
+
+    let fulfillment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO fulfillments (id, order_id, status, tracking_number, tracking_url, tracking_company, shipped_at) VALUES ($1, $2, 'shipped', $3, $4, $5, NOW())",
+    )
+    .bind(fulfillment_id)
+    .bind(order_id)
+    .bind(tracking_number)
+    .bind(tracking_url)
+    .bind(carrier)
+    .execute(&mut *tx)
+    .await?;
+
+    let fulfilled_items = sqlx::query(
+        "INSERT INTO fulfillment_items (id, fulfillment_id, order_item_id, quantity) SELECT gen_random_uuid(), $1, id, quantity FROM order_items WHERE order_id = $2",
+    )
+    .bind(fulfillment_id)
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await?;
+    if fulfilled_items.rows_affected() == 0 {
+        return Err(Error::validation("Order has no items to fulfill"));
+    }
+
+    let note = format!(
+        "[{}] Shipped manually via {}. Tracking number: {}. Tracking URL: {}",
+        chrono::Utc::now().to_rfc3339(),
+        carrier,
+        tracking_number,
+        tracking_url
+    );
+    sqlx::query(
+        "UPDATE orders SET fulfillment_status = 'shipped', notes = CASE WHEN notes IS NULL OR btrim(notes) = '' THEN $2 ELSE notes || E'\\n' || $2 END, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(order_id)
+    .bind(note)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn canonical_carrier(value: &str) -> Option<&'static str> {
+    match value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "dhl" => Some("DHL"),
+        "ups" => Some("UPS"),
+        "fedex" => Some("FedEx"),
+        "sf_express" => Some("SF Express"),
+        _ => None,
+    }
+}
+
+fn validate_tracking_number(value: &str) -> Result<String, Error> {
+    let tracking_number = value.trim();
+    if tracking_number.is_empty()
+        || tracking_number.len() > 128
+        || !tracking_number
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(Error::validation(
+            "Tracking number must contain only letters, numbers, and hyphens (maximum 128 characters)",
+        ));
+    }
+    Ok(tracking_number.to_string())
+}
+
+fn carrier_tracking_url(carrier: &str, tracking_number: &str) -> String {
+    let encoded: String =
+        url::form_urlencoded::byte_serialize(tracking_number.as_bytes()).collect();
+    match carrier {
+        "DHL" => format!(
+            "https://www.dhl.com/en/express/tracking.html?AWB={encoded}"
+        ),
+        "UPS" => format!("https://www.ups.com/track?tracknum={encoded}"),
+        "FedEx" => format!("https://www.fedex.com/fedextrack/?trknbr={encoded}"),
+        "SF Express" => format!(
+            "https://www.sf-express.com/us/en/dynamic_function/waybill/#search/bill-number/{encoded}"
+        ),
+        _ => unreachable!("carrier was validated"),
+    }
+}
+
+async fn load_fulfillments(
+    state: &AppState,
+    order_id: Uuid,
+) -> Result<Vec<OrderFulfillmentResponse>, Error> {
+    sqlx::query_as::<_, OrderFulfillmentResponse>(
+        "SELECT id, status::text AS status, tracking_number, tracking_url, tracking_company, shipped_at, created_at FROM fulfillments WHERE order_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(order_id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(Error::from)
+}
+
 /// Update order status request
 #[derive(Debug, Deserialize)]
 pub struct UpdateOrderStatusRequest {
@@ -1024,6 +1242,7 @@ async fn build_order_response(
         })
         .collect();
     attach_refunds(state, order.id, &mut payment_responses).await;
+    let fulfillments = load_fulfillments(state, order.id).await?;
 
     Ok(OrderResponse {
         id: order.id,
@@ -1045,6 +1264,7 @@ async fn build_order_response(
         billing_address: order.billing_address.clone(),
         shipping_address: order.shipping_address.clone(),
         notes: order.notes.clone(),
+        fulfillments,
         created_at: order.created_at.to_rfc3339(),
     })
 }
@@ -1087,5 +1307,85 @@ pub fn router() -> Router<AppState> {
         .route("/orders/:id/invoice", get(get_invoice))
         .route("/orders/:id/cancel", post(cancel_order))
         .route("/orders/:id/refund", post(refund_order))
+        .route("/orders/:id/fulfillments", post(create_fulfillment))
         .route("/orders/:id/status", put(update_order_status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth(permissions: &[&str]) -> JwtAuth {
+        JwtAuth {
+            customer_id: Uuid::new_v4(),
+            email: "actor@example.com".to_string(),
+            permissions: permissions.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn non_admin_order_owner_is_always_the_authenticated_customer() {
+        for permissions in [vec!["read"], vec!["read", "write"]] {
+            let auth = auth(&permissions);
+            assert_eq!(
+                resolve_order_customer(&auth, Some(Uuid::new_v4())),
+                Some(auth.customer_id)
+            );
+            assert_eq!(resolve_order_customer(&auth, None), Some(auth.customer_id));
+        }
+    }
+
+    #[test]
+    fn admin_order_owner_can_be_another_customer_or_guest() {
+        let auth = auth(&["read", "write", "admin"]);
+        let customer_id = Uuid::new_v4();
+        assert_eq!(
+            resolve_order_customer(&auth, Some(customer_id)),
+            Some(customer_id)
+        );
+        assert_eq!(resolve_order_customer(&auth, None), None);
+    }
+
+    #[test]
+    fn manual_carriers_generate_official_tracking_links() {
+        for (input, carrier, prefix) in [
+            (
+                "dhl",
+                "DHL",
+                "https://www.dhl.com/en/express/tracking.html?AWB=",
+            ),
+            ("UPS", "UPS", "https://www.ups.com/track?tracknum="),
+            (
+                "fedex",
+                "FedEx",
+                "https://www.fedex.com/fedextrack/?trknbr=",
+            ),
+            (
+                "sf express",
+                "SF Express",
+                "https://www.sf-express.com/us/en/dynamic_function/waybill/#search/bill-number/",
+            ),
+        ] {
+            let canonical = canonical_carrier(input).unwrap();
+            assert_eq!(canonical, carrier);
+            assert_eq!(
+                carrier_tracking_url(canonical, "1Z-999"),
+                format!("{prefix}1Z-999")
+            );
+        }
+        assert_eq!(canonical_carrier("sf-express"), Some("SF Express"));
+        assert_eq!(canonical_carrier("other"), None);
+    }
+
+    #[test]
+    fn manual_tracking_numbers_are_trimmed_and_bounded() {
+        assert_eq!(
+            validate_tracking_number("  1Z999AA99999999999  ").unwrap(),
+            "1Z999AA99999999999"
+        );
+        for invalid in ["", "  ", "TRACK/123", "TRACK 123", "轨道123"] {
+            assert!(validate_tracking_number(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_tracking_number(&"A".repeat(129)).is_err());
+    }
 }

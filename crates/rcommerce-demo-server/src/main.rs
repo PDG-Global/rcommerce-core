@@ -11,9 +11,9 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
     Router,
 };
 use chrono::{Datelike, Utc};
@@ -252,22 +252,7 @@ async fn main() -> Result<()> {
         rate_limiter: Arc::new(RwLock::new(RateLimiter::new(config.rate_limit_per_minute))),
     };
 
-    // Build router with dynamic routes
-    let app = Router::new()
-        // Health check
-        .route("/health", get(health_check))
-        // Dynamic routes
-        .route("/", get(home_page))
-        .route("/products/:id", get(product_page))
-        .route("/categories/:slug", get(category_page))
-        .route("/pages/:slug", get(cms_page))
-        .route("/cart", get(cart_page))
-        // API proxy
-        .route("/api/*path", get(api_proxy))
-        // Static files
-        .route("/static/*path", get(static_files))
-        .with_state(state)
-        .layer(axum::middleware::from_fn(security_headers));
+    let app = create_router(state);
 
     let addr: SocketAddr = config.bind.parse()?;
     info!("Server ready: http://{}", addr);
@@ -281,6 +266,20 @@ async fn main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/", get(home_page))
+        .route("/products/:id", get(product_page))
+        .route("/categories/:slug", get(category_page))
+        .route("/pages/:slug", get(cms_page))
+        .route("/cart", get(cart_page))
+        .route("/api/*path", any(api_proxy))
+        .route("/static/*path", get(static_files))
+        .with_state(state)
+        .layer(axum::middleware::from_fn(security_headers))
 }
 
 // Handler: Home page
@@ -451,6 +450,21 @@ async fn api_proxy(
     let path = req.uri().path();
     let method = req.method().clone();
     let target_url = format!("{}{}", state.config.api_url, path);
+    let mut headers = HeaderMap::new();
+
+    for name in [header::CONTENT_TYPE, header::ACCEPT, header::AUTHORIZATION] {
+        if let Some(value) = req.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    if !headers.contains_key(header::AUTHORIZATION) {
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", state.config.api_key)
+                .parse()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
+    }
 
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
@@ -459,7 +473,7 @@ async fn api_proxy(
     let response = state
         .http_client
         .request(method, &target_url)
-        .header("Authorization", format!("Bearer {}", state.config.api_key))
+        .headers(headers)
         .body(body_bytes)
         .send()
         .await
@@ -559,5 +573,95 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("Shutting down..."),
         _ = terminate => info!("Shutting down..."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Json};
+    use serde_json::{json, Value};
+
+    async fn spawn_backend() -> SocketAddr {
+        async fn login(headers: HeaderMap, body: String) -> Json<Value> {
+            Json(json!({
+                "authorization": headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()),
+                "content_type": headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                "body": body,
+            }))
+        }
+
+        async fn profile(headers: HeaderMap) -> Json<Value> {
+            Json(json!({
+                "authorization": headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            }))
+        }
+
+        let app = Router::new()
+            .route("/api/v1/auth/login", post(login))
+            .route("/api/v1/customers/me", get(profile));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    #[tokio::test]
+    async fn proxy_supports_login_and_preserves_customer_tokens() {
+        let backend = spawn_backend().await;
+        let config = Config {
+            bind: "127.0.0.1:0".to_string(),
+            api_url: format!("http://{}", backend),
+            api_key: "ak_test.secret".to_string(),
+            template_dir: PathBuf::from("templates"),
+            static_dir: PathBuf::from("static"),
+            redis_url: None,
+            cache_ttl_secs: 60,
+            rate_limit_per_minute: 60,
+            dev_mode: false,
+            log_level: "info".to_string(),
+        };
+        let state = AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            cache: Arc::new(Cache::new(Arc::new(cache::MemoryCache::new(10, 60)))),
+            tera: Arc::new(RwLock::new(Tera::default())),
+            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(60))),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let frontend = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let client = reqwest::Client::new();
+        let login_body = r#"{"email":"customer@example.com","password":"password"}"#;
+        let login = client
+            .post(format!("http://{}/api/v1/auth/login", frontend))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(login_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let login: Value = login.json().await.unwrap();
+        assert_eq!(login["authorization"], "Bearer ak_test.secret");
+        assert_eq!(login["content_type"], "application/json");
+        assert_eq!(login["body"], login_body);
+
+        let profile = client
+            .get(format!("http://{}/api/v1/customers/me", frontend))
+            .bearer_auth("customer-jwt")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+        let profile: Value = profile.json().await.unwrap();
+        assert_eq!(profile["authorization"], "Bearer customer-jwt");
     }
 }

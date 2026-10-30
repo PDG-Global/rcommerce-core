@@ -58,6 +58,9 @@ rust_decimal = { workspace = true }
 # Validation
 validator = { workspace = true }
 
+# IP network parsing (trusted proxy CIDRs)
+ipnet = { workspace = true }
+
 # Database
 sqlx = { workspace = true }
 
@@ -99,6 +102,8 @@ rcgen = "0.13"
 # For E2E tests
 [dev-dependencies]
 # Additional test dependencies
+async-trait = { workspace = true }
 redis = { workspace = true }
 rand = { workspace = true }
 once_cell = { workspace = true }
+rust_decimal_macros = { workspace = true }

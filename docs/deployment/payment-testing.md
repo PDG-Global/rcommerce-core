@@ -62,7 +62,7 @@ export AIRWALLEX_TEST_WEBHOOK_SECRET="your_webhook_secret"
 ### Quick Test (Mock Gateway)
 
 ```bash
-cd /Users/jeremy/Development/gokart
+cd /path/to/rcommerce
 cargo test -p rcommerce-core --lib payment::gateways::tests
 ```
 
@@ -93,37 +93,43 @@ cargo test -p rcommerce-core --lib payment::gateways -- --test-threads=1
 
 ## Test Scenarios
 
+For direct-payment examples, replace the order UUID with an order owned by the
+JWT customer whose authoritative total and currency match the request. Amounts
+are major-unit strings. Direct initiation requires `save_payment_method = false`;
+use the dedicated payment-methods endpoint to save a card.
+
 ### 1. Initiate Payment (Success)
 
 Tests that a payment can be initiated successfully through the agnostic API.
 
 **Request:**
 ```http
-POST /api/v2/payments
+POST /api/v1/payments
 Content-Type: application/json
-Authorization: Bearer <token>
+Authorization: Bearer <customer_jwt>
 
 {
   "gateway_id": "stripe",
   "amount": "99.99",
   "currency": "USD",
-  "payment_method": {
+  "payment_method_type": "card",
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "customer_email": "test@example.com",
+  "payment_method_data": {
     "type": "card",
-    "card": {
-      "number": "4242424242424242",
-      "exp_month": 12,
-      "exp_year": 2025,
-      "cvc": "123",
-      "name": "Test User"
-    }
+    "number": "4242424242424242",
+    "exp_month": "12",
+    "exp_year": "2030",
+    "cvc": "123",
+    "name": "Test User"
   },
-  "order_id": "order_123",
-  "customer_email": "test@example.com"
+  "save_payment_method": false,
+  "description": "Test order payment"
 }
 ```
 
 **Expected Result:**
-- `type: "success"` response
+- `result: "success"` response
 - Payment ID returned
 - Transaction ID from provider
 - Receipt URL (if available)
@@ -136,7 +142,7 @@ Tests 3D Secure handling for cards that require authentication.
 Same as above, but with card number `4000002500003155`
 
 **Expected Result:**
-- `type: "requires_action"` response
+- `result: "requires_action"` response
 - `action_type: "three_d_secure"`
 - `action_data` containing redirect URL or 3DS parameters
 - `expires_at` timestamp
@@ -147,9 +153,9 @@ Tests completing a payment after 3D Secure or redirect.
 
 **Request:**
 ```http
-POST /api/v2/payments/pay_xxx/complete
+POST /api/v1/payments/pay_xxx/complete
 Content-Type: application/json
-Authorization: Bearer <token>
+Authorization: Bearer <customer_jwt>
 
 {
   "action_type": "three_d_secure",
@@ -160,7 +166,7 @@ Authorization: Bearer <token>
 ```
 
 **Expected Result:**
-- `type: "success"` response
+- `result: "success"` response
 - Payment status updated to `succeeded`
 
 ### 4. Get Payment Status
@@ -169,7 +175,7 @@ Tests retrieving payment status.
 
 **Request:**
 ```http
-GET /api/v2/payments/pay_xxx
+GET /api/v1/payments/pay_xxx
 Authorization: Bearer <token>
 ```
 
@@ -181,13 +187,14 @@ Authorization: Bearer <token>
 
 ### 5. Refund Payment
 
-Tests refunding a captured payment.
+Tests refunding a captured payment through the gateway stored on the payment.
+Refunds require an admin JWT.
 
 **Request:**
 ```http
-POST /api/v2/payments/pay_xxx/refund
+POST /api/v1/payments/pay_xxx/refund
 Content-Type: application/json
-Authorization: Bearer <token>
+Authorization: Bearer <admin_jwt>
 
 {
   "amount": "99.99",
@@ -206,7 +213,7 @@ Tests retrieving available payment methods for a checkout.
 
 **Request:**
 ```http
-POST /api/v2/payments/methods
+POST /api/v1/payments/methods
 Content-Type: application/json
 Authorization: Bearer <token>
 
@@ -226,9 +233,9 @@ Authorization: Bearer <token>
 ### Get Payment Methods
 
 ```bash
-curl -X POST http://localhost:8080/api/v2/payments/methods \
+curl -X POST http://localhost:8080/api/v1/payments/methods \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_CUSTOMER_JWT" \
   -d '{
     "currency": "USD",
     "amount": "99.99"
@@ -238,58 +245,59 @@ curl -X POST http://localhost:8080/api/v2/payments/methods \
 ### Initiate Payment (Success)
 
 ```bash
-curl -X POST http://localhost:8080/api/v2/payments \
+curl -X POST http://localhost:8080/api/v1/payments \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_CUSTOMER_JWT" \
   -d '{
     "gateway_id": "stripe",
     "amount": "99.99",
     "currency": "USD",
-    "payment_method": {
-      "type": "card",
-      "card": {
-        "number": "4242424242424242",
-        "exp_month": 12,
-        "exp_year": 2025,
-        "cvc": "123",
-        "name": "Test User"
-      }
-    },
-    "order_id": "order_123",
+    "payment_method_type": "card",
+    "order_id": "550e8400-e29b-41d4-a716-446655440000",
     "customer_email": "test@example.com",
-    "return_url": "https://yoursite.com/checkout/complete"
+    "payment_method_data": {
+      "type": "card",
+      "number": "4242424242424242",
+      "exp_month": "12",
+      "exp_year": "2030",
+      "cvc": "123",
+      "name": "Test User"
+    },
+    "save_payment_method": false,
+    "description": "Test order payment"
   }'
 ```
 
 ### Initiate Payment (3D Secure)
 
 ```bash
-curl -X POST http://localhost:8080/api/v2/payments \
+curl -X POST http://localhost:8080/api/v1/payments \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_CUSTOMER_JWT" \
   -d '{
     "gateway_id": "stripe",
     "amount": "99.99",
     "currency": "USD",
-    "payment_method": {
+    "payment_method_type": "card",
+    "order_id": "550e8400-e29b-41d4-a716-446655440000",
+    "customer_email": "test@example.com",
+    "payment_method_data": {
       "type": "card",
-      "card": {
-        "number": "4000002500003155",
-        "exp_month": 12,
-        "exp_year": 2025,
-        "cvc": "123",
-        "name": "Test User"
-      }
+      "number": "4000002500003155",
+      "exp_month": "12",
+      "exp_year": "2030",
+      "cvc": "123",
+      "name": "Test User"
     },
-    "order_id": "order_123",
-    "return_url": "https://yoursite.com/checkout/complete"
+    "save_payment_method": false,
+    "description": "Test order payment with 3DS"
   }'
 ```
 
 Expected response:
 ```json
 {
-  "type": "requires_action",
+  "result": "requires_action",
   "payment_id": "pay_xxx",
   "action_type": "three_d_secure",
   "action_data": {
@@ -302,9 +310,9 @@ Expected response:
 ### Complete Payment Action
 
 ```bash
-curl -X POST http://localhost:8080/api/v2/payments/pay_xxx/complete \
+curl -X POST http://localhost:8080/api/v1/payments/pay_xxx/complete \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_CUSTOMER_JWT" \
   -d '{
     "action_type": "three_d_secure",
     "action_data": {
@@ -316,16 +324,18 @@ curl -X POST http://localhost:8080/api/v2/payments/pay_xxx/complete \
 ### Get Payment Status
 
 ```bash
-curl http://localhost:8080/api/v2/payments/pay_xxx \
-  -H "Authorization: Bearer YOUR_API_KEY"
+curl http://localhost:8080/api/v1/payments/pay_xxx \
+  -H "Authorization: Bearer YOUR_CUSTOMER_JWT"
 ```
 
 ### Refund Payment
 
+Refunds require an admin JWT and use the gateway stored on the payment.
+
 ```bash
-curl -X POST http://localhost:8080/api/v2/payments/pay_xxx/refund \
+curl -X POST http://localhost:8080/api/v1/payments/pay_xxx/refund \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_ADMIN_JWT" \
   -d '{
     "amount": "99.99",
     "reason": "requested_by_customer"
@@ -338,11 +348,12 @@ Add to your `config.toml`:
 
 ```toml
 [payment]
-default_gateway = "stripe"
+default_gateway = "mock"  # use "stripe" or "airwallex" to test those checkout flows
+test_mode = true          # required to register mock; use false in production
 
 [payment.stripe]
 enabled = true
-api_key = "${STRIPE_SECRET_KEY}"
+secret_key = "${STRIPE_SECRET_KEY}"
 webhook_secret = "${STRIPE_WEBHOOK_SECRET}"
 
 [payment.airwallex]
@@ -351,6 +362,11 @@ client_id = "${AIRWALLEX_CLIENT_ID}"
 api_key = "${AIRWALLEX_API_KEY}"
 webhook_secret = "${AIRWALLEX_WEBHOOK_SECRET}"
 ```
+
+Mock is not registered when `test_mode = false`. Checkout accepts only `mock`,
+`stripe`, or `airwallex` as its default. A selected real gateway must be enabled
+with credentials; startup fails rather than falling back to another gateway.
+Payment and refund amounts are major-unit decimals, including for Airwallex.
 
 ## Webhook Testing
 
@@ -364,7 +380,7 @@ brew install stripe/stripe-cli/stripe
 stripe login
 
 # Forward webhooks to local server
-stripe listen --forward-to localhost:8080/api/v2/webhooks/stripe
+stripe listen --forward-to localhost:8080/api/v1/webhooks/stripe
 ```
 
 ### Trigger Test Events
@@ -394,58 +410,51 @@ stripe trigger payment_intent.payment_failed
 
 ## Frontend Testing Example
 
+Use an order owned by the JWT customer whose total is exactly `99.99 USD`:
+
 ```javascript
 // test-payment.js
+const ORDER_ID = '550e8400-e29b-41d4-a716-446655440000';
 
-async function testPayment() {
-  // Test 1: Simple payment
-  console.log('Test 1: Simple payment');
-  const result1 = await initiatePayment({
-    gateway_id: 'stripe',
-    amount: '49.99',
-    card: { number: '4242424242424242', exp_month: 12, exp_year: 2025, cvc: '123' }
-  });
-  console.assert(result1.type === 'success', 'Simple payment should succeed');
-  
-  // Test 2: 3D Secure payment
-  console.log('Test 2: 3D Secure payment');
-  const result2 = await initiatePayment({
-    gateway_id: 'stripe',
-    amount: '99.99',
-    card: { number: '4000002500003155', exp_month: 12, exp_year: 2025, cvc: '123' }
-  });
-  console.assert(result2.type === 'requires_action', '3DS card should require action');
-  console.assert(result2.action_type === 'three_d_secure', 'Action type should be 3DS');
-  
-  // Test 3: Declined card
-  console.log('Test 3: Declined card');
-  const result3 = await initiatePayment({
-    gateway_id: 'stripe',
-    amount: '99.99',
-    card: { number: '4000000000000002', exp_month: 12, exp_year: 2025, cvc: '123' }
-  });
-  console.assert(result3.type === 'failed', 'Declined card should fail');
-  
-  console.log('All tests passed!');
-}
-
-async function initiatePayment({ gateway_id, amount, card }) {
-  const response = await fetch('http://localhost:8080/api/v2/payments', {
+async function initiatePayment(number) {
+  const response = await fetch('http://localhost:8080/api/v1/payments', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': 'Bearer YOUR_TEST_API_KEY'
+      'Authorization': 'Bearer YOUR_CUSTOMER_JWT'
     },
     body: JSON.stringify({
-      gateway_id,
-      amount,
+      gateway_id: 'stripe',
+      amount: '99.99',
       currency: 'USD',
-      payment_method: { type: 'card', card },
-      order_id: `test_order_${Date.now()}`,
-      customer_email: 'test@example.com'
+      payment_method_type: 'card',
+      order_id: ORDER_ID,
+      customer_email: 'test@example.com',
+      payment_method_data: {
+        type: 'card',
+        number,
+        exp_month: '12',
+        exp_year: '2030',
+        cvc: '123',
+        name: 'Test User'
+      },
+      save_payment_method: false,
+      description: 'Test order payment'
     })
   });
   return await response.json();
+}
+
+async function testPayment() {
+  const success = await initiatePayment('4242424242424242');
+  console.assert(success.result === 'success', 'Simple payment should succeed');
+
+  const challenge = await initiatePayment('4000002500003155');
+  console.assert(challenge.result === 'requires_action', '3DS should require action');
+  console.assert(challenge.action_type === 'three_d_secure', 'Action type should be 3DS');
+
+  const declined = await initiatePayment('4000000000000002');
+  console.assert(declined.result === 'failed', 'Declined card should fail');
 }
 
 testPayment().catch(console.error);
@@ -493,16 +502,17 @@ RUST_LOG=rcommerce_api=debug,sqlx=warn cargo run
 
 Before going live:
 
-- [ ] Switch to production API keys
+- [ ] Set `payment.test_mode = false`
+- [ ] Switch to production API keys and enable the selected real gateway with its required credentials
 - [ ] Configure production webhook endpoints
 - [ ] Enable 3D Secure for card payments
 - [ ] Set up webhook signature verification
 - [ ] Configure fraud rules
 - [ ] Test all payment flows end-to-end
 - [ ] Test 3D Secure flow with real cards
-- [ ] Test refund flow
+- [ ] Test refund flow with an admin JWT
 - [ ] Set up monitoring and alerts
-- [ ] Configure backup payment gateway
+- [ ] Configure any additional gateway explicitly; there is no automatic fallback
 - [ ] Test webhook handling in production
 - [ ] Verify PCI compliance requirements
 
@@ -514,6 +524,8 @@ Before going live:
 4. **PCI Compliance** - Don't store raw card data (R Commerce handles this)
 5. **Rate limiting** - Implement rate limits on payment endpoints
 6. **Idempotency** - Use idempotency keys for retries
+7. **Authorization** - Payment endpoints require JWT; customers are restricted to their own orders/payments and refunds are admin-only
+8. **Saved methods** - Use `POST /payment-methods`, not `save_payment_method=true` during direct initiation; provider-customer mappings and local SHA-256 token hashes enforce ownership
 
 ## Additional Resources
 

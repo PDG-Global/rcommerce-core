@@ -817,6 +817,39 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub allowlist: Vec<String>,
 
+    /// CIDR ranges of trusted reverse proxies (e.g. "127.0.0.0/8", "10.0.0.0/8").
+    /// When the TCP peer is one of these, X-Forwarded-For is walked
+    /// right-to-left past the trusted proxies to find the client IP.
+    /// Forwarding headers from any other peer are ignored. Invalid CIDRs are
+    /// a startup error.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// Maximum number of X-Forwarded-For entries accepted from a trusted
+    /// proxy; longer chains are rejected (fail closed).
+    #[serde(default = "default_max_forwarded_hops")]
+    pub max_forwarded_hops: usize,
+
+    /// Hard cap on the number of client IPs tracked by the in-memory
+    /// limiters; oldest expired/idle entries are evicted beyond this.
+    #[serde(default = "default_max_tracked_ips")]
+    pub max_tracked_ips: usize,
+
+    /// Login throttling: maximum login attempts per source IP per window
+    /// (counts every attempt, successful or not).
+    #[serde(default = "default_login_ip_max_attempts")]
+    pub login_ip_max_attempts: u32,
+
+    /// Login throttling: maximum failed passwords per (IP, e-mail) pair per
+    /// window. There is deliberately no account-only lock: an attacker can
+    /// only lock their own IP out of a given account.
+    #[serde(default = "default_login_pair_max_failures")]
+    pub login_pair_max_failures: u32,
+
+    /// Login throttling window in seconds (applies to both budgets).
+    #[serde(default = "default_login_window_secs")]
+    pub login_window_secs: u64,
+
     /// Enable DDoS protection mode (stricter limits under attack)
     #[serde(default = "default_true")]
     pub ddos_protection: bool,
@@ -846,6 +879,12 @@ impl Default for RateLimitConfig {
             api_key_requests_per_minute: 1000,
             blocklist: vec![],
             allowlist: vec![],
+            trusted_proxies: vec![],
+            max_forwarded_hops: default_max_forwarded_hops(),
+            max_tracked_ips: default_max_tracked_ips(),
+            login_ip_max_attempts: default_login_ip_max_attempts(),
+            login_pair_max_failures: default_login_pair_max_failures(),
+            login_window_secs: default_login_window_secs(),
             ddos_protection: true,
             expose_headers: true,
             use_redis: false,
@@ -875,6 +914,44 @@ fn default_max_concurrent() -> u32 {
 }
 fn default_rate_limit_api_key() -> u32 {
     1000
+}
+fn default_max_forwarded_hops() -> usize {
+    8
+}
+fn default_max_tracked_ips() -> usize {
+    50_000
+}
+fn default_login_ip_max_attempts() -> u32 {
+    30
+}
+fn default_login_pair_max_failures() -> u32 {
+    10
+}
+fn default_login_window_secs() -> u64 {
+    15 * 60
+}
+
+impl RateLimitConfig {
+    /// Parse and validate the configured trusted-proxy CIDRs. Returns an
+    /// error describing every invalid entry (startup aborts on error).
+    pub fn trusted_proxy_nets(&self) -> std::result::Result<Vec<ipnet::IpNet>, String> {
+        let mut nets = Vec::with_capacity(self.trusted_proxies.len());
+        let mut errors = Vec::new();
+        for cidr in &self.trusted_proxies {
+            match cidr.parse::<ipnet::IpNet>() {
+                Ok(net) => nets.push(net),
+                Err(_) => errors.push(format!("'{}' is not a valid CIDR", cidr)),
+            }
+        }
+        if errors.is_empty() {
+            Ok(nets)
+        } else {
+            Err(format!(
+                "Invalid [rate_limiting].trusted_proxies entries: {}",
+                errors.join(", ")
+            ))
+        }
+    }
 }
 
 /// Feature flags
@@ -1428,7 +1505,7 @@ fn default_recovered_template() -> String {
 }
 
 /// Payment gateway configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentConfig {
     /// Default payment gateway ID
     #[serde(default = "default_payment_gateway")]
@@ -1457,6 +1534,19 @@ pub struct PaymentConfig {
 
 fn default_payment_gateway() -> String {
     "mock".to_string()
+}
+
+impl Default for PaymentConfig {
+    fn default() -> Self {
+        Self {
+            default_gateway: default_payment_gateway(),
+            test_mode: false,
+            stripe: StripeConfig::default(),
+            wechatpay: WeChatPayConfig::default(),
+            alipay: AliPayConfig::default(),
+            airwallex: AirwallexConfig::default(),
+        }
+    }
 }
 
 /// Stripe payment gateway configuration
@@ -2019,6 +2109,44 @@ free_shipping = true
         };
         let header_preload = hsts_preload.header_value();
         assert!(header_preload.contains("preload"));
+    }
+
+    #[test]
+    fn test_trusted_proxy_nets_validation() {
+        let mut config = RateLimitConfig::default();
+        assert!(config.trusted_proxy_nets().unwrap().is_empty());
+
+        config.trusted_proxies = vec![
+            "127.0.0.0/8".to_string(),
+            "::1/128".to_string(),
+            "not-a-cidr".to_string(),
+        ];
+        let err = config.trusted_proxy_nets().unwrap_err();
+        assert!(err.contains("not-a-cidr"));
+
+        config.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let nets = config.trusted_proxy_nets().unwrap();
+        assert_eq!(nets.len(), 1);
+        assert!(nets[0].contains(&"10.1.2.3".parse::<std::net::IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_rate_limiting_new_fields_default_from_toml() {
+        let toml_str = r#"
+[server]
+port = 8080
+
+[rate_limiting]
+enabled = true
+trusted_proxies = ["127.0.0.0/8"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("config parses");
+        assert_eq!(config.rate_limiting.trusted_proxies, vec!["127.0.0.0/8"]);
+        assert_eq!(config.rate_limiting.max_forwarded_hops, 8);
+        assert_eq!(config.rate_limiting.max_tracked_ips, 50_000);
+        assert_eq!(config.rate_limiting.login_ip_max_attempts, 30);
+        assert_eq!(config.rate_limiting.login_pair_max_failures, 10);
+        assert_eq!(config.rate_limiting.login_window_secs, 900);
     }
 }
 

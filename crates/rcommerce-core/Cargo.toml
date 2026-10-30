@@ -32,6 +32,9 @@ sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
 # Validation
 validator = { workspace = true }
 
+# IP network parsing (trusted proxy CIDRs)
+ipnet = { workspace = true }
+
 # Pagination
 ulid = { workspace = true }
 

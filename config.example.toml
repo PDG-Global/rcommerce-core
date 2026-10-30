@@ -259,6 +259,35 @@ smtp_tls = true
 # Enable rate limiting (default: true)
 enabled = true
 
+# Trusted reverse proxies (CIDR notation). When the TCP peer matches one of
+# these networks, X-Forwarded-For is walked right-to-left past the trusted
+# proxies to find the real client IP. Forwarding headers from any other peer
+# are ignored — a client can send any X-Forwarded-For it likes, and trusting
+# it would let it pick a fresh IP per request and bypass every per-IP limit.
+# Invalid CIDRs abort startup.
+# Example (Caddy/nginx on the same host): trusted_proxies = ["127.0.0.0/8", "::1/128"]
+trusted_proxies = []
+
+# Maximum X-Forwarded-For entries accepted from a trusted proxy; longer
+# chains are rejected (default: 8)
+max_forwarded_hops = 8
+
+# Hard cap on how many client IPs the in-memory limiters track; oldest
+# expired entries are evicted beyond this (default: 50000)
+max_tracked_ips = 50000
+
+# Login throttling: maximum login attempts per source IP per window. Counts
+# every attempt, successful or not (default: 30)
+login_ip_max_attempts = 30
+
+# Login throttling: maximum failed passwords per (source IP, e-mail) pair per
+# window. There is no account-only lock: an attacker can only lock their own
+# IP out of a given account (default: 10)
+login_pair_max_failures = 10
+
+# Login throttling window in seconds (default: 900 = 15 minutes)
+login_window_secs = 900
+
 # Maximum requests per minute from a single IP (default: 60)
 requests_per_minute = 60
 
@@ -424,12 +453,14 @@ format = "Json"
 # PAYMENT GATEWAYS
 # =============================================================================
 [payment]
-# Default payment gateway ID (default: "mock")
-# Options: "mock", "stripe", "wechatpay", "alipay", "airwallex"
+# Checkout gateway: "mock", "stripe", or "airwallex".
+# Mock requires test_mode = true and must never be used in production.
 default_gateway = "mock"
 
-# Enable test mode for all payments (default: false)
-test_mode = false
+# Enable the mock gateway for local development and test servers.
+# For production, set test_mode = false, select "airwallex" or "stripe",
+# and enable that gateway with valid credentials below.
+test_mode = true
 
 # Stripe configuration
 [payment.stripe]

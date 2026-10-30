@@ -63,10 +63,20 @@ impl CartService {
         self
     }
 
-    /// Create a new cart service with database access (for bundle expansion)
+    /// Create a new cart service with database access for transactional mutations
     pub fn with_database(mut self, db: Database) -> Self {
         self.db = Some(db);
         self
+    }
+
+    fn postgres_mutation(&self) -> Option<crate::services::cart_mutation::PostgresCartMutation> {
+        self.db.clone().map(|db| {
+            crate::services::cart_mutation::PostgresCartMutation::new(
+                db,
+                self.coupon_repo.clone(),
+                self.coupon_service.clone(),
+            )
+        })
     }
 
     /// Get or create a cart for a customer or session
@@ -306,6 +316,10 @@ impl CartService {
         input: AddToCartInput,
         product_details: ProductDetails,
     ) -> Result<CartItem> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation.add_item(cart_id, input, product_details).await;
+        }
+
         // Verify cart exists and is not converted
         let cart = self
             .cart_repo
@@ -376,6 +390,12 @@ impl CartService {
         quantity: i32,
         bundle_details: BundleCartDetails,
     ) -> Result<Vec<CartItem>> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation
+                .add_bundle_item(cart_id, bundle_product_id, quantity, bundle_details)
+                .await;
+        }
+
         // Verify cart exists and is not converted
         let cart = self
             .cart_repo
@@ -466,6 +486,10 @@ impl CartService {
         item_id: Uuid,
         input: UpdateCartItemInput,
     ) -> Result<CartItem> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation.update_item(cart_id, item_id, input).await;
+        }
+
         let mut item = self
             .cart_repo
             .find_item_by_id(item_id)
@@ -493,6 +517,10 @@ impl CartService {
 
     /// Remove item from cart
     pub async fn remove_item(&self, cart_id: Uuid, item_id: Uuid) -> Result<()> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation.remove_item(cart_id, item_id).await;
+        }
+
         let item = self
             .cart_repo
             .find_item_by_id(item_id)
@@ -536,10 +564,17 @@ impl CartService {
             ));
         }
 
-        // Apply coupon
-        let mut updated_cart = cart;
-        updated_cart.coupon_code = Some(input.coupon_code);
-        self.cart_repo.update(&updated_cart).await?;
+        if let Some(db) = &self.db {
+            sqlx::query("UPDATE carts SET coupon_code = $2, updated_at = NOW() WHERE id = $1")
+                .bind(cart_id)
+                .bind(&input.coupon_code)
+                .execute(db.pool())
+                .await?;
+        } else {
+            let mut updated_cart = cart;
+            updated_cart.coupon_code = Some(input.coupon_code);
+            self.cart_repo.update(&updated_cart).await?;
+        }
 
         // Recalculate with discount
         self.recalculate_cart(cart_id).await?;
@@ -553,14 +588,20 @@ impl CartService {
 
     /// Remove coupon from cart
     pub async fn remove_coupon(&self, cart_id: Uuid) -> Result<Cart> {
-        let mut cart = self
-            .cart_repo
-            .find_by_id(cart_id)
-            .await?
-            .ok_or_else(|| Error::not_found("Cart not found"))?;
-
-        cart.coupon_code = None;
-        self.cart_repo.update(&cart).await?;
+        if let Some(db) = &self.db {
+            sqlx::query("UPDATE carts SET coupon_code = NULL, updated_at = NOW() WHERE id = $1")
+                .bind(cart_id)
+                .execute(db.pool())
+                .await?;
+        } else {
+            let mut cart = self
+                .cart_repo
+                .find_by_id(cart_id)
+                .await?
+                .ok_or_else(|| Error::not_found("Cart not found"))?;
+            cart.coupon_code = None;
+            self.cart_repo.update(&cart).await?;
+        }
 
         // Recalculate without discount
         self.recalculate_cart(cart_id).await?;
@@ -574,16 +615,24 @@ impl CartService {
 
     /// Set shipping address for cart
     pub async fn set_shipping_address(&self, cart_id: Uuid, address_id: Uuid) -> Result<Cart> {
-        let mut cart = self
-            .cart_repo
-            .find_by_id(cart_id)
-            .await?
-            .ok_or_else(|| Error::not_found("Cart not found"))?;
-
-        cart.shipping_address_id = Some(address_id);
-        cart.updated_at = Utc::now();
-
-        self.cart_repo.update(&cart).await?;
+        if let Some(db) = &self.db {
+            sqlx::query(
+                "UPDATE carts SET shipping_address_id = $2, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(cart_id)
+            .bind(address_id)
+            .execute(db.pool())
+            .await?;
+        } else {
+            let mut cart = self
+                .cart_repo
+                .find_by_id(cart_id)
+                .await?
+                .ok_or_else(|| Error::not_found("Cart not found"))?;
+            cart.shipping_address_id = Some(address_id);
+            cart.updated_at = Utc::now();
+            self.cart_repo.update(&cart).await?;
+        }
 
         // Recalculate to update tax
         self.recalculate_cart(cart_id).await?;
@@ -601,17 +650,26 @@ impl CartService {
         method: String,
         cost: Decimal,
     ) -> Result<Cart> {
-        let mut cart = self
-            .cart_repo
-            .find_by_id(cart_id)
-            .await?
-            .ok_or_else(|| Error::not_found("Cart not found"))?;
-
-        cart.shipping_method = Some(method);
-        cart.shipping_total = cost;
-        cart.updated_at = Utc::now();
-
-        self.cart_repo.update(&cart).await?;
+        if let Some(db) = &self.db {
+            sqlx::query(
+                "UPDATE carts SET shipping_method = $2, shipping_total = $3, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(cart_id)
+            .bind(&method)
+            .bind(cost)
+            .execute(db.pool())
+            .await?;
+        } else {
+            let mut cart = self
+                .cart_repo
+                .find_by_id(cart_id)
+                .await?
+                .ok_or_else(|| Error::not_found("Cart not found"))?;
+            cart.shipping_method = Some(method);
+            cart.shipping_total = cost;
+            cart.updated_at = Utc::now();
+            self.cart_repo.update(&cart).await?;
+        }
 
         // Recalculate totals
         self.recalculate_cart(cart_id).await?;
@@ -630,6 +688,10 @@ impl CartService {
 
     /// Recalculate cart totals
     async fn recalculate_cart(&self, cart_id: Uuid) -> Result<()> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation.recalculate_cart(cart_id).await;
+        }
+
         let items = self.cart_repo.get_items(cart_id).await?;
         let mut cart = self
             .cart_repo
@@ -857,6 +919,10 @@ impl CartService {
 
     /// Clear cart (remove all items)
     pub async fn clear_cart(&self, cart_id: Uuid) -> Result<()> {
+        if let Some(mutation) = self.postgres_mutation() {
+            return mutation.clear_cart(cart_id).await;
+        }
+
         self.cart_repo.clear_items(cart_id).await?;
         self.recalculate_cart(cart_id).await?;
         Ok(())

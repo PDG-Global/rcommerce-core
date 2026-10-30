@@ -120,7 +120,7 @@ impl ShippingProvider for WeightBasedProvider {
         _from_address: &Address,
         to_address: &Address,
         package: &Package,
-        _options: &RateOptions,
+        options: &RateOptions,
     ) -> Result<Vec<ShippingRate>> {
         let country_code = to_address.country.to_uppercase();
         let weight_kg = if package.weight_unit.to_lowercase() == "kg" {
@@ -151,7 +151,7 @@ impl ShippingProvider for WeightBasedProvider {
             "weight_standard",
             &service_name,
             cost,
-            "USD",
+            options.currency.as_deref().unwrap_or("USD"),
         );
 
         Ok(vec![ShippingRate {
@@ -597,6 +597,33 @@ mod tests {
             futures::executor::block_on(provider.get_rates(&us_addr, &us_addr, &package, &options))
                 .unwrap();
         assert!(rates.is_empty(), "US must produce no rates");
+    }
+
+    #[test]
+    fn test_get_rates_uses_requested_currency_without_changing_amount() {
+        let provider = WeightBasedProvider::new();
+        let addr = test_address("GB");
+        let package = Package {
+            weight: dec!(1.0),
+            weight_unit: "kg".to_string(),
+            length: None,
+            width: None,
+            height: None,
+            dimension_unit: None,
+            predefined_package: None,
+        };
+        let options = RateOptions {
+            currency: Some("EUR".to_string()),
+            ..Default::default()
+        };
+
+        let rates =
+            futures::executor::block_on(provider.get_rates(&addr, &addr, &package, &options))
+                .unwrap();
+
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].currency, "EUR");
+        assert_eq!(rates[0].total_cost, dec!(7.00));
     }
 
     fn test_address(country: &str) -> Address {

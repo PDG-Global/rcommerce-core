@@ -186,49 +186,60 @@ impl InventoryService {
         quantity: i32,
         cost_per_unit: Option<Decimal>,
     ) -> Result<StockMovement> {
-        // Update inventory levels: UPDATE first, INSERT only if no row exists.
-        // (An ON CONFLICT target cannot match NULL variant_id rows, so an
-        // upsert silently never conflicts for simple products.)
+        self.receive_stock_for_variant(product_id, None, location_id, quantity, cost_per_unit)
+            .await
+    }
+
+    pub async fn receive_stock_for_variant(
+        &self,
+        product_id: uuid::Uuid,
+        variant_id: Option<uuid::Uuid>,
+        location_id: uuid::Uuid,
+        quantity: i32,
+        cost_per_unit: Option<Decimal>,
+    ) -> Result<StockMovement> {
         let updated = sqlx::query(
             r#"
-            UPDATE inventory_levels 
+            UPDATE inventory_levels
             SET available_quantity = available_quantity + $3,
                 updated_at = NOW()
-            WHERE product_id = $1 AND location_id = $2 AND variant_id IS NULL
+            WHERE product_id = $1 AND location_id = $2 AND variant_id IS NOT DISTINCT FROM $4
             "#,
         )
         .bind(product_id)
         .bind(location_id)
         .bind(quantity)
+        .bind(variant_id)
         .execute(self.db.pool())
         .await?;
 
         if updated.rows_affected() == 0 {
             sqlx::query(
                 r#"
-                INSERT INTO inventory_levels (id, product_id, location_id, available_quantity, incoming_quantity)
-                VALUES ($1, $2, $3, $4, 0)
+                INSERT INTO inventory_levels (id, product_id, variant_id, location_id, available_quantity, incoming_quantity)
+                VALUES ($1, $2, $3, $4, $5, 0)
                 "#,
             )
             .bind(uuid::Uuid::new_v4())
             .bind(product_id)
+            .bind(variant_id)
             .bind(location_id)
             .bind(quantity)
             .execute(self.db.pool())
             .await?;
         }
 
-        // Create stock movement record
         let movement_id = uuid::Uuid::new_v4();
         let movement = sqlx::query_as::<_, StockMovement>(
             r#"
-            INSERT INTO stock_movements (id, product_id, location_id, quantity, movement_type, cost_per_unit, reference)
-            VALUES ($1, $2, $3, $4, 'in', $5, 'stock_receipt')
+            INSERT INTO stock_movements (id, product_id, variant_id, location_id, quantity, movement_type, cost_per_unit, reference)
+            VALUES ($1, $2, $3, $4, $5, 'in', $6, 'stock_receipt')
             RETURNING *
             "#
         )
         .bind(movement_id)
         .bind(product_id)
+        .bind(variant_id)
         .bind(location_id)
         .bind(quantity)
         .bind(cost_per_unit)

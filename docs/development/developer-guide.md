@@ -97,8 +97,9 @@ pool_size = 5
 [cache]
 provider = "memory"  # Use in-memory cache for development
 
-[payments]
+[payment]
 default_gateway = "mock"
+test_mode = true  # development only; mock is unavailable when this is false
 
 [logging]
 level = "debug"

@@ -360,33 +360,33 @@ pub async fn apply_coupon(
 }
 ```
 
+## Mutation Consistency and Bundles
+
+PostgreSQL cart mutations lock the cart and its items in one transaction,
+serializing concurrent changes per cart. Stock checks include existing cart
+quantities and are repeated within the transaction. Bundle expansion preserves
+parent/child metadata; changing or removing a parent updates its children, and
+children cannot be mutated independently. Component lines do not double-count
+the merchandise subtotal. Recalculation updates stored line quantities and
+subtotals, discount allocations, and cart totals without repricing unchanged
+products.
+
 ## Authentication & Authorization
 
-Cart endpoints have different authentication requirements:
+Guest cart operations use the cart UUID as a bearer capability. The session
+token returned at creation is used for merging after login, not as a
+requirement on every guest request.
 
-### Public Endpoints (No Auth)
-- `POST /carts/guest` - Create guest cart
-- `GET /carts/:id` - Get cart by ID
+- `POST /carts/guest` is public.
+- `/carts/:id` and all item/coupon subroutes accept optional JWT. Guest carts
+  need no token; customer-owned carts require a token matching `customer_id`.
+- `GET /carts/me` and `POST /carts/merge` always require JWT.
+- Checkout applies the same ownership check. Missing or foreign credentials on
+  a customer-owned cart return `404` for every read and mutation.
 
-### Protected Endpoints (JWT Required)
-- `GET /carts/me` - Get customer cart
-- `POST /carts/:id/items` - Add item
-- `PUT /carts/:id/items/:item_id` - Update item
-- `DELETE /carts/:id/items/:item_id` - Remove item
-- `DELETE /carts/:id/items` - Clear cart
-- `POST /carts/merge` - Merge carts
-- `POST /carts/:id/coupon` - Apply coupon
-- `DELETE /carts/:id/coupon` - Remove coupon
-
-The `Extension<JwtAuth>` extractor is used to get the authenticated customer ID:
-
-```rust
-pub struct JwtAuth {
-    pub customer_id: Uuid,
-    pub email: String,
-    pub permissions: Vec<String>,
-}
-```
+The optional `Extension<JwtAuth>` context supplies the caller identity on
+by-ID routes. The storefront sends it when a customer is logged in and supports
+guest access otherwise.
 
 ## Error Handling
 

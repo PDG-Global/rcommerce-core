@@ -4,7 +4,7 @@
 
 The payment system provides a unified API for processing payments across multiple gateways while each gateway handles its own secure payment collection. This enables merchants to accept payments through various methods (credit cards, bank transfers, digital wallets, etc.) while maintaining a consistent integration experience.
 
-**Key Design Principle:** Sensitive payment data never touches your server. The frontend uses gateway-provided secure payment UIs (Stripe Elements, Airwallex Hosted Pages) to collect and tokenize payment details. R Commerce creates payment sessions and handles webhooks for payment confirmation.
+**Key Design Principle:** Checkout can use gateway-provided secure payment UIs (Stripe Elements, Airwallex Hosted Pages) so card data bypasses R Commerce. The direct payment API also accepts payment-method data and forwards it to the selected gateway; raw card data is not persisted locally.
 
 **Supported Gateways:**
 - Stripe (Global cards and digital wallets)
@@ -53,16 +53,15 @@ The payment system provides a unified API for processing payments across multipl
 
 ## Benefits
 
-1. **Security**: Sensitive payment data (card numbers) never touches your server
-2. **PCI Compliance**: Using gateway's secure UIs achieves SAQ A compliance
+1. **Hosted UI option**: Gateway Elements/Hosted Pages can keep card data off the R Commerce server
+2. **PCI scope**: Gateway-hosted collection can reduce scope; assess the actual integration
 3. **No API Keys in Frontend**: Secret keys remain server-side only
 4. **Unified Backend API**: Same API regardless of which gateway is used
 5. **Simplified Frontend**: Integration handled by gateway SDKs
 
 ## Security
 
-- **Card Data**: Never touches your server - goes directly to payment gateway
-- **PCI Compliance**: Using Stripe Elements or Airwallex Hosted Pages achieves SAQ A compliance
+- **Card Data**: Raw card data is not persisted locally; direct API payment data passes through R Commerce to the gateway
 - **API Keys**: Secret keys stored server-side only
 - **Webhook Verification**: All webhook signatures are verified
 - **HTTPS**: Required in production
@@ -100,37 +99,52 @@ window.location.href = redirect_url;
 
 ## API Integration
 
-### Create Payment Session
+### Direct Payment API
+
+All `/payments` and `/payment-methods` endpoints require JWT. Customers can
+operate only on their own orders, payments, and saved methods; foreign records
+are treated as not found. Refunds require an admin JWT and use the gateway
+stored on the payment.
 
 ```http
 POST /api/v1/payments
+Authorization: Bearer <customer_jwt>
+Content-Type: application/json
+
 {
   "gateway_id": "stripe",
   "amount": "99.99",
   "currency": "USD",
-  "order_id": "order_123",
+  "payment_method_type": "card",
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
   "customer_email": "customer@example.com",
-  "return_url": "https://yoursite.com/checkout/complete"
+  "payment_method_data": {
+    "type": "card",
+    "number": "4242424242424242",
+    "exp_month": "12",
+    "exp_year": "2030",
+    "cvc": "123",
+    "name": "Test Customer"
+  },
+  "save_payment_method": false,
+  "description": "Order payment"
 }
 ```
 
-**Response (Stripe Elements):**
-```json
-{
-  "client_secret": "pi_xxx_secret_xxx",
-  "payment_id": "pay_xxx",
-  "gateway": "stripe"
-}
-```
+The server validates amount and currency against the authoritative order and
+persists the provider intent ID and status on initiation, completion, and
+status refresh. Completion and refunds use the stored gateway, with no
+implicit fallback. Amounts use major currency units; Airwallex payment and
+refund payloads also use major units rather than cents.
 
-**Response (Airwallex Hosted):**
-```json
-{
-  "redirect_url": "https://airwallex.com/checkout/xxx",
-  "payment_id": "pay_xxx",
-  "gateway": "airwallex"
-}
-```
+`save_payment_method = true` is rejected on direct initiation. Use
+`POST /api/v1/payment-methods` to save, then list or delete through the saved
+method endpoints. The server maintains a provider-customer mapping per local
+customer and gateway and stores only a local SHA-256 token hash for ownership
+checks. Airwallex saved-card charges require a CVC supplied in
+`payment_method_data.cvc`; it is never stored or logged. Refund reconciliation
+uses cumulative settled refund amounts so partial refunds do not mark the whole
+order refunded or restock every item.
 
 ### Webhook Handling
 
@@ -148,26 +162,29 @@ Your server should:
 
 ## Configuration
 
-### Stripe Configuration
-
 ```toml
+[payment]
+default_gateway = "stripe"  # checkout: mock (test only), stripe, or airwallex
+test_mode = false           # production
+
 [payment.stripe]
 enabled = true
 secret_key = "${STRIPE_SECRET_KEY}"
 publishable_key = "${STRIPE_PUBLISHABLE_KEY}"
 webhook_secret = "${STRIPE_WEBHOOK_SECRET}"
-```
 
-### Airwallex Configuration
-
-```toml
 [payment.airwallex]
-enabled = true
+enabled = false
 api_key = "${AIRWALLEX_API_KEY}"
 client_id = "${AIRWALLEX_CLIENT_ID}"
 webhook_secret = "${AIRWALLEX_WEBHOOK_SECRET}"
-demo = true  # For testing
+demo = false
 ```
+
+Mock is registered only when `test_mode = true`. The selected real gateway must
+be enabled with its required credentials. Unsupported, disabled, or incomplete
+selections fail at startup without fallback; production uses
+`test_mode = false`.
 
 ## Error Handling
 

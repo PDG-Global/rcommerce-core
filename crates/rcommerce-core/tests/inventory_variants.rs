@@ -8,7 +8,6 @@
 use chrono::Duration;
 use rcommerce_core::inventory::{InventoryConfig, InventoryService, StockReservation};
 use rcommerce_core::repository::Database;
-use rcommerce_core::Migrator;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -33,18 +32,11 @@ async fn setup() -> Option<(PgPool, InventoryService)> {
         }
     };
 
-    // Build the schema through the real migration path.
-    if let Err(e) = Migrator::new(pool.clone()).migrate().await {
+    // Build the schema through the real migration path (once per process —
+    // see ensure_test_migrations; concurrent DDL deadlocks against the DML
+    // of other parallel tests).
+    if let Err(e) = rcommerce_core::ensure_test_migrations(&pool).await {
         eprintln!("Skipping inventory variant tests: migration failed: {e}");
-        return None;
-    }
-
-    // Migration 013 is not registered in the migrator (applied by hand on the
-    // live databases). Apply it here so stock_reservations matches what the
-    // code expects: nullable order_id and the reservation_status enum.
-    let fixup = include_str!("../migrations/013_stock_reservations_order_id_nullable.sql");
-    if let Err(e) = sqlx::raw_sql(fixup).execute(&pool).await {
-        eprintln!("Skipping inventory variant tests: 013 fixup failed: {e}");
         return None;
     }
 

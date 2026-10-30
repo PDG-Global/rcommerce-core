@@ -185,27 +185,26 @@ commerce.example.com {
     # Automatic HTTPS (Let's Encrypt)
     tls admin@example.com
     
-    # Reverse proxy to R Commerce
+    # Reverse proxy to R Commerce. Caddy's default handling appends the
+    # immediate socket peer to X-Forwarded-For; do not override that header.
     reverse_proxy localhost:8080 {
         # WebSocket support
         header_up Upgrade {http.request.header.Upgrade}
         header_up Connection {http.request.header.Connection}
-        
-        # Forward original headers
+
         header_up X-Real-IP {http.request.remote}
-        header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
         header_up X-Forwarded-Proto {http.request.scheme}
         header_up X-Forwarded-Host {http.request.host}
-        
+
         # Health checks
         health_uri /health
         health_interval 30s
         health_timeout 5s
     }
-    
+
     # Compression
     encode gzip zstd
-    
+
     # Security headers
     header {
         X-Frame-Options "SAMEORIGIN"
@@ -214,7 +213,7 @@ commerce.example.com {
         Referrer-Policy "strict-origin-when-cross-origin"
         remove Server
     }
-    
+
     # Logging
     log {
         output file /var/log/caddy/access.log {
@@ -224,7 +223,7 @@ commerce.example.com {
         }
         format json
     }
-    
+
     # Static file serving (optional)
     handle_path /static/* {
         root * /var/www/rcommerce/static
@@ -233,6 +232,36 @@ commerce.example.com {
     }
 }
 ```
+
+### Trusted Client Addresses
+
+R Commerce uses the TCP peer from Axum `ConnectInfo` and trusts
+`X-Forwarded-For` only when that peer belongs to `[rate_limiting].trusted_proxies`.
+It walks the chain right-to-left past trusted proxies and uses the first
+untrusted entry as the client. The resolved address feeds request/login
+limiters and API-key audit records; forwarding headers from untrusted peers
+are ignored.
+
+For **Cloudflare → Caddy → Axum**, configure the Caddy peer and all current
+Cloudflare IPv4/IPv6 CIDRs from Cloudflare's published list:
+
+```toml
+[rate_limiting]
+trusted_proxies = [
+    "127.0.0.1/32",
+    "::1/128",
+    # Add every current Cloudflare IPv4 and IPv6 CIDR here.
+]
+max_forwarded_hops = 8
+max_tracked_ips = 50000
+```
+
+Caddy must preserve its normal behavior of appending the immediate, verified
+socket peer to `X-Forwarded-For`. Never replace that chain with an incoming
+`CF-Connecting-IP` or `X-Forwarded-For` value, and never trust those headers
+from arbitrary clients. Keep Axum private so clients cannot bypass Caddy.
+Invalid trusted CIDRs prevent startup; malformed or overlong chains from a
+trusted proxy fail closed.
 
 ### Load Balancing
 

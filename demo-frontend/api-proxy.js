@@ -23,7 +23,7 @@ const api = {
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({}));
-            throw new Error(error.error || 'Login failed');
+            throw new Error(error.error?.message || error.error || 'Login failed');
         }
         
         const data = await response.json();
@@ -104,7 +104,7 @@ const api = {
     
     // Customer
     async fetchCustomerProfile() {
-        const response = await this.authenticatedFetch(`${API_BASE_URL}/v1/customers`);
+        const response = await this.authenticatedFetch(`${API_BASE_URL}/v1/customers/me`);
         
         if (!response.ok) {
             if (response.status === 401) {

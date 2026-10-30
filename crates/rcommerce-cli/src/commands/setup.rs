@@ -507,6 +507,11 @@ async fn setup_payment_gateways(mut config: Config) -> Result<Config, String> {
             .map_err(|e| format!("Input error: {}", e))?;
 
         config.payment.test_mode = test_mode;
+        if enable_stripe {
+            config.payment.default_gateway = "stripe".to_string();
+        } else if test_mode {
+            config.payment.default_gateway = "mock".to_string();
+        }
 
         println!("{}", "✓ Payment gateways configured".green());
     } else {

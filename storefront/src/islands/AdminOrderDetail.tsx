@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { apiFetchAuthenticated, API_BASE, getAuthToken } from '../lib/api';
 import { visibleItems } from '../lib/bundles';
 import AdminGuard from './AdminGuard';
@@ -62,6 +62,8 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
   const [statusDraft, setStatusDraft] = useState('');
   const [refundAmount, setRefundAmount] = useState('');
   const [refundReason, setRefundReason] = useState('');
+  const [carrier, setCarrier] = useState('UPS');
+  const [trackingNumber, setTrackingNumber] = useState('');
 
   const loadOrder = useCallback(() => {
     setLoading(true);
@@ -79,11 +81,17 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
     loadOrder();
   }, [loadOrder]);
 
-  const runAction = (key: string, fn: () => Promise<unknown>, successMessage: string) => {
+  const runAction = (
+    key: string,
+    fn: () => Promise<unknown>,
+    successMessage: string,
+    onSuccess?: () => void,
+  ) => {
     setBusy(key);
     setFeedback(null);
     fn()
       .then(() => {
+        onSuccess?.();
         setFeedback({ kind: 'success', message: successMessage });
         clearCachedAdminStats();
         return loadOrder();
@@ -161,6 +169,24 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
     );
   };
 
+  const handleFulfill = (event: FormEvent) => {
+    event.preventDefault();
+    if (!order) return;
+    const code = trackingNumber.trim();
+    if (!code) return;
+    if (!window.confirm(`Mark order ${order.order_number} as shipped via ${carrier} with tracking ${code}?`)) return;
+    runAction(
+      'fulfillment',
+      () =>
+        apiFetchAuthenticated(`/orders/${order.id}/fulfillments`, {
+          method: 'POST',
+          body: JSON.stringify({ carrier, tracking_number: code }),
+        }),
+      `Order marked as shipped via ${carrier}.`,
+      () => setTrackingNumber(''),
+    );
+  };
+
   if (loading && !order) {
     return <p className="font-serif italic text-xl text-rcommerce-500">Loading order…</p>;
   }
@@ -177,9 +203,13 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
   const canCancel = CANCELLABLE_STATUSES.includes(order.status);
   const canRefund = order.payment_status === 'paid' && order.status !== 'refunded';
   const fulfillmentStatus = order.fulfillment_status || 'pending';
+  const fulfillments = order.fulfillments ?? [];
+  const canFulfill =
+    ['confirmed', 'processing'].includes(order.status) &&
+    ['pending', 'processing'].includes(fulfillmentStatus);
   const noteLines = parseOrderNotes(order.notes);
   const lastNote = noteLines.length > 0 ? noteLines[noteLines.length - 1] : null;
-  const tracking = lastNote ? extractTracking(lastNote.text) : null;
+  const tracking = fulfillments.length === 0 && lastNote ? extractTracking(lastNote.text) : null;
   const discountValue = parseFloat(String(order.discount_total ?? 0));
   const hasDiscount = Number.isFinite(discountValue) && discountValue > 0;
 
@@ -350,7 +380,34 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
         </div>
 
         <div className="text-sm">
-          {tracking ? (
+          {fulfillments.length > 0 ? (
+            <ul className="space-y-3">
+              {fulfillments.map((fulfillment) => (
+                <li key={fulfillment.id} className="border border-rcommerce-200 p-3">
+                  <p className="text-rcommerce-700">
+                    <span className="font-semibold">{fulfillment.tracking_company ?? 'Carrier'}</span>{' '}
+                    {fulfillment.tracking_url ? (
+                      <a
+                        href={fulfillment.tracking_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-rcommerce-accent hover:underline"
+                      >
+                        {fulfillment.tracking_number}
+                      </a>
+                    ) : (
+                      <span>{fulfillment.tracking_number ?? 'No tracking number'}</span>
+                    )}
+                  </p>
+                  {fulfillment.shipped_at && (
+                    <p className="text-rcommerce-500 text-xs mt-1">
+                      Shipped {formatDateTime(fulfillment.shipped_at)}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : tracking ? (
             <p className="text-rcommerce-700">
               Tracking: {tracking.carrier ?? 'Carrier'}{' '}
               <a
@@ -366,6 +423,53 @@ function OrderDetailContent({ orderId }: { orderId: string }) {
             <p className="text-rcommerce-500">No tracking information yet.</p>
           )}
         </div>
+
+        {canFulfill && (
+          <form onSubmit={handleFulfill} className="border border-rcommerce-200 p-4 space-y-4">
+            <h3 className="text-sm font-semibold">Manual fulfilment</h3>
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="fulfillment-carrier" className="block text-xs font-semibold uppercase tracking-button text-rcommerce-500 mb-2">
+                  Carrier
+                </label>
+                <select
+                  id="fulfillment-carrier"
+                  value={carrier}
+                  onChange={(event) => setCarrier(event.target.value)}
+                  className="input"
+                >
+                  {['DHL', 'UPS', 'FedEx', 'SF Express'].map((option) => (
+                    <option key={option} value={option}>{option}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="fulfillment-tracking" className="block text-xs font-semibold uppercase tracking-button text-rcommerce-500 mb-2">
+                  Tracking number
+                </label>
+                <input
+                  id="fulfillment-tracking"
+                  type="text"
+                  value={trackingNumber}
+                  onChange={(event) => setTrackingNumber(event.target.value)}
+                  maxLength={128}
+                  pattern="[A-Za-z0-9-]+"
+                  title="Letters, numbers, and hyphens only"
+                  autoComplete="off"
+                  required
+                  className="input"
+                />
+              </div>
+            </div>
+            <button
+              type="submit"
+              disabled={busy !== null || !trackingNumber.trim()}
+              className="btn-primary"
+            >
+              {busy === 'fulfillment' ? 'Shipping…' : 'Mark as shipped'}
+            </button>
+          </form>
+        )}
 
         {noteLines.length > 0 && (
           <div className="space-y-2 pt-4 border-t border-rcommerce-200">

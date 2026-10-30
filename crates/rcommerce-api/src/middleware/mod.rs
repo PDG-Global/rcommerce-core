@@ -2,14 +2,13 @@
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     http::{HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -19,40 +18,60 @@ use rcommerce_core::config::{RateLimitConfig, TlsConfig};
 use rcommerce_core::services::AuthService;
 
 pub mod api_key_auth;
+pub mod client_ip;
+pub mod login_throttle;
 pub mod scopes;
 pub mod wc_auth;
 
 pub use api_key_auth::{
     api_key_auth_middleware, combined_auth_middleware, ApiKeyAuth, AuthContext, JwtAuth,
 };
+pub use client_ip::{client_ip_middleware, ClientIp, ClientIpError, ClientIpResolver};
+pub use login_throttle::{canonical_email, LoginThrottle};
 
-/// Rate limiter for auth endpoints (in-memory, per-IP)
+/// Rate limiter for auth endpoints (in-memory, per client IP)
 #[derive(Clone)]
 pub struct AuthRateLimiter {
     /// Max attempts per window
     max_attempts: u32,
     /// Window duration in seconds
     window_secs: u64,
+    /// Hard cap on tracked IPs; oldest windows are evicted beyond this.
+    max_tracked: usize,
     /// Store: IP -> (attempts, first_attempt_time)
-    store: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
+    store: Arc<Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>>,
 }
 
 impl AuthRateLimiter {
-    pub fn new(max_attempts: u32, window_secs: u64) -> Self {
+    pub fn new(max_attempts: u32, window_secs: u64, max_tracked: usize) -> Self {
         Self {
             max_attempts,
             window_secs,
+            max_tracked: max_tracked.max(1),
             store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Check if the request is allowed and increment counter
-    pub async fn check_and_increment(&self, ip: &str) -> bool {
+    pub async fn check_and_increment(&self, ip: std::net::IpAddr) -> bool {
         let mut store = self.store.lock().await;
         let now = Instant::now();
         let window = Duration::from_secs(self.window_secs);
 
-        match store.get_mut(ip) {
+        if store.len() >= self.max_tracked && !store.contains_key(&ip) {
+            store.retain(|_, (_, first)| now.duration_since(*first) <= window);
+            if store.len() >= self.max_tracked {
+                if let Some(oldest) = store
+                    .iter()
+                    .min_by_key(|(_, (_, first))| *first)
+                    .map(|(k, _)| *k)
+                {
+                    store.remove(&oldest);
+                }
+            }
+        }
+
+        match store.get_mut(&ip) {
             Some((attempts, first_attempt)) => {
                 // Check if window has expired
                 if now.duration_since(*first_attempt) > window {
@@ -71,7 +90,7 @@ impl AuthRateLimiter {
             }
             None => {
                 // First attempt from this IP
-                store.insert(ip.to_string(), (1, now));
+                store.insert(ip, (1, now));
                 true
             }
         }
@@ -98,24 +117,19 @@ pub async fn auth_rate_limit_middleware(
         .cloned()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Extract connection info from request extensions
-    let addr = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    // Resolve the client IP through the trusted-proxy-aware resolver. A
+    // header we cannot safely process fails closed rather than bypassing
+    // the limit.
+    let ip = match state.client_ip_resolver.resolve_request(&request) {
+        Ok(ip) => ip,
+        Err(err) => {
+            tracing::warn!("Auth rate limit: client IP resolution failed: {:?}", err);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    };
 
-    // Get client IP (use X-Forwarded-For if behind proxy, otherwise use socket addr)
-    let ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
-
-    // Check rate limit (5 attempts per minute)
-    if !state.auth_rate_limiter.check_and_increment(&ip).await {
+    // Check rate limit
+    if !state.auth_rate_limiter.check_and_increment(ip).await {
         tracing::warn!("Auth rate limit exceeded for IP: {}", ip);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -228,21 +242,34 @@ pub enum RateLimitCheck {
 pub struct RateLimiter {
     max_requests: u32,
     window: Duration,
-    allowlist: Vec<String>,
-    blocklist: Vec<String>,
+    allowlist: Vec<std::net::IpAddr>,
+    blocklist: Vec<std::net::IpAddr>,
     expose_headers: bool,
-    store: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    max_tracked: usize,
+    store: Arc<Mutex<HashMap<std::net::IpAddr, Vec<Instant>>>>,
 }
 
 impl RateLimiter {
     /// Create a limiter from the `[rate_limiting]` configuration section
     pub fn new(config: &RateLimitConfig) -> Self {
+        let parse_ips = |list: &[String]| -> Vec<std::net::IpAddr> {
+            list.iter()
+                .filter_map(|entry| match entry.parse() {
+                    Ok(ip) => Some(ip),
+                    Err(_) => {
+                        tracing::warn!("Ignoring invalid [rate_limiting] IP entry: '{}'", entry);
+                        None
+                    }
+                })
+                .collect()
+        };
         Self {
             max_requests: config.requests_per_minute.max(1),
             window: Duration::from_secs(60),
-            allowlist: config.allowlist.clone(),
-            blocklist: config.blocklist.clone(),
+            allowlist: parse_ips(&config.allowlist),
+            blocklist: parse_ips(&config.blocklist),
             expose_headers: config.expose_headers,
+            max_tracked: config.max_tracked_ips.max(1),
             store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -257,19 +284,35 @@ impl RateLimiter {
         self.expose_headers
     }
 
-    /// Check whether a request from `key` (a client IP) is allowed
-    pub async fn check(&self, key: &str) -> RateLimitCheck {
-        if self.blocklist.iter().any(|ip| ip == key) {
+    /// Check whether a request from `ip` (a canonical client IP) is allowed
+    pub async fn check(&self, ip: std::net::IpAddr) -> RateLimitCheck {
+        if self.blocklist.contains(&ip) {
             return RateLimitCheck::Blocked;
         }
-        if self.allowlist.iter().any(|ip| ip == key) {
+        if self.allowlist.contains(&ip) {
             return RateLimitCheck::Allowed(self.max_requests);
         }
 
         let mut store = self.store.lock().await;
         let now = Instant::now();
 
-        let timestamps = store.entry(key.to_string()).or_default();
+        if store.len() >= self.max_tracked && !store.contains_key(&ip) {
+            store.retain(|_, ts| {
+                ts.retain(|t| now.duration_since(*t) < self.window);
+                !ts.is_empty()
+            });
+            if store.len() >= self.max_tracked {
+                if let Some(oldest) = store
+                    .iter()
+                    .min_by_key(|(_, ts)| ts.first().copied().unwrap_or(now))
+                    .map(|(k, _)| *k)
+                {
+                    store.remove(&oldest);
+                }
+            }
+        }
+
+        let timestamps = store.entry(ip).or_default();
         timestamps.retain(|t| now.duration_since(*t) < self.window);
 
         if timestamps.len() as u32 >= self.max_requests {
@@ -297,32 +340,21 @@ impl RateLimiter {
     }
 }
 
-/// Resolve the client IP, honoring X-Forwarded-For when behind a reverse proxy
-fn client_ip(request: &Request<Body>) -> String {
-    let addr = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-
-    request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string())
-}
-
 /// Rate limiting middleware - enforces the `[rate_limiting]` config per client IP
 pub async fn rate_limit_middleware(
     State(limiter): State<RateLimiter>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let ip = client_ip(&request);
+    // The client IP was resolved once by `client_ip_middleware` (trusted-proxy
+    // aware). Without it we cannot attribute the request safely: fail closed.
+    let Some(client_ip) = request.extensions().get::<ClientIp>().copied() else {
+        tracing::error!("Rate limiter ran without a ClientIp extension");
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let ip = client_ip.ip();
 
-    match limiter.check(&ip).await {
+    match limiter.check(ip).await {
         RateLimitCheck::Allowed(remaining) => {
             let mut response = next.run(request).await;
             if limiter.expose_headers() {
@@ -469,13 +501,17 @@ mod tests {
         }
     }
 
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
     #[tokio::test]
     async fn test_rate_limiter_allows_within_limit() {
         let limiter = RateLimiter::new(&test_config(3));
 
         let mut remaining_expectations = [2u32, 1, 0];
         for expected in remaining_expectations.iter_mut() {
-            match limiter.check("10.0.0.1").await {
+            match limiter.check(ip("10.0.0.1")).await {
                 RateLimitCheck::Allowed(remaining) => assert_eq!(remaining, *expected),
                 RateLimitCheck::Blocked => panic!("expected Allowed, got Blocked"),
                 RateLimitCheck::Limited(_) => panic!("expected Allowed, got Limited"),
@@ -488,14 +524,14 @@ mod tests {
         let limiter = RateLimiter::new(&test_config(2));
 
         assert!(matches!(
-            limiter.check("10.0.0.1").await,
+            limiter.check(ip("10.0.0.1")).await,
             RateLimitCheck::Allowed(_)
         ));
         assert!(matches!(
-            limiter.check("10.0.0.1").await,
+            limiter.check(ip("10.0.0.1")).await,
             RateLimitCheck::Allowed(_)
         ));
-        match limiter.check("10.0.0.1").await {
+        match limiter.check(ip("10.0.0.1")).await {
             RateLimitCheck::Limited(retry_after) => {
                 assert!(retry_after > 0 && retry_after <= 60);
             }
@@ -504,7 +540,7 @@ mod tests {
 
         // A different IP is not affected
         assert!(matches!(
-            limiter.check("10.0.0.2").await,
+            limiter.check(ip("10.0.0.2")).await,
             RateLimitCheck::Allowed(_)
         ));
     }
@@ -514,23 +550,23 @@ mod tests {
         let config = RateLimitConfig {
             requests_per_minute: 1,
             blocklist: vec!["192.0.2.1".to_string()],
-            allowlist: vec!["192.0.2.2".to_string()],
+            allowlist: vec!["192.0.2.2".to_string(), "not-an-ip".to_string()],
             ..Default::default()
         };
         let limiter = RateLimiter::new(&config);
 
         assert!(matches!(
-            limiter.check("192.0.2.1").await,
+            limiter.check(ip("192.0.2.1")).await,
             RateLimitCheck::Blocked
         ));
 
         // Allowlisted IP is never limited, even past the request limit
         assert!(matches!(
-            limiter.check("192.0.2.2").await,
+            limiter.check(ip("192.0.2.2")).await,
             RateLimitCheck::Allowed(_)
         ));
         assert!(matches!(
-            limiter.check("192.0.2.2").await,
+            limiter.check(ip("192.0.2.2")).await,
             RateLimitCheck::Allowed(_)
         ));
     }
@@ -540,7 +576,7 @@ mod tests {
         let limiter = RateLimiter::new(&test_config(1));
 
         assert!(matches!(
-            limiter.check("10.0.0.1").await,
+            limiter.check(ip("10.0.0.1")).await,
             RateLimitCheck::Allowed(_)
         ));
         assert_eq!(limiter.store.lock().await.len(), 1);
@@ -549,10 +585,10 @@ mod tests {
         {
             let mut store = limiter.store.lock().await;
             store
-                .get_mut("10.0.0.1")
+                .get_mut(&ip("10.0.0.1"))
                 .unwrap()
                 .iter_mut()
-                .for_each(|t| *t = *t - Duration::from_secs(120));
+                .for_each(|t| *t -= Duration::from_secs(120));
         }
 
         limiter.cleanup().await;
@@ -560,8 +596,42 @@ mod tests {
 
         // IP can request again after cleanup
         assert!(matches!(
-            limiter.check("10.0.0.1").await,
+            limiter.check(ip("10.0.0.1")).await,
             RateLimitCheck::Allowed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_state_is_bounded() {
+        let config = RateLimitConfig {
+            requests_per_minute: 1,
+            max_tracked_ips: 4,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(&config);
+        for i in 0..10 {
+            assert!(matches!(
+                limiter.check(ip(&format!("10.0.1.{}", i + 1))).await,
+                RateLimitCheck::Allowed(_)
+            ));
+        }
+        assert_eq!(limiter.store.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rate_limiter_is_bounded_and_per_ip() {
+        let limiter = AuthRateLimiter::new(2, 60, 3);
+        assert!(limiter.check_and_increment(ip("10.0.0.1")).await);
+        assert!(limiter.check_and_increment(ip("10.0.0.1")).await);
+        assert!(!limiter.check_and_increment(ip("10.0.0.1")).await);
+        // Other IPs unaffected
+        assert!(limiter.check_and_increment(ip("10.0.0.2")).await);
+
+        for i in 0..10 {
+            limiter
+                .check_and_increment(ip(&format!("198.51.100.{}", i + 1)))
+                .await;
+        }
+        assert!(limiter.store.lock().await.len() <= 3);
     }
 }

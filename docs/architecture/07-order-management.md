@@ -14,6 +14,18 @@ The Order Management System (OMS) is the core component that handles the entire 
 - Bulk operations
 - Advanced search and filtering
 
+## Direct Order Creation
+
+In addition to cart checkout, `POST /api/v1/orders` creates an order directly
+with JWT authentication. For non-admin callers, the order's `customer_id` is
+always the authenticated caller; a requested different owner is not honored.
+Admins may specify a customer to create on their behalf or omit `customer_id`
+for a guest order.
+
+The configured store currency is written to the order and passed to the tax
+context and shipping-rate request. Amounts remain in that currency; no foreign
+exchange conversion is performed.
+
 ## Order Lifecycle
 
 ```
@@ -60,6 +72,19 @@ The Order Management System (OMS) is the core component that handles the entire 
 | **Completed** | Shipped and delivered | ❌ No | ❌ No |  Yes |
 | **Cancelled** | Order cancelled | ❌ No | ❌ No | ❌ No |
 | **Refunded** | Fully refunded | ❌ No | ❌ No | ❌ No |
+
+### Manual Admin Fulfillment
+
+`POST /api/v1/orders/:id/fulfillments` marks an entire confirmed or processing
+order as shipped. The admin supplies a tracking number and one of DHL, UPS,
+FedEx, or SF Express; the server generates the carrier tracking URL.
+
+A transaction locks the order, creates the fulfillment and all fulfillment item
+rows, updates `fulfillment_status`, and appends a plain-text audit note. Orders
+that are ineligible or already shipped are rejected, including concurrent
+repeat submissions. After commit, the existing branded shipping email is sent.
+Manual fulfillment does not contact Dianxiaomi or the carrier and does not yet
+support partial or split shipments.
 
 ## Core Data Models
 

@@ -4,7 +4,6 @@
 
 use async_trait::async_trait;
 use reqwest;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -15,6 +14,134 @@ use crate::Result;
 
 const AIRWALLEX_API_BASE_PROD: &str = "https://api.airwallex.com/api/v1";
 const AIRWALLEX_API_BASE_DEMO: &str = "https://api.sandbox.airwallex.com/api/v1";
+
+fn build_payment_intent_payload(
+    amount: Decimal,
+    currency: &str,
+    order_id: uuid::Uuid,
+    local_customer_id: Option<uuid::Uuid>,
+    gateway_customer_id: Option<&str>,
+) -> serde_json::Value {
+    let merchant_order_id = format!(
+        "ORD-{}",
+        order_id.to_string().split('-').next().unwrap_or("")
+    );
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "order_id".to_string(),
+        serde_json::Value::String(order_id.to_string()),
+    );
+    if let Some(customer_id) = local_customer_id {
+        metadata.insert(
+            "customer_id".to_string(),
+            serde_json::Value::String(customer_id.to_string()),
+        );
+    }
+
+    let mut payload = serde_json::json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "amount": amount,
+        "currency": currency,
+        "descriptor": "R Commerce Payment",
+        "merchant_order_id": merchant_order_id,
+        "metadata": metadata,
+    });
+    if let Some(customer_id) = gateway_customer_id {
+        payload["customer_id"] = serde_json::json!(customer_id);
+    }
+    payload
+}
+
+fn build_saved_card_confirm_payload(
+    gateway_customer_id: &str,
+    payment_method_token: &str,
+    cvc: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "customer_id": gateway_customer_id,
+        "payment_method": {
+            "id": payment_method_token,
+            "type": "card",
+            "card": {
+                "cvc": cvc
+            }
+        },
+        "triggered_by": "customer",
+        "payment_method_options": {
+            "card": {
+                "authorization_type": "final_auth",
+                "auto_capture": true
+            }
+        }
+    })
+}
+
+fn saved_card_gateway_customer_id(metadata: &serde_json::Value) -> Result<&str> {
+    metadata
+        .get("gateway_customer_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|customer_id| !customer_id.is_empty())
+        .ok_or_else(|| {
+            crate::Error::validation(
+                "Saved Airwallex card payments require metadata.gateway_customer_id",
+            )
+        })
+}
+
+fn build_refund_payload(
+    payment_id: &str,
+    amount: Option<Decimal>,
+    currency: &str,
+    reason: &str,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "payment_intent_id": payment_id,
+        "reason": reason,
+        "currency": currency,
+    });
+    if let Some(amount) = amount {
+        payload["amount"] = serde_json::json!(amount);
+    }
+    payload
+}
+
+fn refund_response_amount(requested: Option<Decimal>, original: Decimal) -> Decimal {
+    requested.unwrap_or(original)
+}
+
+fn build_payment_method_payload(
+    customer_id: &str,
+    payment_method_data: &PaymentMethodData,
+) -> Result<serde_json::Value> {
+    let PaymentMethodData::Card {
+        number,
+        exp_month,
+        exp_year,
+        cvc,
+        name,
+    } = payment_method_data
+    else {
+        return Err(crate::Error::validation(
+            "Only card tokenization is supported",
+        ));
+    };
+
+    Ok(serde_json::json!({
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "customer_id": customer_id,
+        "type": "card",
+        "card": {
+            "number": number,
+            "expiry_month": exp_month,
+            "expiry_year": exp_year,
+            "cvc": cvc,
+            "name": name,
+        },
+    }))
+}
 
 /// Airwallex Agnostic Gateway
 pub struct AirwallexAgnosticGateway {
@@ -215,8 +342,10 @@ impl AirwallexAgnosticGateway {
             "REQUIRES_ACTION" | "PENDING" => PaymentStatus::Pending,
             "PROCESSING" => PaymentStatus::Processing,
             "SUCCEEDED" | "CAPTURED" => PaymentStatus::Succeeded,
-            "FAILED" | "CANCELLED" => PaymentStatus::Failed,
-            "REFUNDED" | "PARTIALLY_REFUNDED" => PaymentStatus::Refunded,
+            "FAILED" => PaymentStatus::Failed,
+            "CANCELLED" => PaymentStatus::Cancelled,
+            "REFUNDED" => PaymentStatus::Refunded,
+            "PARTIALLY_REFUNDED" => PaymentStatus::PartiallyRefunded,
             _ => PaymentStatus::Pending,
         }
     }
@@ -237,39 +366,18 @@ impl AirwallexAgnosticGateway {
         amount: Decimal,
         currency: &str,
         order_id: uuid::Uuid,
-        customer_id: Option<uuid::Uuid>,
+        local_customer_id: Option<uuid::Uuid>,
+        gateway_customer_id: Option<&str>,
     ) -> Result<AirwallexPaymentIntent> {
         let token = self.get_access_token().await?;
 
-        let amount_in_cents = (amount * dec!(100))
-            .to_i64()
-            .ok_or_else(|| crate::Error::validation("Invalid amount"))?;
-
-        let merchant_order_id = format!(
-            "ORD-{}",
-            order_id.to_string().split('-').next().unwrap_or("")
+        let payload = build_payment_intent_payload(
+            amount,
+            currency,
+            order_id,
+            local_customer_id,
+            gateway_customer_id,
         );
-
-        let mut metadata = serde_json::Map::new();
-        metadata.insert(
-            "order_id".to_string(),
-            serde_json::Value::String(order_id.to_string()),
-        );
-        if let Some(customer_id) = customer_id {
-            metadata.insert(
-                "customer_id".to_string(),
-                serde_json::Value::String(customer_id.to_string()),
-            );
-        }
-
-        let payload = serde_json::json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "amount": amount_in_cents,
-            "currency": currency,
-            "descriptor": "R Commerce Payment",
-            "merchant_order_id": merchant_order_id,
-            "metadata": metadata,
-        });
 
         let response = self
             .client
@@ -295,10 +403,9 @@ impl AirwallexAgnosticGateway {
 
         let intent: AirwallexPaymentIntent = serde_json::from_str(&body).map_err(|e| {
             tracing::error!(
-                "Failed to parse Airwallex intent response (HTTP {}): {} — body: {}",
+                "Failed to parse Airwallex intent response (HTTP {}): {}",
                 status,
-                e,
-                body
+                e
             );
             crate::Error::network(format!("Failed to parse Airwallex response: {}", e))
         })?;
@@ -423,6 +530,26 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
         &self,
         request: InitiatePaymentRequest,
     ) -> Result<InitiatePaymentResponse> {
+        let gateway_customer_id = match &request.payment_method_data {
+            PaymentMethodData::CardToken { .. } => {
+                Some(saved_card_gateway_customer_id(&request.metadata)?)
+            }
+            _ => None,
+        };
+        let saved_card_cvc = match &request.payment_method_data {
+            PaymentMethodData::CardToken { cvc, .. } => Some(
+                cvc.as_deref()
+                    .map(str::trim)
+                    .filter(|cvc| !cvc.is_empty())
+                    .ok_or_else(|| {
+                        crate::Error::validation(
+                            "CVC is required for Airwallex saved card payments",
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+
         // Create payment intent
         let intent = self
             .create_payment_intent(
@@ -430,6 +557,7 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
                 &request.currency,
                 request.order_id,
                 request.customer_id,
+                gateway_customer_id,
             )
             .await?;
 
@@ -448,11 +576,17 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
                 cvc: cvc.clone(),
                 name: name.clone(),
             }),
-            PaymentMethodData::CardToken { token } => {
-                // Use saved card token
-                let token = token.clone();
+            PaymentMethodData::CardToken { token, .. } => {
+                let gateway_customer_id = gateway_customer_id.ok_or_else(|| {
+                    crate::Error::validation("Missing saved card gateway customer binding")
+                })?;
                 let confirmed_intent = self
-                    .confirm_payment_intent_with_token(&intent.id, &token)
+                    .confirm_payment_intent_with_token(
+                        &intent.id,
+                        gateway_customer_id,
+                        token,
+                        saved_card_cvc.expect("saved card CVC was validated"),
+                    )
                     .await?;
                 return self.handle_intent_response(confirmed_intent, &request.currency);
             }
@@ -499,23 +633,9 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
         amount: Option<Decimal>,
         reason: &str,
     ) -> Result<RefundResponse> {
+        let payment = self.get_payment_intent(payment_id).await?;
         let token = self.get_access_token().await?;
-
-        let amount_in_cents = match amount {
-            Some(a) => Some(
-                (a * dec!(100))
-                    .to_i64()
-                    .ok_or_else(|| crate::Error::validation("Invalid amount"))?,
-            ),
-            None => None,
-        };
-
-        let payload = serde_json::json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "payment_intent_id": payment_id,
-            "reason": reason,
-            "amount": amount_in_cents,
-        });
+        let payload = build_refund_payload(payment_id, amount, &payment.currency, reason);
 
         let response = self
             .client
@@ -545,7 +665,7 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
         Ok(RefundResponse {
             refund_id: refund.id,
             payment_id: payment_id.to_string(),
-            amount: amount.unwrap_or(Decimal::ZERO),
+            amount: refund_response_amount(amount, payment.amount),
             currency: refund.currency,
             status: Self::map_refund_status(&refund.status),
             reason: reason.to_string(),
@@ -627,44 +747,59 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
 
     async fn tokenize_payment_method(
         &self,
-        payment_method_data: PaymentMethodData,
+        _payment_method_data: PaymentMethodData,
     ) -> Result<PaymentMethodToken> {
+        Err(crate::Error::payment_error(
+            "Airwallex payment methods require a gateway customer",
+        ))
+    }
+
+    async fn create_customer(&self, email: &str, name: &str) -> Result<String> {
         let token = self.get_access_token().await?;
-
-        let card_data = match payment_method_data {
-            PaymentMethodData::Card {
-                number,
-                exp_month,
-                exp_year,
-                cvc,
-                name,
-            } => {
-                serde_json::json!({
-                    "type": "card",
-                    "card": {
-                        "number": number,
-                        "expiry_month": exp_month,
-                        "expiry_year": exp_year,
-                        "cvc": cvc,
-                        "name": name,
-                    },
-                })
-            }
-            _ => {
-                return Err(crate::Error::validation(
-                    "Only card tokenization is supported",
-                ))
-            }
-        };
-
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
-            "payment_method": card_data,
+            "email": email,
         });
+        if !name.trim().is_empty() {
+            payload["name"] = serde_json::json!(name);
+        }
 
         let response = self
             .client
-            .post(format!("{}/pa/payment_methods", self.base_url))
+            .post(format!("{}/pa/customers", self.base_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| crate::Error::network(format!("Airwallex API error: {}", e)))?;
+        if !response.status().is_success() {
+            return Err(crate::Error::payment_error(
+                "Failed to create Airwallex customer",
+            ));
+        }
+
+        let customer: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| crate::Error::network(format!("Failed to parse customer: {}", e)))?;
+        customer
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| crate::Error::payment_error("Airwallex customer response missing id"))
+    }
+
+    async fn tokenize_payment_method_for_customer(
+        &self,
+        customer_id: &str,
+        payment_method_data: PaymentMethodData,
+    ) -> Result<PaymentMethodToken> {
+        let token = self.get_access_token().await?;
+        let payload = build_payment_method_payload(customer_id, &payment_method_data)?;
+        let response = self
+            .client
+            .post(format!("{}/pa/payment_methods/create", self.base_url))
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -673,20 +808,14 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
             .map_err(|e| crate::Error::network(format!("Airwallex API error: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(crate::Error::payment_error(format!(
-                "Airwallex error: {}",
-                error_text
-            )));
+            return Err(crate::Error::payment_error(
+                "Failed to create attached Airwallex payment method",
+            ));
         }
 
         let pm: AirwallexPaymentMethod = response.json().await.map_err(|e| {
             crate::Error::network(format!("Failed to parse Airwallex response: {}", e))
         })?;
-
         Ok(PaymentMethodToken {
             token: pm.id,
             payment_method: PaymentMethodInfo {
@@ -742,21 +871,24 @@ impl AgnosticPaymentGateway for AirwallexAgnosticGateway {
 
     async fn delete_payment_method(&self, token_str: &str) -> Result<()> {
         let token = self.get_access_token().await?;
-
         let response = self
             .client
-            .delete(format!(
-                "{}/pa/payment_methods/{}",
+            .post(format!(
+                "{}/pa/payment_methods/{}/disable",
                 self.base_url, token_str
             ))
             .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "request_id": uuid::Uuid::new_v4().to_string(),
+            }))
             .send()
             .await
             .map_err(|e| crate::Error::network(format!("Airwallex API error: {}", e)))?;
 
         if !response.status().is_success() {
             return Err(crate::Error::payment_error(
-                "Failed to delete payment method",
+                "Failed to disable payment method",
             ));
         }
 
@@ -769,19 +901,13 @@ impl AirwallexAgnosticGateway {
     async fn confirm_payment_intent_with_token(
         &self,
         intent_id: &str,
+        gateway_customer_id: &str,
         token: &str,
+        cvc: &str,
     ) -> Result<AirwallexPaymentIntent> {
         let access_token = self.get_access_token().await?;
 
-        let confirm_payload = serde_json::json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "payment_method": token,
-            "payment_method_options": {
-                "card": {
-                    "three_ds_action": "FORCE_3DS"
-                }
-            }
-        });
+        let confirm_payload = build_saved_card_confirm_payload(gateway_customer_id, token, cvc);
 
         let response = self
             .client
@@ -821,7 +947,6 @@ impl AirwallexAgnosticGateway {
     ) -> Result<InitiatePaymentResponse> {
         match intent.status.as_str() {
             "SUCCEEDED" | "CAPTURED" => {
-                let _amount = Decimal::from_f64_retain(intent.amount);
                 let id = intent.id.clone();
                 Ok(InitiatePaymentResponse::Success {
                     payment_id: id.clone(),
@@ -853,6 +978,12 @@ impl AirwallexAgnosticGateway {
                 error_code: "payment_failed".to_string(),
                 error_message: "Payment failed".to_string(),
                 retry_allowed: true,
+            }),
+            "CANCELLED" => Ok(InitiatePaymentResponse::Failed {
+                payment_id: intent.id,
+                error_code: "payment_cancelled".to_string(),
+                error_message: "Payment was cancelled".to_string(),
+                retry_allowed: false,
             }),
             _ => Ok(InitiatePaymentResponse::RequiresAction {
                 payment_id: intent.id,
@@ -898,11 +1029,17 @@ impl AirwallexAgnosticGateway {
                     "next_action": intent.next_action,
                 }),
             }),
-            "FAILED" | "CANCELLED" => Ok(CompletePaymentActionResponse::Failed {
+            "FAILED" => Ok(CompletePaymentActionResponse::Failed {
                 payment_id: intent.id,
                 error_code: "payment_failed".to_string(),
                 error_message: "Payment failed".to_string(),
                 retry_allowed: true,
+            }),
+            "CANCELLED" => Ok(CompletePaymentActionResponse::Failed {
+                payment_id: intent.id,
+                error_code: "payment_cancelled".to_string(),
+                error_message: "Payment was cancelled".to_string(),
+                retry_allowed: false,
             }),
             _ => Ok(CompletePaymentActionResponse::RequiresAction {
                 payment_id: intent.id,
@@ -938,9 +1075,9 @@ struct AirwallexPaymentIntent {
     #[serde(rename = "client_secret")]
     client_secret: String,
     status: String,
-    // Airwallex echoes amounts as JSON floats in major currency units
-    // regardless of the unit sent in the request.
-    amount: f64,
+    // Airwallex echoes amounts as JSON floats in major currency units.
+    #[serde(with = "rust_decimal::serde::float")]
+    amount: Decimal,
     currency: String,
     #[serde(default)]
     // Airwallex echoes metadata back verbatim — keep this tolerant of any
@@ -971,12 +1108,36 @@ struct AirwallexWebhookData {
     object: AirwallexWebhookObject,
 }
 
+fn deserialize_optional_decimal<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)?
+        .map(|value| {
+            value
+                .to_string()
+                .parse::<Decimal>()
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AirwallexWebhookObject {
     id: String,
     #[serde(rename = "payment_intent_id")]
     payment_intent_id: Option<String>,
     status: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal",
+        serialize_with = "rust_decimal::serde::float_option::serialize"
+    )]
+    amount: Option<Decimal>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -989,7 +1150,7 @@ struct AirwallexPaymentMethod {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AirwallexCard {
-    #[serde(rename = "number_last_four")]
+    #[serde(rename = "last4", alias = "number_last_four")]
     number_last_four: String,
     brand: String,
     expiry_month: String,
@@ -1005,6 +1166,128 @@ struct AirwallexPaymentMethodList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payment_and_refund_payloads_use_major_units() {
+        let order_id = uuid::Uuid::new_v4();
+        let intent = build_payment_intent_payload(dec!(112.61), "HKD", order_id, None, None);
+        assert_eq!(intent["amount"], serde_json::json!(dec!(112.61)));
+        assert_eq!(intent["currency"], "HKD");
+        assert_eq!(intent["metadata"]["order_id"], order_id.to_string());
+        assert!(intent.get("customer_id").is_none());
+
+        let partial = build_refund_payload("int_123", Some(dec!(12.34)), "HKD", "customer_request");
+        assert_eq!(partial["amount"], serde_json::json!(dec!(12.34)));
+        assert_eq!(partial["currency"], "HKD");
+
+        let full = build_refund_payload("int_123", None, "HKD", "customer_request");
+        assert!(full.get("amount").is_none());
+        assert_eq!(refund_response_amount(None, dec!(112.61)), dec!(112.61));
+        assert_eq!(
+            refund_response_amount(Some(dec!(12.34)), dec!(112.61)),
+            dec!(12.34)
+        );
+    }
+
+    #[test]
+    fn saved_card_payloads_bind_provider_customer_and_token() {
+        let order_id = uuid::Uuid::new_v4();
+        let local_customer_id = uuid::Uuid::new_v4();
+        let metadata = serde_json::json!({ "gateway_customer_id": "cus_provider" });
+        let gateway_customer_id = saved_card_gateway_customer_id(&metadata).unwrap();
+
+        let intent = build_payment_intent_payload(
+            dec!(112.61),
+            "HKD",
+            order_id,
+            Some(local_customer_id),
+            Some(gateway_customer_id),
+        );
+        assert_eq!(intent["customer_id"], "cus_provider");
+        assert_ne!(intent["customer_id"], local_customer_id.to_string());
+        assert_eq!(
+            intent["metadata"]["customer_id"],
+            local_customer_id.to_string()
+        );
+        assert_eq!(intent["metadata"]["order_id"], order_id.to_string());
+
+        let confirm = build_saved_card_confirm_payload(gateway_customer_id, "mtd_saved", "123");
+        assert_eq!(confirm["customer_id"], "cus_provider");
+        assert_ne!(confirm["customer_id"], local_customer_id.to_string());
+        assert_eq!(confirm["payment_method"]["id"], "mtd_saved");
+        assert_eq!(confirm["payment_method"]["type"], "card");
+        assert_eq!(confirm["payment_method"]["card"]["cvc"], "123");
+        assert_eq!(confirm["triggered_by"], "customer");
+        assert_eq!(
+            confirm["payment_method_options"]["card"]["authorization_type"],
+            "final_auth"
+        );
+        assert_eq!(
+            confirm["payment_method_options"]["card"]["auto_capture"],
+            true
+        );
+    }
+
+    #[test]
+    fn saved_card_customer_binding_fails_closed() {
+        for metadata in [
+            serde_json::json!({}),
+            serde_json::json!({ "gateway_customer_id": null }),
+            serde_json::json!({ "gateway_customer_id": "" }),
+            serde_json::json!({ "gateway_customer_id": "   " }),
+            serde_json::json!({ "gateway_customer_id": 123 }),
+        ] {
+            assert!(saved_card_gateway_customer_id(&metadata).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_card_requires_cvc_before_provider_call() {
+        let gateway = AirwallexAgnosticGateway::new(
+            "test_client_id".to_string(),
+            "test_api_key".to_string(),
+            "test_webhook_secret".to_string(),
+            true,
+        );
+        let error = gateway
+            .initiate_payment(InitiatePaymentRequest {
+                amount: dec!(10.00),
+                currency: "HKD".to_string(),
+                payment_method_type: PaymentMethodType::Card,
+                order_id: uuid::Uuid::new_v4(),
+                customer_id: None,
+                customer_email: "buyer@example.com".to_string(),
+                customer_ip: None,
+                billing_address: None,
+                shipping_address: None,
+                payment_method_data: PaymentMethodData::CardToken {
+                    token: "mtd_saved".to_string(),
+                    cvc: None,
+                },
+                save_payment_method: false,
+                description: "Test".to_string(),
+                metadata: serde_json::json!({ "gateway_customer_id": "cus_provider" }),
+            })
+            .await
+            .expect_err("missing CVC must fail before any provider request");
+        assert!(error.to_string().contains("CVC is required"));
+    }
+
+    #[test]
+    fn attached_payment_method_payload_uses_provider_customer_id() {
+        let data = PaymentMethodData::Card {
+            number: "4242424242424242".to_string(),
+            exp_month: "12".to_string(),
+            exp_year: "2030".to_string(),
+            cvc: "123".to_string(),
+            name: "Test Buyer".to_string(),
+        };
+        let payload = build_payment_method_payload("cus_provider", &data).unwrap();
+        assert_eq!(payload["customer_id"], "cus_provider");
+        assert_eq!(payload["type"], "card");
+        assert_eq!(payload["card"]["number"], "4242424242424242");
+        assert!(payload.get("payment_method").is_none());
+    }
 
     #[test]
     fn test_airwallex_agnostic_gateway_creation() {
@@ -1049,12 +1332,71 @@ mod tests {
         );
         assert_eq!(
             AirwallexAgnosticGateway::map_status("CANCELLED"),
-            PaymentStatus::Failed
+            PaymentStatus::Cancelled
         );
         assert_eq!(
             AirwallexAgnosticGateway::map_status("REFUNDED"),
             PaymentStatus::Refunded
         );
+        assert_eq!(
+            AirwallexAgnosticGateway::map_status("PARTIALLY_REFUNDED"),
+            PaymentStatus::PartiallyRefunded
+        );
+    }
+
+    fn intent_with_status(status: &str) -> AirwallexPaymentIntent {
+        AirwallexPaymentIntent {
+            id: "int_cancelled".to_string(),
+            client_secret: "secret".to_string(),
+            status: status.to_string(),
+            amount: dec!(112.61),
+            currency: "HKD".to_string(),
+            metadata: serde_json::json!({}),
+            next_action: None,
+        }
+    }
+
+    #[test]
+    fn cancelled_responses_are_not_generic_failures() {
+        let gateway = test_gateway();
+        let initiated = gateway
+            .handle_intent_response(intent_with_status("CANCELLED"), "HKD")
+            .unwrap();
+        match initiated {
+            InitiatePaymentResponse::Failed {
+                error_code,
+                error_message,
+                retry_allowed,
+                ..
+            } => {
+                assert_eq!(error_code, "payment_cancelled");
+                assert_eq!(error_message, "Payment was cancelled");
+                assert!(!retry_allowed);
+            }
+            other => panic!("unexpected initiate response: {other:?}"),
+        }
+
+        let request = CompletePaymentActionRequest {
+            payment_id: "int_cancelled".to_string(),
+            action_type: PaymentActionType::Verification,
+            action_data: serde_json::json!({}),
+        };
+        let completed = gateway
+            .handle_complete_action_response(intent_with_status("CANCELLED"), &request)
+            .unwrap();
+        match completed {
+            CompletePaymentActionResponse::Failed {
+                error_code,
+                error_message,
+                retry_allowed,
+                ..
+            } => {
+                assert_eq!(error_code, "payment_cancelled");
+                assert_eq!(error_message, "Payment was cancelled");
+                assert!(!retry_allowed);
+            }
+            other => panic!("unexpected complete response: {other:?}"),
+        }
     }
 
     #[test]
@@ -1230,6 +1572,58 @@ mod tests {
         assert_eq!(event.event_type, WebhookEventType::PaymentRefunded);
         assert_eq!(event.payment_id, "ref_zzz");
         assert_eq!(event.transaction_id.as_deref(), Some("int_xxx"));
+    }
+
+    async fn refund_webhook_event(object: serde_json::Value) -> WebhookEvent {
+        let gateway = test_gateway();
+        let timestamp = "1712345678000";
+        let body = serde_json::json!({
+            "name": "refund.succeeded",
+            "data": { "object": object }
+        })
+        .to_string();
+        let signature = airwallex_signature("test_webhook_secret", timestamp, body.as_bytes());
+        let headers = vec![
+            ("x-timestamp".to_string(), timestamp.to_string()),
+            ("x-signature".to_string(), signature),
+        ];
+
+        gateway
+            .handle_webhook(body.as_bytes(), &headers)
+            .await
+            .expect("refund webhook should verify")
+    }
+
+    #[tokio::test]
+    async fn partial_refund_webhook_retains_actual_amount_and_currency() {
+        let event = refund_webhook_event(serde_json::json!({
+            "id": "ref_partial",
+            "payment_intent_id": "int_xxx",
+            "status": "SUCCEEDED",
+            "amount": 12.34,
+            "currency": "HKD"
+        }))
+        .await;
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentRefunded);
+        assert_eq!(event.data["amount"], serde_json::json!(12.34));
+        assert_eq!(event.data["currency"], "HKD");
+    }
+
+    #[tokio::test]
+    async fn full_refund_webhook_retains_actual_amount_and_currency() {
+        let event = refund_webhook_event(serde_json::json!({
+            "id": "ref_full",
+            "payment_intent_id": "int_xxx",
+            "status": "SUCCEEDED",
+            "amount": 112.61,
+            "currency": "HKD"
+        }))
+        .await;
+
+        assert_eq!(event.event_type, WebhookEventType::PaymentRefunded);
+        assert_eq!(event.data["amount"], serde_json::json!(112.61));
+        assert_eq!(event.data["currency"], "HKD");
     }
 
     #[tokio::test]

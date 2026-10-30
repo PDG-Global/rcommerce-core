@@ -219,26 +219,30 @@ admin > write > read
 
 ### Protected vs Public Routes
 
-**Public (no auth required):**
+**Public or optional JWT:**
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/v1/auth/login` | User login |
 | POST | `/api/v1/auth/register` | User registration |
 | POST | `/api/v1/auth/refresh` | Refresh access token |
 | POST | `/api/v1/carts/guest` | Create guest cart |
-| GET | `/api/v1/carts/:id` | Get cart by ID |
-| POST | `/api/v1/webhooks/:gateway_id` | Payment webhooks (HMAC verified) |
+| * | `/api/v1/carts/:id` and item/coupon subroutes | Guest UUID access, or matching owner JWT for customer carts |
+| POST | `/api/v1/checkout/*` | Guest or matching cart-owner JWT |
+| POST | `/api/v1/webhooks/:gateway_id` | Payment webhooks (signature verified) |
 
-**Protected (JWT or API key required):**
+For customer-owned carts, missing or foreign tokens return `404` on every cart
+and checkout operation. Guest cart UUIDs are bearer capabilities.
+
+**Protected:**
 | Method | Path | Auth Type | Description |
 |--------|------|-----------|-------------|
 | GET | `/api/v1/carts/me` | JWT | Get customer cart |
-| POST | `/api/v1/carts/:id/items` | JWT | Add item to cart |
 | POST | `/api/v1/carts/merge` | JWT | Merge guest cart |
-| POST | `/api/v1/checkout/*` | JWT | Checkout operations |
-| GET | `/api/v1/customers` | API Key | List customers |
-| GET | `/api/v1/orders` | API Key/JWT | List orders |
-| POST | `/api/v1/orders` | API Key | Create order |
+| GET | `/api/v1/customers` | JWT | List customers |
+| GET/POST | `/api/v1/orders` | JWT | List or directly create orders |
+| POST | `/api/v1/orders/:id/fulfillments` | Admin JWT | Manually fulfill an entire order |
+| * | `/api/v1/payments/*` | JWT | Payment operations (refunds additionally require admin) |
+| * | `/api/v1/payment-methods/*` | JWT | Saved payment methods |
 | GET | `/api/v1/products` | API Key | List products |
 | POST | `/api/v1/products` | API Key | Create product |
 
@@ -407,19 +411,25 @@ cannot be added to a cart.
 ```
 GET    /v1/orders                   # List orders
 GET    /v1/orders/:id               # Get order
-POST   /v1/orders                   # Create order (manual/admin)
+POST   /v1/orders                   # Create order directly (customer/admin)
 PUT    /v1/orders/:id               # Update order
 PATCH  /v1/orders/:id               # Partial update
 DELETE /v1/orders/:id               # Delete order (with constraints)
 
 POST   /v1/orders/:id/payments      # Process payment
-POST   /v1/orders/:id/fulfillments  # Create fulfillment
+POST   /v1/orders/:id/fulfillments  # Manually fulfill entire order (admin)
 POST   /v1/orders/:id/cancel        # Cancel order
 POST   /v1/orders/:id/refund        # Process refund
 
 GET    /v1/orders/:id/notes         # List order notes
 POST   /v1/orders/:id/notes         # Add note
 ```
+
+For direct creation, non-admin orders always belong to the authenticated
+caller. Admins may create on behalf of a customer or omit `customer_id` for a
+guest order. The configured store currency is propagated to the order, tax
+calculation, and shipping-rate request without FX conversion. Customers can
+read only their own orders and payments; refunds require admin.
 
 **Order Statuses:**
 pending, confirmed, processing, on_hold, completed, cancelled, refunded, fraud_review
@@ -485,6 +495,19 @@ DELETE /v1/payment-methods/:token   # Delete saved payment method
 POST   /v1/webhooks/:gateway       # Receive webhooks from payment providers
 ```
 
+All payment and saved-method endpoints require JWT; customers can access only
+their own orders, payments, and saved methods, and refunds require admin.
+Direct initiation persists the provider intent ID and status, and later actions
+use the stored gateway. `save_payment_method = true` on direct initiation is
+rejected in favor of `POST /payment-methods`. Saved methods use a per-gateway
+provider-customer mapping and local SHA-256 token hashes for ownership checks.
+Airwallex amounts use major currency units.
+
+Checkout's default gateway is strictly `mock`, `stripe`, or `airwallex`. Mock is
+registered only with `payment.test_mode = true`; a real selection must be
+enabled with credentials. Invalid selections fail at startup without fallback,
+and production uses `test_mode = false`.
+
 **Supported Payment Gateways:**
 - Stripe (Full support)
 - Airwallex (Full support - Demo/Production ready)
@@ -543,67 +566,6 @@ GET    /v1/webhooks/:id/deliveries  # Get delivery history
 Content-Type: application/json
 X-Webhook-Signature: sha256=abc123...
 X-Webhook-Test: true (for test deliveries)
-```
-
-### Payments (v2 - Future Enhancement)
-
-The v2 Payments API provides a provider-agnostic interface where all payment processing happens server-side. The frontend sends card data to R Commerce, which then communicates with payment providers.
-
-```
-POST   /v2/payments/methods         # Get available payment methods for checkout
-POST   /v2/payments                 # Initiate payment (server-side processing)
-GET    /v2/payments/:id             # Get payment status
-POST   /v2/payments/:id/complete    # Complete 3DS/redirect action
-POST   /v2/payments/:id/refund      # Process refund
-
-POST   /v2/payment-methods          # Save payment method for customer
-GET    /v2/customers/:id/payment-methods  # List saved payment methods
-DELETE /v2/payment-methods/:token   # Delete saved payment method
-
-POST   /v2/webhooks/:gateway       # Receive webhooks from payment providers
-```
-
-**Key Differences from v1:**
-- **Server-side processing**: Card data is sent to R Commerce API, not directly to Stripe
-- **Unified interface**: Same API structure works for all gateways (Stripe, Airwallex, WeChat Pay, etc.)
-- **3D Secure handling**: Backend returns `requires_action` response; frontend handles redirect/iframe
-- **No provider SDK required**: Frontend doesn't need Stripe.js or other provider SDKs
-
-**Example v2 Payment Flow:**
-
-```javascript
-// 1. Get available payment methods
-const methods = await fetch('/api/v2/payments/methods', {
-  method: 'POST',
-  body: JSON.stringify({ currency: 'USD', amount: '99.99' })
-});
-
-// 2. Initiate payment with card data
-const result = await fetch('/api/v2/payments', {
-  method: 'POST',
-  body: JSON.stringify({
-    gateway_id: 'stripe',
-    amount: '99.99',
-    currency: 'USD',
-    payment_method: {
-      type: 'card',
-      card: {
-        number: '4242424242424242',
-        exp_month: 12,
-        exp_year: 2025,
-        cvc: '123'
-      }
-    }
-  })
-});
-
-// 3. Handle response
-if (result.type === 'success') {
-  // Payment complete
-} else if (result.type === 'requires_action') {
-  // Handle 3D Secure or redirect
-  window.location.href = result.action_data.redirect_url;
-}
 ```
 
 ### Shipping

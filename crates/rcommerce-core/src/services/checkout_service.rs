@@ -206,6 +206,7 @@ pub struct CheckoutResult {
     pub client_secret: Option<String>,
     pub payment_intent_id: Option<String>,
     pub requires_confirmation: bool,
+    pub payment_transitioned: bool,
 }
 
 /// Confirm checkout request (after client-side Stripe confirmation)
@@ -331,7 +332,7 @@ impl CheckoutService {
         // Get available shipping rates
         let package = self.estimate_package(&items).await?;
         let shipping_rates = self
-            .get_shipping_rates(&request.shipping_address, &package)
+            .get_shipping_rates(&request.shipping_address, &package, cart.currency)
             .await?;
 
         // Default to the cheapest available rate (updated when customer selects rate)
@@ -407,7 +408,12 @@ impl CheckoutService {
         // client-submitted rate before trusting its price.
         let package = self.estimate_package(&items).await?;
         let validated_rate = self
-            .validate_shipping_rate(&request.shipping_rate, &shipping_address, &package)
+            .validate_shipping_rate(
+                &request.shipping_rate,
+                &shipping_address,
+                &package,
+                cart.currency,
+            )
             .await?;
 
         // Shipping is not taxed (matches the legacy WooCommerce setup); EU VAT
@@ -440,7 +446,9 @@ impl CheckoutService {
         let total = subtotal - discount_total + shipping_total + tax_total;
 
         // Get available shipping rates (server-estimated package, same as initiate)
-        let shipping_rates = self.get_shipping_rates(&shipping_address, &package).await?;
+        let shipping_rates = self
+            .get_shipping_rates(&shipping_address, &package, cart.currency)
+            .await?;
 
         let summary = CheckoutSummary {
             cart_id: cart.id,
@@ -517,6 +525,7 @@ impl CheckoutService {
                         client_secret: None,
                         payment_intent_id: None,
                         requires_confirmation: false,
+                        payment_transitioned: false,
                         order: detail,
                         payment_id: String::new(),
                     });
@@ -561,6 +570,7 @@ impl CheckoutService {
                 &request.selected_shipping_rate,
                 &request.shipping_address,
                 &package,
+                cart.currency,
             )
             .await?;
 
@@ -853,6 +863,7 @@ impl CheckoutService {
                 client_secret: Some(payment.client_secret.clone()),
                 payment_intent_id: Some(payment.id.clone()),
                 requires_confirmation: true,
+                payment_transitioned: false,
             });
         }
 
@@ -872,9 +883,9 @@ impl CheckoutService {
         self.cart_service
             .mark_converted(cart.id, Some(order.id))
             .await?;
-        let finalized_order = self
+        let (finalized_order, transitioned) = self
             .order_service
-            .confirm_order_after_payment(order.id)
+            .confirm_order_after_payment_transition(order.id)
             .await?;
 
         info!(
@@ -890,6 +901,7 @@ impl CheckoutService {
             client_secret: None,
             payment_intent_id: None,
             requires_confirmation: false,
+            payment_transitioned: transitioned,
         })
     }
 
@@ -930,9 +942,9 @@ impl CheckoutService {
                     {
                         warn!("Failed to mark cart {} converted: {}", cart.id, e);
                     }
-                    let finalized = self
+                    let (finalized, transitioned) = self
                         .order_service
-                        .confirm_order_after_payment(prior.id)
+                        .confirm_order_after_payment_transition(prior.id)
                         .await?;
                     return Ok(CheckoutResult {
                         payment_id: payment.id.clone(),
@@ -941,6 +953,7 @@ impl CheckoutService {
                         client_secret: payment.client_secret.clone(),
                         payment_intent_id: Some(intent_id.clone()),
                         requires_confirmation: false,
+                        payment_transitioned: transitioned,
                         order: finalized,
                     });
                 }
@@ -956,6 +969,7 @@ impl CheckoutService {
                         client_secret: payment.client_secret.clone(),
                         payment_intent_id: Some(intent_id.clone()),
                         requires_confirmation: true,
+                        payment_transitioned: false,
                         order: detail,
                     });
                 }
@@ -972,6 +986,7 @@ impl CheckoutService {
                         client_secret: None,
                         payment_intent_id: Some(intent_id.clone()),
                         requires_confirmation: true,
+                        payment_transitioned: false,
                         order: detail,
                     });
                 }
@@ -990,6 +1005,7 @@ impl CheckoutService {
             client_secret: None,
             payment_intent_id: None,
             requires_confirmation: true,
+            payment_transitioned: false,
             order: detail,
         })
     }
@@ -1028,6 +1044,15 @@ impl CheckoutService {
         &self,
         request: ConfirmCheckoutRequest,
     ) -> Result<CheckoutResult> {
+        self.confirm_checkout_with_transition(request)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    pub async fn confirm_checkout_with_transition(
+        &self,
+        request: ConfirmCheckoutRequest,
+    ) -> Result<(CheckoutResult, bool)> {
         info!(
             "Confirming checkout: order={}, payment_intent={}",
             request.order_id, request.payment_intent_id
@@ -1041,6 +1066,15 @@ impl CheckoutService {
             .get_order(request.order_id)
             .await?
             .ok_or_else(|| Error::not_found("Order not found"))?;
+        let order_cart_id = existing
+            .order
+            .metadata
+            .get("cart_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok());
+        if order_cart_id != Some(request.cart_id) {
+            return Err(Error::not_found("Order not found"));
+        }
         let already_final = matches!(
             existing.order.status,
             crate::order::OrderStatus::Confirmed
@@ -1072,15 +1106,19 @@ impl CheckoutService {
                 "Order {} already {:?}; confirm replay is a no-op (payment {})",
                 request.order_id, existing.order.status, request.payment_intent_id
             );
-            return Ok(CheckoutResult {
-                order: existing,
-                payment_id: payment.id,
-                total_charged: payment.amount,
-                currency: payment.currency.parse().unwrap_or(Currency::USD),
-                client_secret: payment.client_secret,
-                payment_intent_id: Some(request.payment_intent_id),
-                requires_confirmation: false,
-            });
+            return Ok((
+                CheckoutResult {
+                    order: existing,
+                    payment_id: payment.id,
+                    total_charged: payment.amount,
+                    currency: payment.currency.parse().unwrap_or(Currency::USD),
+                    client_secret: payment.client_secret,
+                    payment_intent_id: Some(request.payment_intent_id),
+                    requires_confirmation: false,
+                    payment_transitioned: false,
+                },
+                false,
+            ));
         }
 
         // Record the payment for order history
@@ -1115,9 +1153,9 @@ impl CheckoutService {
                 );
             }
         }
-        let finalized_order = self
+        let (finalized_order, transitioned) = self
             .order_service
-            .confirm_order_after_payment(request.order_id)
+            .confirm_order_after_payment_transition(request.order_id)
             .await?;
 
         info!(
@@ -1125,15 +1163,19 @@ impl CheckoutService {
             finalized_order.order.id, request.payment_intent_id
         );
 
-        Ok(CheckoutResult {
-            order: finalized_order,
-            payment_id: payment.id,
-            total_charged: payment.amount,
-            currency: payment.currency.parse().unwrap_or(Currency::USD),
-            client_secret: None,
-            payment_intent_id: Some(request.payment_intent_id),
-            requires_confirmation: false,
-        })
+        Ok((
+            CheckoutResult {
+                order: finalized_order,
+                payment_id: payment.id,
+                total_charged: payment.amount,
+                currency: payment.currency.parse().unwrap_or(Currency::USD),
+                client_secret: None,
+                payment_intent_id: Some(request.payment_intent_id),
+                requires_confirmation: false,
+                payment_transitioned: transitioned,
+            },
+            transitioned,
+        ))
     }
 
     /// Validate cart before checkout
@@ -1264,8 +1306,11 @@ impl CheckoutService {
         submitted: &ShippingRate,
         destination: &Address,
         package: &Package,
+        currency: Currency,
     ) -> Result<ShippingRate> {
-        let rates = self.get_shipping_rates(destination, package).await?;
+        let rates = self
+            .get_shipping_rates(destination, package, currency)
+            .await?;
         match_shipping_rate(submitted, &rates).cloned()
     }
 
@@ -1274,6 +1319,7 @@ impl CheckoutService {
         &self,
         destination: &Address,
         package: &Package,
+        currency: Currency,
     ) -> Result<Vec<ShippingRate>> {
         // TODO: Get origin address from configuration
         let origin = Address {
@@ -1304,7 +1350,7 @@ impl CheckoutService {
             adult_signature: false,
             saturday_delivery: false,
             hold_for_pickup: false,
-            currency: Some("USD".to_string()),
+            currency: Some(currency.to_string()),
         };
 
         // Use the injected shipping factory
@@ -1821,6 +1867,11 @@ mod tests {
         cart_id: Uuid,
         product_id: Uuid,
         location_id: Uuid,
+        /// Whether checkout_setup created the location itself. Only then may
+        /// teardown delete it — adopting the migration-seeded default
+        /// warehouse and deleting it in teardown leaves inventory_locations
+        /// empty for other tests (the seed runs once, in the migration).
+        owns_location: bool,
     }
 
     async fn checkout_setup() -> Option<(
@@ -1845,15 +1896,8 @@ mod tests {
             }
         };
 
-        if let Err(e) = crate::Migrator::new(pool.clone()).migrate().await {
+        if let Err(e) = crate::ensure_test_migrations(&pool).await {
             eprintln!("Skipping checkout idempotency tests: migration failed: {e}");
-            return None;
-        }
-        // Migration 013 is not registered in the migrator (applied by hand on
-        // the live databases); apply it so stock_reservations matches the code.
-        let fixup = include_str!("../../migrations/013_stock_reservations_order_id_nullable.sql");
-        if let Err(e) = sqlx::raw_sql(fixup).execute(&pool).await {
-            eprintln!("Skipping checkout idempotency tests: 013 fixup failed: {e}");
             return None;
         }
 
@@ -1886,25 +1930,31 @@ mod tests {
         .await
         .unwrap();
 
-        let existing_location: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM inventory_locations WHERE is_active = true ORDER BY created_at LIMIT 1",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-        let location_id = match existing_location {
-            Some(id) => id,
-            None => {
-                let id = Uuid::new_v4();
-                sqlx::query(
-                    "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Idem WH', $2)",
-                )
-                .bind(id)
-                .bind(format!("IDEM-{}", &id.to_string()[..8]))
-                .execute(&pool)
-                .await
-                .unwrap();
-                id
+        // Adopt the existing (migration-seeded) location when there is one:
+        // order creation reserves stock at the oldest active location, so the
+        // test product's stock must live there. Only when no location exists
+        // do we create our own — and only then may teardown delete it.
+        let (location_id, owns_location) = {
+            let existing: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM inventory_locations WHERE is_active = true ORDER BY created_at LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            match existing {
+                Some(id) => (id, false),
+                None => {
+                    let id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Idem WH', $2)",
+                    )
+                    .bind(id)
+                    .bind(format!("IDEM-{}", &id.to_string()[..8]))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    (id, true)
+                }
             }
         };
         sqlx::query(
@@ -1990,6 +2040,7 @@ mod tests {
                 cart_id: cart.id,
                 product_id,
                 location_id,
+                owns_location,
             },
         ))
     }
@@ -2093,11 +2144,13 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM inventory_locations WHERE id = $1")
-            .bind(ctx.location_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        if ctx.owns_location {
+            sqlx::query("DELETE FROM inventory_locations WHERE id = $1")
+                .bind(ctx.location_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
         sqlx::query("DELETE FROM products WHERE id = $1")
             .bind(ctx.product_id)
             .execute(pool)
@@ -2274,6 +2327,40 @@ mod tests {
             result.is_err(),
             "an intent not recorded for the order must be refused"
         );
+
+        idem_cleanup(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn test_confirm_checkout_rejects_a_mismatched_cart() {
+        let Some((gateway, service, ctx)) = checkout_setup().await else {
+            return;
+        };
+        gateway.set_status(crate::payment::PaymentStatus::Pending);
+        let first = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("complete_checkout must succeed");
+        let order_id = first.order.order.id;
+        let intent = first.payment_intent_id.clone().expect("payment intent id");
+        gateway.set_status(crate::payment::PaymentStatus::Succeeded);
+
+        let error = service
+            .confirm_checkout(ConfirmCheckoutRequest {
+                order_id,
+                payment_intent_id: intent,
+                cart_id: Uuid::new_v4(),
+            })
+            .await
+            .expect_err("a cart other than the order's original cart must be refused");
+        assert!(matches!(error, Error::NotFound(_)));
+
+        let status: String = sqlx::query_scalar("SELECT status::text FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
 
         idem_cleanup(&ctx).await;
     }

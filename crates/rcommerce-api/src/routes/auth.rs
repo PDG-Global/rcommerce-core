@@ -1,14 +1,16 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::IpAddr;
 use uuid::Uuid;
 
+use crate::middleware::ClientIp;
 use crate::state::AppState;
 use rcommerce_core::{
     models::CreateCustomerRequest,
@@ -175,51 +177,132 @@ pub struct ResendVerificationResponse {
     pub message: String,
 }
 
+/// The only answer a failed login ever gives: unknown e-mail, wrong
+/// password, imported account without a local password, and missing password
+/// are indistinguishable (including in response time — see
+/// [`verify_against_dummy`]).
+fn unauthorized() -> Response {
+    Error::unauthorized("Invalid email or password").into_response()
+}
+
+/// Generic throttling response; carries Retry-After but reveals
+/// nothing about which budget tripped or whether the account exists.
+fn login_throttled(retry_after: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": {
+                "code": "too_many_requests",
+                "message": "Too many login attempts. Please try again later.",
+            }
+        })),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// Verify the offered password against the eagerly-created dummy hash so
+/// unknown e-mails cost the same Argon2 work as real ones. The result is
+/// discarded; this exists purely to even out timing.
+fn verify_against_dummy(state: &AppState, password: &str) {
+    if state.dummy_password_hash.is_empty() {
+        return;
+    }
+    let _ = state
+        .auth_service
+        .verify_password(password, &state.dummy_password_hash);
+}
+
+/// Login input bounds. Argon2 hashing cost grows with the password length,
+/// and e-mails must fit the `customers` column.
+const MAX_LOGIN_EMAIL_CHARS: usize = 255;
+const MAX_LOGIN_PASSWORD_BYTES: usize = 128;
+
+fn credentials_within_bounds(email: &str, password: &str) -> bool {
+    !email.is_empty()
+        && email.chars().count() <= MAX_LOGIN_EMAIL_CHARS
+        && !password.is_empty()
+        && password.len() <= MAX_LOGIN_PASSWORD_BYTES
+}
+
 /// Login endpoint
 pub async fn login(
     State(state): State<AppState>,
+    client_ip: Option<axum::Extension<ClientIp>>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, Response> {
+    // The client IP was resolved (trusted-proxy aware) by client_ip
+    // middleware. Hand-constructed routers without it share the unspecified
+    // address; throttling then still applies (fail closed), it just cannot
+    // distinguish clients.
+    let ip = client_ip
+        .map(|ext| ext.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // Reserve both budgets before password verification so concurrent attempts
+    // cannot race past either limit. Successful authentication clears the pair.
+    if let Err(retry_after) = state.login_throttle.check_attempt(ip, &payload.email) {
+        tracing::warn!("Login throttled for IP {}", ip);
+        return Err(login_throttled(retry_after));
+    }
+
+    if !credentials_within_bounds(&payload.email, &payload.password) {
+        verify_against_dummy(&state, &payload.password);
+        return Err(unauthorized());
+    }
+
     // Find customer by email
     let customer = state
         .customer_service
         .find_by_email(&payload.email)
         .await
-        .map_err(|e| e.into_response())?
-        .ok_or_else(|| Error::unauthorized("Invalid email or password").into_response())?;
+        .map_err(|e| e.into_response())?;
 
-    // Imported accounts without a local password must reset their password before logging in.
-    if customer.is_imported && customer.password_hash.is_none() {
-        return Err(ImportedAccountResponse {
-            message: "This account was imported. Please reset your password to continue."
-                .to_string(),
-            requires_password_reset: true,
+    let Some(customer) = customer else {
+        // Same cost, same answer as a wrong password: nothing here confirms
+        // whether the e-mail is registered.
+        verify_against_dummy(&state, &payload.password);
+        return Err(unauthorized());
+    };
+
+    // Imported accounts without a local password get the same generic 401 as
+    // unknown e-mails (again after dummy verification, so timing does not
+    // single them out). The password-reset flow is how they set a password
+    // and log in.
+    let password_hash = match &customer.password_hash {
+        Some(hash) => hash.clone(),
+        None => {
+            verify_against_dummy(&state, &payload.password);
+            return Err(unauthorized());
         }
-        .into_response());
+    };
+
+    // Verify the password before revealing anything else about the account
+    // (verification status, imported status, existence).
+    let (valid, needs_rehash) = state
+        .auth_service
+        .verify_password(&payload.password, &password_hash)
+        .map_err(|e| e.into_response())?;
+
+    if !valid {
+        return Err(unauthorized());
     }
 
-    // Email must be verified before logging in.
+    // Success: clear only this (IP, e-mail) pair's failures. The IP attempt
+    // budget (volume, not correctness) stays, and other pairs are untouched.
+    state.login_throttle.clear_pair(ip, &payload.email);
+
+    // Email must be verified before logging in; this is only revealed to
+    // someone who proved they hold the password.
     if !customer.email_verified {
         return Err(EmailVerificationRequiredResponse {
             message: "Please verify your email before logging in.".to_string(),
             requires_email_verification: true,
         }
         .into_response());
-    }
-
-    // Verify password
-    let password_hash = customer
-        .password_hash
-        .as_ref()
-        .ok_or_else(|| Error::unauthorized("Invalid email or password").into_response())?;
-
-    let (valid, needs_rehash) = state
-        .auth_service
-        .verify_password(&payload.password, password_hash)
-        .map_err(|e| e.into_response())?;
-
-    if !valid {
-        return Err(Error::unauthorized("Invalid email or password").into_response());
     }
 
     // Rehash password if it was using legacy format (PHPass or bcrypt)
@@ -573,6 +656,7 @@ pub fn protected_router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::RegisterRequest;
+    use super::*;
 
     fn request() -> RegisterRequest {
         RegisterRequest {
@@ -617,5 +701,38 @@ mod tests {
         let mut r = request();
         r.phone = Some("1".repeat(51));
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn login_credentials_are_bounded() {
+        assert!(credentials_within_bounds("a@example.com", "secret123"));
+        assert!(!credentials_within_bounds("", "secret123"));
+        assert!(!credentials_within_bounds("a@example.com", ""));
+        assert!(!credentials_within_bounds(
+            &format!("{}@x.com", "a".repeat(250)),
+            "secret123"
+        ));
+        assert!(!credentials_within_bounds(
+            "a@example.com",
+            &"x".repeat(129)
+        ));
+        assert!(credentials_within_bounds("a@example.com", &"x".repeat(128)));
+    }
+
+    #[test]
+    fn throttled_response_carries_retry_after_only() {
+        let response = login_throttled(42);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "42");
+        // No body fields distinguishing account state — generic shape only.
+        let body = response.into_body();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { axum::body::to_bytes(body, usize::MAX).await.unwrap() });
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["error"]["code"].as_str().unwrap().contains("too_many"));
+        assert!(json["error"].get("email").is_none());
     }
 }

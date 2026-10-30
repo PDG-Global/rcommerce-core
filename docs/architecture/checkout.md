@@ -494,32 +494,25 @@ pub enum PaymentMethod {
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | /api/v1/checkout/initiate | JWT | Start checkout, get tax & shipping rates |
-| POST | /api/v1/checkout/shipping | JWT | Select shipping method |
-| POST | /api/v1/checkout/complete | JWT | Process payment & create order |
+| POST | /api/v1/checkout/initiate | Optional JWT | Start checkout, get tax & shipping rates |
+| POST | /api/v1/checkout/shipping | Optional JWT | Select shipping method |
+| POST | /api/v1/checkout/complete | Optional JWT | Process payment & create order |
 | POST | /api/v1/checkout/confirm | Optional JWT | Confirm a client-side (Stripe Elements / Airwallex Drop-in) payment |
 
 **Confirming a client-side payment:** `POST /checkout/confirm` only accepts the
 payment intent that `/checkout/complete` recorded for that order, and only once the
 gateway reports it succeeded for at least the order total, in the order's currency.
 Any other succeeded intent, for example one of another order, is refused, so one
-payment cannot confirm several orders.
+payment cannot confirm several orders. The submitted `cart_id` must also match
+the original cart UUID stored in the order metadata; another cart returns `404`.
 
 ## Authentication
 
-All checkout endpoints require JWT authentication. The `JwtAuth` context is extracted by the auth middleware:
-
-```rust
-pub async fn initiate_checkout(
-    State(state): State<AppState>,
-    Extension(auth): Extension<JwtAuth>,  // Extracted by middleware
-    Json(request): Json<InitiateCheckoutApiRequest>,
-) -> Result<...> {
-    // auth.customer_id contains the authenticated customer's ID
-    // auth.email contains the customer's email
-    // auth.permissions contains the customer's permissions
-}
-```
+Checkout supports guest carts and customer carts through optional JWT
+authentication. A guest uses the cart UUID. A customer-owned cart requires a
+JWT matching its owner for every checkout operation; missing or foreign tokens
+return `404`. The storefront sends the customer token when available and omits
+it for guest checkout.
 
 ## Error Handling
 

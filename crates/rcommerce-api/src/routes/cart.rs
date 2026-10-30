@@ -12,7 +12,7 @@ use crate::state::AppState;
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use rcommerce_core::{
@@ -87,14 +87,27 @@ pub async fn get_customer_cart(
     Ok(Json(cart_with_items))
 }
 
+pub(crate) async fn get_cart_for_request(
+    state: &AppState,
+    cart_id: Uuid,
+    auth: Option<&JwtAuth>,
+) -> Result<CartWithItems, Error> {
+    let cart_with_items = state.cart_service.get_cart_with_items(cart_id).await?;
+    if let Some(customer_id) = cart_with_items.cart.customer_id {
+        if auth.map(|a| a.customer_id) != Some(customer_id) {
+            return Err(Error::not_found("Cart not found"));
+        }
+    }
+    Ok(cart_with_items)
+}
+
 /// Get cart by ID
 pub async fn get_cart(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
 ) -> Result<Json<CartWithItems>, Error> {
-    // Get cart with items from service
-    let cart_with_items = state.cart_service.get_cart_with_items(cart_id).await?;
-
+    let cart_with_items = get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
     Ok(Json(cart_with_items))
 }
 
@@ -109,9 +122,12 @@ pub struct AddItemRequest {
 /// Add item to cart
 pub async fn add_item_to_cart(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
     Json(request): Json<AddItemRequest>,
 ) -> Result<Json<rcommerce_core::models::CartItem>, Error> {
+    let cart_with_items = get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Validate quantity
     if request.quantity <= 0 {
         return Err(Error::validation("Quantity must be greater than 0"));
@@ -147,7 +163,23 @@ pub async fn add_item_to_cart(
                 .product
                 .as_ref()
                 .ok_or_else(|| Error::validation("Bundle component product not found"))?;
-            let required = component.component.quantity * request.quantity;
+            let existing = cart_with_items
+                .items
+                .iter()
+                .filter(|item| item.product_id == component_product.id && item.variant_id.is_none())
+                .try_fold(0_i32, |total, item| {
+                    total
+                        .checked_add(item.quantity)
+                        .ok_or_else(|| Error::validation("Bundle component quantity is too large"))
+                })?;
+            let increment = component
+                .component
+                .quantity
+                .checked_mul(request.quantity)
+                .ok_or_else(|| Error::validation("Bundle component quantity is too large"))?;
+            let required = existing
+                .checked_add(increment)
+                .ok_or_else(|| Error::validation("Bundle component quantity is too large"))?;
             let inventory = state
                 .inventory_service
                 .get_product_inventory(component_product.id)
@@ -264,7 +296,20 @@ pub async fn add_item_to_cart(
             .await?
             .total_available
     };
-    let requested_total = request.quantity;
+    let existing_quantity = cart_with_items
+        .items
+        .iter()
+        .filter(|item| {
+            item.product_id == target_product_id && item.variant_id == request.variant_id
+        })
+        .try_fold(0_i32, |total, item| {
+            total
+                .checked_add(item.quantity)
+                .ok_or_else(|| Error::validation("Quantity is too large"))
+        })?;
+    let requested_total = existing_quantity
+        .checked_add(request.quantity)
+        .ok_or_else(|| Error::validation("Quantity is too large"))?;
 
     if total_available <= 0 {
         return Err(Error::validation(format!(
@@ -343,9 +388,12 @@ pub struct UpdateItemRequest {
 /// Update cart item
 pub async fn update_cart_item(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path((cart_id, item_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateItemRequest>,
 ) -> Result<Json<rcommerce_core::models::CartItem>, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Validate quantity (0 is allowed - removes item)
     if request.quantity < 0 {
         return Err(Error::validation("Quantity cannot be negative"));
@@ -369,8 +417,11 @@ pub async fn update_cart_item(
 /// Remove item from cart
 pub async fn remove_cart_item(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path((cart_id, item_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Remove item via service
     state.cart_service.remove_item(cart_id, item_id).await?;
 
@@ -380,8 +431,11 @@ pub async fn remove_cart_item(
 /// Clear all items from cart
 pub async fn clear_cart(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Clear cart via service
     state.cart_service.clear_cart(cart_id).await?;
 
@@ -423,9 +477,12 @@ pub struct ApplyCouponRequest {
 /// Apply coupon to cart
 pub async fn apply_coupon(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
     Json(request): Json<ApplyCouponRequest>,
 ) -> Result<Json<CartWithItems>, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Validate coupon code is not empty
     if request.coupon_code.trim().is_empty() {
         return Err(Error::validation("Coupon code is required"));
@@ -447,8 +504,11 @@ pub async fn apply_coupon(
 /// Remove coupon from cart
 pub async fn remove_coupon(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
 ) -> Result<Json<CartWithItems>, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Remove coupon via service
     let cart = state.cart_service.remove_coupon(cart_id).await?;
 
@@ -461,22 +521,24 @@ pub async fn remove_coupon(
 /// Delete cart
 pub async fn delete_cart(
     State(state): State<AppState>,
+    Extension(auth): Extension<Option<JwtAuth>>,
     Path(cart_id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
+    get_cart_for_request(&state, cart_id, auth.as_ref()).await?;
+
     // Delete cart via service
     state.cart_service.delete_cart(cart_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Router for public cart routes (no auth required)
+/// Router for cart routes with optional customer authentication
 pub fn public_router() -> Router<AppState> {
     Router::new()
-        // Guest cart - no auth required
+        // Guest cart creation is always public
         .route("/carts/guest", post(create_guest_cart))
-        // Get cart by ID - no auth required (identified by cart_id)
-        .route("/carts/:cart_id", get(get_cart))
-        // Guest cart item modifications - no auth required
+        // Guest carts are identified by UUID; customer carts require their owner
+        .route("/carts/:cart_id", get(get_cart).delete(delete_cart))
         .route(
             "/carts/:cart_id/items",
             post(add_item_to_cart).delete(clear_cart),
@@ -485,7 +547,6 @@ pub fn public_router() -> Router<AppState> {
             "/carts/:cart_id/items/:item_id",
             put(update_cart_item).delete(remove_cart_item),
         )
-        // Guest coupons - no auth required
         .route(
             "/carts/:cart_id/coupon",
             post(apply_coupon).delete(remove_coupon),
@@ -499,8 +560,6 @@ pub fn protected_router() -> Router<AppState> {
         .route("/carts/me", get(get_customer_cart))
         // Merge guest cart into the authenticated customer's cart
         .route("/carts/merge", post(merge_carts))
-        // Cart modification - requires auth
-        .route("/carts/:cart_id", delete(delete_cart))
 }
 
 /// Router for cart routes (combines public and protected - used for backward compatibility)

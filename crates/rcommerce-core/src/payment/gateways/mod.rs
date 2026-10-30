@@ -43,6 +43,8 @@ pub struct PaymentResponse {
 pub struct MockPaymentGateway {
     sessions:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Decimal, uuid::Uuid)>>>,
+    saved_payment_methods:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<PaymentMethodInfo>>>>,
 }
 
 impl MockPaymentGateway {
@@ -332,22 +334,41 @@ impl AgnosticPaymentGateway for MockPaymentGateway {
         })
     }
 
-    async fn get_saved_payment_methods(
-        &self,
-        _customer_id: &str,
-    ) -> Result<Vec<PaymentMethodInfo>> {
-        Ok(vec![PaymentMethodInfo {
-            method_type: PaymentMethodType::Card,
-            last_four: Some("4242".to_string()),
-            card_brand: Some("visa".to_string()),
-            exp_month: Some("12".to_string()),
-            exp_year: Some("2025".to_string()),
-            cardholder_name: Some("Mock User".to_string()),
-            token: Some(format!("mock_tok_{}", uuid::Uuid::new_v4())),
-        }])
+    async fn create_customer(&self, _email: &str, _name: &str) -> Result<String> {
+        Ok(format!("mock_customer_{}", uuid::Uuid::new_v4()))
     }
 
-    async fn delete_payment_method(&self, _token: &str) -> Result<()> {
+    async fn tokenize_payment_method_for_customer(
+        &self,
+        customer_id: &str,
+        payment_method_data: PaymentMethodData,
+    ) -> Result<PaymentMethodToken> {
+        let token = self.tokenize_payment_method(payment_method_data).await?;
+        let mut info = token.payment_method.clone();
+        info.token = Some(token.token.clone());
+        self.saved_payment_methods
+            .lock()
+            .unwrap()
+            .entry(customer_id.to_string())
+            .or_default()
+            .push(info);
+        Ok(token)
+    }
+
+    async fn get_saved_payment_methods(&self, customer_id: &str) -> Result<Vec<PaymentMethodInfo>> {
+        Ok(self
+            .saved_payment_methods
+            .lock()
+            .unwrap()
+            .get(customer_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn delete_payment_method(&self, token: &str) -> Result<()> {
+        for methods in self.saved_payment_methods.lock().unwrap().values_mut() {
+            methods.retain(|method| method.token.as_deref() != Some(token));
+        }
         Ok(())
     }
 }

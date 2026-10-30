@@ -1,6 +1,6 @@
 import type { Cart } from './types';
 
-import { API_BASE, apiFetchAuthenticated, getAuthToken } from './api';
+import { API_BASE, apiFetchAuthenticated, apiFetchOptionalAuth, getAuthToken } from './api';
 
 const CART_KEY = 'rcommerce_cart_id';
 const SESSION_KEY = 'rcommerce_session_token';
@@ -58,11 +58,8 @@ export async function getOrCreateCart(currency?: string): Promise<Cart> {
   const existingId = getStoredCartId();
   if (existingId) {
     try {
-      const res = await fetch(`${API_BASE}/carts/${existingId}`);
-      if (res.ok) {
-        const data = await res.json();
-        return normalizeCart(data);
-      }
+      const data = await apiFetchOptionalAuth(`/carts/${existingId}`);
+      return normalizeCart(data);
     } catch {
       // ignore, create new cart
     }
@@ -117,54 +114,38 @@ export async function addToCart(
   quantity: number,
   variantId?: string,
 ) {
-  const res = await fetch(`${API_BASE}/carts/${cartId}/items`, {
+  const data = await apiFetchOptionalAuth<any>(`/carts/${cartId}/items`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ product_id: productId, variant_id: variantId || null, quantity }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || 'Failed to add item to cart');
-  }
   window.dispatchEvent(new CustomEvent('cart-updated'));
-  return res.json();
+  return data;
 }
 
 export async function updateCartItem(cartId: string, itemId: string, quantity: number) {
-  const res = await fetch(`${API_BASE}/carts/${cartId}/items/${itemId}`, {
+  const data = await apiFetchOptionalAuth<any>(`/carts/${cartId}/items/${itemId}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ quantity }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || 'Failed to update cart item');
-  }
   window.dispatchEvent(new CustomEvent('cart-updated'));
-  return res.json();
+  return data;
 }
 
 export async function removeCartItem(cartId: string, itemId: string) {
-  const res = await fetch(`${API_BASE}/carts/${cartId}/items/${itemId}`, { method: 'DELETE' });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || 'Failed to remove cart item');
-  }
+  await apiFetchOptionalAuth(`/carts/${cartId}/items/${itemId}`, { method: 'DELETE' });
   window.dispatchEvent(new CustomEvent('cart-updated'));
 }
 
 export async function applyCoupon(cartId: string, couponCode: string) {
-  const res = await fetch(`${API_BASE}/carts/${cartId}/coupon`, {
+  const data = await apiFetchOptionalAuth<any>(`/carts/${cartId}/coupon`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ coupon_code: couponCode }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || 'Failed to apply coupon');
-  }
   window.dispatchEvent(new CustomEvent('cart-updated'));
-  return res.json();
+  return data;
 }
 
 export function openCart() {

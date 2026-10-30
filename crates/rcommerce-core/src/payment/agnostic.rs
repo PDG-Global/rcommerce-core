@@ -222,6 +222,9 @@ pub enum PaymentMethodData {
     CardToken {
         /// Payment method token/ID
         token: String,
+        /// CVC/CVV for providers that require it on customer-initiated charges
+        #[serde(default)]
+        cvc: Option<String>,
     },
     /// Digital wallet data
     DigitalWallet {
@@ -445,6 +448,24 @@ pub trait AgnosticPaymentGateway: Send + Sync {
         &self,
         payment_method_data: PaymentMethodData,
     ) -> Result<PaymentMethodToken>;
+
+    /// Create a customer at the payment gateway.
+    async fn create_customer(&self, _email: &str, _name: &str) -> Result<String> {
+        Err(crate::Error::payment_error(
+            "Gateway customer creation is not supported",
+        ))
+    }
+
+    /// Tokenize and attach a payment method to an existing gateway customer.
+    async fn tokenize_payment_method_for_customer(
+        &self,
+        _customer_id: &str,
+        _payment_method_data: PaymentMethodData,
+    ) -> Result<PaymentMethodToken> {
+        Err(crate::Error::payment_error(
+            "Customer payment-method tokenization is not supported",
+        ))
+    }
 
     /// Get saved payment methods for a customer
     async fn get_saved_payment_methods(&self, customer_id: &str) -> Result<Vec<PaymentMethodInfo>>;

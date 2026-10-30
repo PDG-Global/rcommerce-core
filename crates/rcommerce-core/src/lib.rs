@@ -27,7 +27,7 @@ pub use config::{
     BrandingConfig, Config, DunningConfig, DunningEmailTemplates, GatewayDunningConfig,
     OrdersConfig,
 };
-pub use db::migrate::{auto_migrate, DbStatus, Migrator};
+pub use db::migrate::{auto_migrate, ensure_test_migrations, DbStatus, Migrator};
 pub use error::{Error, Result};
 pub use inventory::{
     InventoryConfig, InventoryLevel, InventoryLocation, InventoryService, LocationInventory,

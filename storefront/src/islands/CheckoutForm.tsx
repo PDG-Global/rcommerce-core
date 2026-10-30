@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type FormEvent, type RefObject } from 'rea
 import { init as initAirwallex, createElement, type Payment } from '@airwallex/components-sdk';
 import type { Cart, CartItem, CheckoutSummary, CheckoutResult, ShippingRate, Customer } from '../lib/types';
 import { getOrCreateCart, clearStoredCartId, applyCoupon, formatMoney } from '../lib/cart';
-import { apiFetchJson, apiFetchAuthenticated, getAuthToken, AIRWALLEX_ENV } from '../lib/api';
+import { apiFetchJson, apiFetchAuthenticated, apiFetchOptionalAuth, AIRWALLEX_ENV } from '../lib/api';
 import CountryStateFields from './CountryStateFields';
 import { brand } from '../lib/brand';
 import { visibleItems } from '../lib/bundles';
@@ -330,7 +330,7 @@ function PaymentSection({
         : 'prod';
 
   const postConfirm = (payload: { order_id: string; payment_intent_id: string | null; cart_id: string }) => {
-    const checkoutFetch = getAuthToken() ? apiFetchAuthenticated : apiFetchJson;
+    const checkoutFetch = apiFetchOptionalAuth;
     return checkoutFetch<CheckoutResult>('/checkout/confirm', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -435,7 +435,7 @@ function PaymentSection({
           return;
         }
 
-        const checkoutFetch = getAuthToken() ? apiFetchAuthenticated : apiFetchJson;
+        const checkoutFetch = apiFetchOptionalAuth;
         const result = await checkoutFetch<CheckoutResult>('/checkout/complete', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -962,7 +962,7 @@ export default function CheckoutForm() {
   }, []);
 
   const initiateCheckout = async (currentCart: Cart, currentAddress: AddressForm) => {
-    const res = await apiFetchJson<CheckoutSummary>('/checkout/initiate', {
+    const res = await apiFetchOptionalAuth<CheckoutSummary>('/checkout/initiate', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1032,7 +1032,7 @@ export default function CheckoutForm() {
     if (!cart || !summary) return;
     setLoading(true);
     try {
-      const res = await apiFetchJson<CheckoutSummary>('/checkout/shipping', {
+      const res = await apiFetchOptionalAuth<CheckoutSummary>('/checkout/shipping', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({

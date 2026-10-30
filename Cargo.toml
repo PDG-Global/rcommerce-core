@@ -38,6 +38,9 @@ migration = "0.3"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Networking
+ipnet = "2"
 send_wrapper = "0.6"
 
 # UUID
@@ -152,6 +155,14 @@ once_cell = "1.19"
 
 # System monitoring
 sysinfo = "0.30"
+
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false
 
 [profile.release]
 opt-level = 3

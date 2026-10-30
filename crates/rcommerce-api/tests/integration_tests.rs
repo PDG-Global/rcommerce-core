@@ -186,7 +186,11 @@ impl TestApp {
         let cart_service_arc = Arc::new(cart_service);
         let order_service_arc = Arc::new(order_service);
         let tax_service = Arc::new(rcommerce_core::tax::DefaultTaxService::new(db_pool.clone()));
-        let shipping_factory = Arc::new(ShippingProviderFactory::new());
+        let mut shipping_factory = ShippingProviderFactory::new();
+        shipping_factory.register(Box::new(
+            rcommerce_core::shipping::carriers::ManualProvider::new(),
+        ));
+        let shipping_factory = Arc::new(shipping_factory);
 
         let api_key_repository = PostgresApiKeyRepository::new(db_pool.clone());
         let subscription_repository = PostgresSubscriptionRepository::new(db_pool.clone());
@@ -206,9 +210,8 @@ impl TestApp {
 
         // Create checkout service
         let checkout_config = CheckoutConfig::default();
-        let payment_gateway_arc: Arc<dyn rcommerce_core::PaymentGateway> = Arc::new(
-            StripeGateway::new("sk_test_dummy".to_string(), "whsec_dummy".to_string()),
-        );
+        let payment_gateway_arc: Arc<dyn rcommerce_core::PaymentGateway> =
+            Arc::new(rcommerce_core::payment::gateways::MockPaymentGateway::new());
         let checkout_service = Arc::new(CheckoutService::new(
             cart_service_arc.clone(),
             tax_service.clone(),
@@ -302,63 +305,63 @@ impl TestApp {
         // Acquire lock to prevent concurrent migrations (causes deadlocks)
         let _guard = MIGRATION_LOCK.lock().await;
 
-        // Clean up existing objects first to ensure a fresh database state
-        // This is necessary because tests may share the same database
+        // Clean up existing objects first to ensure a fresh database state.
+        // This is necessary because tests may share the same database.
+        // Drop tables first: CASCADE removes their indexes automatically, and
+        // dropping indexes first would abort the block on constraint-backed
+        // indexes (e.g. products_pkey), silently leaving the old schema in
+        // place (the previous version of this block did exactly that).
         let cleanup_sql = r#"
             DO $$
             DECLARE
                 r RECORD;
             BEGIN
-                -- Disable triggers temporarily to avoid cascade issues
-                SET session_replication_role = replica;
-                
-                -- Drop all indexes in public schema (excluding system indexes)
+                -- Drop all tables in public schema (CASCADE drops dependent
+                -- indexes, constraints, and triggers)
                 FOR r IN (
-                    SELECT indexname 
-                    FROM pg_indexes 
-                    WHERE schemaname = 'public'
-                    AND indexname NOT LIKE 'pg_%'
-                ) LOOP
-                    EXECUTE 'DROP INDEX IF EXISTS public.' || quote_ident(r.indexname) || ' CASCADE';
-                END LOOP;
-                
-                -- Drop all tables in public schema
-                FOR r IN (
-                    SELECT tablename 
-                    FROM pg_tables 
+                    SELECT tablename
+                    FROM pg_tables
                     WHERE schemaname = 'public'
                 ) LOOP
                     EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
                 END LOOP;
-                
+
                 -- Drop all types (enums) in public schema (excluding extensions)
                 FOR r IN (
-                    SELECT typname 
+                    SELECT typname
                     FROM pg_type t
                     JOIN pg_namespace n ON t.typnamespace = n.oid
-                    WHERE n.nspname = 'public' 
+                    WHERE n.nspname = 'public'
                     AND t.typtype = 'e'
                 ) LOOP
                     EXECUTE 'DROP TYPE IF EXISTS public.' || quote_ident(r.typname) || ' CASCADE';
                 END LOOP;
-                
-                -- Drop all functions in public schema (excluding extensions)
+
+                -- Drop all functions in public schema (excluding extension
+                -- members such as uuid-ossp's uuid_generate_v4/uuid_nil)
                 FOR r IN (
                     SELECT proname, pg_get_function_identity_arguments(p.oid) as args
                     FROM pg_proc p
                     JOIN pg_namespace n ON p.pronamespace = n.oid
                     WHERE n.nspname = 'public'
-                    AND p.proname NOT IN ('uuid_generate_v4', 'gen_random_uuid')  -- Keep extension functions
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pg_depend d
+                        WHERE d.classid = 'pg_proc'::regclass
+                        AND d.objid = p.oid
+                        AND d.deptype = 'e'
+                    )
                 ) LOOP
                     EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident(r.proname) || '(' || r.args || ') CASCADE';
                 END LOOP;
-                
-                -- Re-enable triggers
-                SET session_replication_role = DEFAULT;
             END $$;
         "#;
 
-        sqlx::query(cleanup_sql).execute(pool).await.ok(); // Ignore errors - schema might not exist yet
+        // Propagate errors: if the reset fails, running the suite against the
+        // leftover schema produces misleading failures (e.g. a missing seed).
+        sqlx::query(cleanup_sql)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to reset test schema: {e}"))?;
 
         // Apply the same migrations as the server, so the schema never drifts
         rcommerce_core::Migrator::new(pool.clone())
@@ -484,11 +487,29 @@ impl TestApp {
 
         // Carts check stock per location (inventory_levels), not the product column
         if inventory > 0 {
-            let location_id: Uuid = sqlx::query_scalar(
+            let location_id: Uuid = match sqlx::query_scalar(
                 "SELECT id FROM inventory_locations WHERE is_active ORDER BY created_at LIMIT 1",
             )
-            .fetch_one(&self.db_pool)
-            .await?;
+            .fetch_optional(&self.db_pool)
+            .await?
+            {
+                Some(id) => id,
+                // The seeded default warehouse may be gone (e.g. a core test
+                // tore it down and the harness's schema reset is a no-op on
+                // Postgres) — create one rather than failing, mirroring the
+                // order service's get_default_location_id fallback.
+                None => {
+                    let id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Default Warehouse', $2)",
+                    )
+                    .bind(id)
+                    .bind(format!("MAIN-{}", &id.to_string()[..8]))
+                    .execute(&self.db_pool)
+                    .await?;
+                    id
+                }
+            };
             self.app_state
                 .inventory_service
                 .receive_stock(product_id, location_id, inventory, None)
@@ -1478,6 +1499,631 @@ async fn test_admin_can_create_product() {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     assert_eq!(status, 201, "{body}");
+
+    app.cleanup().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_admin_can_manually_fulfill_order_once() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let product_id = app
+        .create_test_product("Fulfillment Test Wheel", Decimal::from(30), 10)
+        .await
+        .unwrap();
+    let order_id = Uuid::new_v4();
+    let order_item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_email, status, payment_status, fulfillment_status, subtotal, total) VALUES ($1, $2, 'buyer@example.com', 'confirmed', 'paid', 'pending', 60, 60)",
+    )
+    .bind(order_id)
+    .bind(format!("TEST-FULFILL-{order_id}"))
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO order_items (id, order_id, product_id, title, quantity, price, total) VALUES ($1, $2, $3, 'Test wheel', 2, 30, 60)",
+    )
+    .bind(order_item_id)
+    .bind(order_id)
+    .bind(product_id)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+
+    let url = format!("{}/api/v1/orders/{}/fulfillments", app.base_url(), order_id);
+    let payload = serde_json::json!({
+        "carrier": "UPS",
+        "tracking_number": "1Z999AA99999999999"
+    });
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&customer_token)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&admin)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(body["fulfillment_status"], "shipped");
+    assert_eq!(body["fulfillments"][0]["tracking_company"], "UPS");
+    assert_eq!(
+        body["fulfillments"][0]["tracking_url"],
+        "https://www.ups.com/track?tracknum=1Z999AA99999999999"
+    );
+
+    let (fulfillment_id, fulfillment_status, tracking_company): (Uuid, String, String) =
+        sqlx::query_as(
+            "SELECT id, status::text, tracking_company FROM fulfillments WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&app.db_pool)
+        .await
+        .unwrap();
+    assert_eq!(fulfillment_status, "shipped");
+    assert_eq!(tracking_company, "UPS");
+    let fulfilled_quantity: i64 = sqlx::query_scalar(
+        "SELECT SUM(quantity)::bigint FROM fulfillment_items WHERE fulfillment_id = $1",
+    )
+    .bind(fulfillment_id)
+    .fetch_one(&app.db_pool)
+    .await
+    .unwrap();
+    assert_eq!(fulfilled_quantity, 2);
+
+    let response = app
+        .http_client
+        .post(&url)
+        .bearer_auth(&admin)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let fulfillment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fulfillments WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&app.db_pool)
+            .await
+            .unwrap();
+    assert_eq!(fulfillment_count, 1);
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/orders/{}", app.base_url(), order_id))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["fulfillments"][0]["tracking_number"],
+        "1Z999AA99999999999"
+    );
+    assert!(body["notes"]
+        .as_str()
+        .unwrap()
+        .contains("Shipped manually via UPS"));
+
+    app.cleanup().await.ok();
+}
+
+async fn assert_cart_not_found(response: reqwest::Response) {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+}
+
+async fn add_guest_item(app: &TestApp, cart_id: Uuid, product_id: Uuid) -> Uuid {
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/carts/{}/items", app.base_url(), cart_id))
+        .json(&serde_json::json!({"product_id": product_id, "quantity": 1}))
+        .send()
+        .await
+        .expect("Failed to add anonymous guest cart item");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("Invalid cart item response");
+    assert!(status.is_success(), "{body}");
+    body["id"].as_str().unwrap().parse().unwrap()
+}
+
+fn ownership_test_address() -> serde_json::Value {
+    serde_json::json!({
+        "id": Uuid::nil(),
+        "customer_id": Uuid::nil(),
+        "first_name": "Guest",
+        "last_name": "Buyer",
+        "address1": "123 Main St",
+        "address2": null,
+        "company": null,
+        "city": "New York",
+        "state": "NY",
+        "country": "US",
+        "zip": "10001",
+        "phone": "+12125550100",
+        "is_default_shipping": false,
+        "is_default_billing": false,
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+    })
+}
+
+fn ownership_test_shipping_rate() -> serde_json::Value {
+    serde_json::json!({
+        "provider_id": "manual",
+        "carrier": "Manual",
+        "service_code": "standard",
+        "service_name": "Standard Shipping",
+        "rate": "10.00",
+        "currency": "USD",
+        "delivery_days": 5,
+        "total_cost": "10.00"
+    })
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_customer_cart_ownership_checkout_and_merge() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (owner, owner_password) = app.create_test_customer().await.unwrap();
+    let (other, other_password) = app.create_test_customer().await.unwrap();
+    let owner_token = app.login(&owner.email, &owner_password).await.unwrap();
+    let other_token = app.login(&other.email, &other_password).await.unwrap();
+    let product_id = app
+        .create_test_product("Ownership Product", Decimal::new(1000, 2), 100)
+        .await
+        .unwrap();
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/carts/me", app.base_url()))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let owner_cart: CartWithItems = response.json().await.unwrap();
+    let cart_id = owner_cart.cart.id;
+    let item_id = app
+        .add_item_to_cart(cart_id, product_id, 1, &owner_token)
+        .await
+        .unwrap();
+
+    let cart_routes = vec![
+        (
+            reqwest::Method::GET,
+            format!("/api/v1/carts/{cart_id}"),
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/api/v1/carts/{cart_id}/items"),
+            Some(serde_json::json!({"product_id": product_id, "quantity": 1})),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("/api/v1/carts/{cart_id}/items/{item_id}"),
+            Some(serde_json::json!({"quantity": 2})),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/api/v1/carts/{cart_id}/items/{item_id}"),
+            None,
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/api/v1/carts/{cart_id}/items"),
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/api/v1/carts/{cart_id}/coupon"),
+            Some(serde_json::json!({"coupon_code": "OWNERSHIP"})),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/api/v1/carts/{cart_id}/coupon"),
+            None,
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/api/v1/carts/{cart_id}"),
+            None,
+        ),
+    ];
+    for (method, path, body) in &cart_routes {
+        for token in [None, Some(other_token.as_str())] {
+            let mut request = app
+                .http_client
+                .request(method.clone(), format!("{}{}", app.base_url(), path));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            assert_cart_not_found(request.send().await.unwrap()).await;
+        }
+    }
+
+    for token in [None, Some(other_token.as_str())] {
+        let mut request = app.http_client.get(format!(
+            "{}/api/v1/carts/{}",
+            app.base_url(),
+            Uuid::new_v4()
+        ));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_cart_not_found(request.send().await.unwrap()).await;
+    }
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/carts/{}", app.base_url(), cart_id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let unchanged: CartWithItems = response.json().await.unwrap();
+    assert_eq!(unchanged.items.len(), 1);
+    assert_eq!(unchanged.items[0].quantity, 1);
+
+    let checkout_routes = vec![
+        (
+            "/api/v1/checkout/initiate",
+            serde_json::json!({
+                "cart_id": cart_id,
+                "shipping_address": ownership_test_address(),
+                "billing_address": null,
+                "currency": "USD"
+            }),
+        ),
+        (
+            "/api/v1/checkout/shipping",
+            serde_json::json!({
+                "cart_id": cart_id,
+                "shipping_address": ownership_test_address(),
+                "shipping_rate": ownership_test_shipping_rate()
+            }),
+        ),
+        (
+            "/api/v1/checkout/complete",
+            serde_json::json!({
+                "cart_id": cart_id,
+                "shipping_address": ownership_test_address(),
+                "billing_address": null,
+                "payment_method": {"type": "stripe_elements"},
+                "customer_email": owner.email,
+                "selected_shipping_rate": ownership_test_shipping_rate(),
+                "test": true
+            }),
+        ),
+        (
+            "/api/v1/checkout/confirm",
+            serde_json::json!({
+                "order_id": Uuid::new_v4(),
+                "payment_intent_id": "not-used",
+                "cart_id": cart_id
+            }),
+        ),
+    ];
+    for (path, body) in &checkout_routes {
+        for token in [None, Some(other_token.as_str())] {
+            let mut request = app
+                .http_client
+                .post(format!("{}{}", app.base_url(), path))
+                .json(body);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            assert_cart_not_found(request.send().await.unwrap()).await;
+        }
+    }
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/initiate", app.base_url()))
+        .bearer_auth(&owner_token)
+        .json(&checkout_routes[0].1)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status} {body}");
+
+    let (guest_cart_id, session_token) = app.create_guest_cart().await.unwrap();
+    add_guest_item(&app, guest_cart_id, product_id).await;
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/carts/{}", app.base_url(), guest_cart_id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/carts/merge", app.base_url()))
+        .json(&serde_json::json!({"session_token": session_token.clone()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/carts/merge", app.base_url()))
+        .bearer_auth(&other_token)
+        .json(&serde_json::json!({"session_token": session_token}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status} {body}");
+    let merged: CartWithItems = serde_json::from_str(&body).unwrap();
+    assert_eq!(merged.cart.id, guest_cart_id);
+    assert_eq!(merged.cart.customer_id, Some(other.id));
+    assert_eq!(merged.items.len(), 1);
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/carts/{}", app.base_url(), guest_cart_id))
+        .bearer_auth(&other_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    for token in [None, Some(owner_token.as_str())] {
+        let mut request =
+            app.http_client
+                .get(format!("{}/api/v1/carts/{}", app.base_url(), guest_cart_id));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_cart_not_found(request.send().await.unwrap()).await;
+    }
+
+    app.cleanup().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_guest_cart_and_checkout_routes_remain_public() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let product_id = app
+        .create_test_product("Guest Product", Decimal::new(1000, 2), 100)
+        .await
+        .unwrap();
+    let coupon_code = format!("GUEST{}", &Uuid::new_v4().simple().to_string()[..6]).to_uppercase();
+    app.create_test_coupon(&coupon_code, "percentage", "10.00")
+        .await
+        .unwrap();
+    let (cart_id, _) = app.create_guest_cart().await.unwrap();
+    let item_id = add_guest_item(&app, cart_id, product_id).await;
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/carts/{}", app.base_url(), cart_id))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = app
+        .http_client
+        .put(format!(
+            "{}/api/v1/carts/{}/items/{}",
+            app.base_url(),
+            cart_id,
+            item_id
+        ))
+        .json(&serde_json::json!({"quantity": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = app
+        .http_client
+        .post(format!(
+            "{}/api/v1/carts/{}/coupon",
+            app.base_url(),
+            cart_id
+        ))
+        .json(&serde_json::json!({"coupon_code": coupon_code}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status} {body}");
+    let response = app
+        .http_client
+        .delete(format!(
+            "{}/api/v1/carts/{}/coupon",
+            app.base_url(),
+            cart_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = app
+        .http_client
+        .delete(format!(
+            "{}/api/v1/carts/{}/items/{}",
+            app.base_url(),
+            cart_id,
+            item_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    add_guest_item(&app, cart_id, product_id).await;
+    let response = app
+        .http_client
+        .delete(format!("{}/api/v1/carts/{}/items", app.base_url(), cart_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let cart = app.get_cart(cart_id).await.unwrap();
+    assert!(cart.items.is_empty());
+    add_guest_item(&app, cart_id, product_id).await;
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/initiate", app.base_url()))
+        .json(&serde_json::json!({
+            "cart_id": cart_id,
+            "shipping_address": ownership_test_address(),
+            "billing_address": null,
+            "currency": "USD"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{body}");
+    let shipping_rate = body["available_shipping_rates"][0].clone();
+    assert!(!shipping_rate.is_null());
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/shipping", app.base_url()))
+        .json(&serde_json::json!({
+            "cart_id": cart_id,
+            "shipping_address": ownership_test_address(),
+            "shipping_rate": shipping_rate.clone()
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status} {body}");
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/complete", app.base_url()))
+        .json(&serde_json::json!({
+            "cart_id": cart_id,
+            "shipping_address": ownership_test_address(),
+            "billing_address": null,
+            "payment_method": {"type": "stripe_elements"},
+            "customer_email": "guest@example.com",
+            "selected_shipping_rate": shipping_rate,
+            "test": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let completed: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{completed}");
+    assert_eq!(completed["requires_confirmation"], false);
+    let order_id = completed["order"]["id"].as_str().unwrap();
+    let payment_id = completed["payment_id"].as_str().unwrap();
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/confirm", app.base_url()))
+        .json(&serde_json::json!({
+            "order_id": order_id,
+            "payment_intent_id": payment_id,
+            "cart_id": cart_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status} {body}");
+
+    let (disposable_cart_id, _) = app.create_guest_cart().await.unwrap();
+    let response = app
+        .http_client
+        .delete(format!(
+            "{}/api/v1/carts/{}",
+            app.base_url(),
+            disposable_cart_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let response = app
+        .http_client
+        .get(format!(
+            "{}/api/v1/carts/{}",
+            app.base_url(),
+            disposable_cart_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_cart_not_found(response).await;
+
+    app.cleanup().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_confirm_checkout_cart_mismatch_returns_404() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (original_cart_id, _) = app.create_guest_cart().await.unwrap();
+    let (other_cart_id, _) = app.create_guest_cart().await.unwrap();
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_email, fulfillment_status, metadata) \
+         VALUES ($1, $2, 'guest@example.com', 'pending', $3)",
+    )
+    .bind(order_id)
+    .bind(format!("TEST-{order_id}"))
+    .bind(serde_json::json!({"cart_id": original_cart_id.to_string()}))
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/checkout/confirm", app.base_url()))
+        .json(&serde_json::json!({
+            "order_id": order_id,
+            "payment_intent_id": "not-used",
+            "cart_id": other_cart_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_cart_not_found(response).await;
+    let status: String = sqlx::query_scalar("SELECT status::text FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(&app.db_pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
 
     app.cleanup().await.ok();
 }

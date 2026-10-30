@@ -18,7 +18,7 @@ use rcommerce_core::shipping::ShippingProviderFactory;
 use rcommerce_core::tax::DefaultTaxService;
 use rcommerce_core::{BundleService, DigitalProductService, FileUploadService};
 
-use crate::middleware::AuthRateLimiter;
+use crate::middleware::{AuthRateLimiter, ClientIpResolver, LoginThrottle};
 
 /// Parameters for creating AppState
 pub struct AppStateParams {
@@ -51,6 +51,18 @@ pub struct AppStateParams {
     pub default_currency: String,
     /// Airwallex gateway config for settlement reconciliation
     pub airwallex_config: Option<rcommerce_core::config::AirwallexConfig>,
+    /// Rate limiting / client-IP configuration used for the AppState-owned
+    /// limiters. Defaults apply unless overridden via `with_rate_limiting`.
+    pub rate_limiting: rcommerce_core::config::RateLimitConfig,
+}
+
+impl AppStateParams {
+    /// Override the rate limiting configuration (used by the real servers;
+    /// tests get the defaults from `new`).
+    pub fn with_rate_limiting(mut self, config: rcommerce_core::config::RateLimitConfig) -> Self {
+        self.rate_limiting = config;
+        self
+    }
 }
 
 impl AppStateParams {
@@ -107,6 +119,7 @@ impl AppStateParams {
             accounting,
             default_currency,
             airwallex_config,
+            rate_limiting: rcommerce_core::config::RateLimitConfig::default(),
         }
     }
 }
@@ -135,6 +148,15 @@ pub struct AppState {
     pub db: Database,
     pub redis: Option<RedisPool>,
     pub auth_rate_limiter: AuthRateLimiter,
+    /// Trusted-proxy-aware client IP resolver (rate limiting, login
+    /// throttling, API-key audit).
+    pub client_ip_resolver: ClientIpResolver,
+    /// Login throttling: source-IP attempt budget and (IP, e-mail) failure
+    /// budgets.
+    pub login_throttle: LoginThrottle,
+    /// Eagerly computed Argon2 hash used to answer unknown e-mails with the
+    /// same cost as real ones (defeats login enumeration by timing).
+    pub dummy_password_hash: String,
     pub api_key_repository: Arc<PostgresApiKeyRepository>,
     pub email_channel: Option<Arc<EmailChannel>>,
     pub notification_service: Option<Arc<NotificationService>>,
@@ -153,8 +175,41 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(params: AppStateParams) -> Self {
-        // Create auth rate limiter: 5 attempts per minute per IP
-        let auth_rate_limiter = AuthRateLimiter::new(5, 60);
+        let rate_limiting = params.rate_limiting.clone();
+
+        // Create auth rate limiter (5 attempts per minute per IP)
+        let auth_rate_limiter = AuthRateLimiter::new(5, 60, rate_limiting.max_tracked_ips.max(1));
+
+        // Trusted-proxy-aware client IP resolution. Server startup validates
+        // the configured CIDRs before AppState is built; this fallback only
+        // fires for hand-constructed states with an invalid config.
+        let client_ip_resolver =
+            ClientIpResolver::from_config(&rate_limiting).unwrap_or_else(|e| {
+                tracing::error!(
+                    "Invalid rate limiting config in AppStateParams ({}); \
+                     running without trusted proxies",
+                    e
+                );
+                ClientIpResolver::new(Vec::new(), rate_limiting.max_forwarded_hops)
+            });
+
+        // Login throttling from the same configuration section.
+        let login_throttle = LoginThrottle::new(&rate_limiting);
+
+        // Eagerly compute the dummy hash so unknown e-mails cost the same
+        // Argon2 work as real ones. Doing it once at startup keeps login
+        // latency uniform; a failure here must not keep the server from
+        // starting (verification errors are ignored by the login flow).
+        let dummy_password_hash = match params
+            .auth_service
+            .hash_password("rcommerce-invalid-credentials-placeholder")
+        {
+            Ok(hash) => hash,
+            Err(e) => {
+                tracing::error!("Failed to pre-compute dummy password hash: {}", e);
+                String::new()
+            }
+        };
 
         // Remember the configured sender address for shop-operator notifications
         let notification_from_email = params
@@ -258,6 +313,9 @@ impl AppState {
             db: params.db,
             redis: params.redis,
             auth_rate_limiter,
+            client_ip_resolver,
+            login_throttle,
+            dummy_password_hash,
             api_key_repository: Arc::new(params.api_key_repository),
             email_channel,
             notification_service,

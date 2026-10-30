@@ -11,12 +11,13 @@ R commerce uses TOML format for configuration files, with support for environmen
 ```toml
 [server]
 [database]
-[payments]
+[payment]
 [shipping]
 [notifications]
 [logging]
 [cache]
 [security]
+[rate_limiting]
 [compatibility]
 [migration]
 [features]
@@ -114,80 +115,67 @@ RCOMMERCE_DATABASE_PASSWORD=secure_password
 RCOMMERCE_DATABASE_POOL_SIZE=50
 ```
 
+## Rate Limiting and Client IP Configuration
+
+```toml
+[rate_limiting]
+enabled = true
+requests_per_minute = 60
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+max_forwarded_hops = 8
+max_tracked_ips = 50000
+login_ip_max_attempts = 30
+login_pair_max_failures = 10
+login_window_secs = 900
+```
+
+`trusted_proxies` contains CIDRs for actual reverse-proxy peers; invalid CIDRs
+prevent startup. Forwarding headers from any other peer are ignored. For a
+trusted peer, `X-Forwarded-For` is processed right-to-left past trusted proxy
+addresses. The socket peer comes from Axum `ConnectInfo`, and the resolved
+address is used by the request limiter, login throttles, and API-key audit
+trail. Malformed or overlong chains from a trusted proxy are rejected.
+
+The login limits use bounded, per-process maps: one budget counts every attempt
+from a source IP, and the other counts failures for a source-IP/canonical-email
+pair. A successful login clears only that pair. Exceeding either budget returns
+`429` with `Retry-After`. See the reverse-proxy guide for the required
+Cloudflare → Caddy → Axum configuration.
+
 ## Payment Configuration
 
 ```toml
-[payments]
-# Default payment gateway
-default_gateway = "stripe"
+[payment]
+default_gateway = "stripe"  # checkout: "stripe", "airwallex", or test-only "mock"
+test_mode = false           # production
 
-# Auto-capture settings
-auto_capture = true              # Automatically capture payments
-capture_delay_seconds = 0        # Delay before capture (0 = immediate)
-
-# 3D Secure / Strong Customer Authentication
-sca_threshold = 3000             # Amount (in minor units) requiring 3DS
-
-# Supported currencies
-supported_currencies = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD"]
-
-# Fraud detection
-enable_fraud_check = true        # Enable fraud detection
-risk_threshold = 75              # Score > 75 blocks payment
-
-# Stripe Configuration
-[payments.stripe]
+[payment.stripe]
 enabled = true
 secret_key = "sk_live_your_secret_key_here"
 publishable_key = "pk_live_your_publishable_key_here"
 webhook_secret = "whsec_your_webhook_secret_here"
 
-# Stripe Connect (for marketplace features)
-connect_enabled = false
-connect_client_id = "ca_your_client_id_here"
-
-# Stripe settings
-statement_descriptor = "RCOMMERCE"
-statement_descriptor_suffix = "STORE"
-receipt_email = true             # Send automatic receipt emails
-
-# Airwallex Configuration
-[payments.airwallex]
-enabled = false                  # Enable/disable Airwallex
+[payment.airwallex]
+enabled = false
 client_id = "your_client_id"
 api_key = "your_api_key"
 webhook_secret = "your_webhook_secret"
-account_id = "your_account_id"
-request_currency = true          # Request payment in specific currency
-
-# PayPal Configuration
-[payments.paypal]
-enabled = false
-client_id = "your_client_id"
-client_secret = "your_client_secret"
-environment = "live"             # "live" or "sandbox"
-
-# Braintree Configuration
-[payments.braintree]
-enabled = false
-merchant_id = "your_merchant_id"
-public_key = "your_public_key"
-private_key = "your_private_key"
-environment = "production"       # "production" or "sandbox"
-
-# Manual/Bank Transfer Configuration
-[payments.manual]
-enabled = true                   # Always enable manual payments
-instructions = "Please transfer to: Bank: ... Account: ..."
-confirm_delay_hours = 24         # How long to wait for confirmation
+demo = false
 ```
+
+The mock gateway is registered only when `payment.test_mode = true`. Checkout
+accepts only `mock`, `stripe`, or `airwallex` as its default gateway. The
+selected real gateway must be enabled and have its required credentials;
+startup fails for an unsupported, disabled, or incomplete selection and never
+falls back to another gateway. Production must use `test_mode = false`.
 
 **Environment Variables:**
 ```bash
-RCOMMERCE_PAYMENTS_DEFAULT_GATEWAY=stripe
-RCOMMERCE_PAYMENTS_AUTO_CAPTURE=true
-RCOMMERCE_PAYMENTS_STRIPE_SECRET_KEY=sk_live_xxx
-RCOMMERCE_PAYMENTS_RISK_THRESHOLD=80
+STRIPE_API_KEY=sk_live_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+AIRWALLEX_CLIENT_ID=your_client_id
+AIRWALLEX_API_KEY=your_api_key
+AIRWALLEX_WEBHOOK_SECRET=your_webhook_secret
 ```
 
 ## Shipping Configuration
@@ -546,9 +534,10 @@ RCOMMERCE_DATABASE_TYPE=postgres
 RCOMMERCE_DATABASE_HOST=db.example.com
 RCOMMERCE_DATABASE_POOL_SIZE=50
 
-# Payments
-RCOMMERCE_PAYMENTS_DEFAULT_GATEWAY=stripe
-RCOMMERCE_PAYMENTS_STRIPE_SECRET_KEY=sk_live_xxx
+# Payment provider credentials
+STRIPE_API_KEY=sk_live_xxx
+AIRWALLEX_CLIENT_ID=your_client_id
+AIRWALLEX_API_KEY=your_api_key
 
 # Redis/Cache
 RCOMMERCE_CACHE_REDIS_URL=redis://redis:6379
@@ -595,16 +584,24 @@ ssl_mode = "require"
 pool_size = 50
 max_lifetime = "30min"
 
-[payments]
+[payment]
 default_gateway = "stripe"
-auto_capture = true
-sca_threshold = 3000
-enable_fraud_check = true
-risk_threshold = 75
+test_mode = false
 
-[payments.stripe]
+[payment.stripe]
+enabled = true
 secret_key = "${STRIPE_SECRET_KEY}"
 webhook_secret = "${STRIPE_WEBHOOK_SECRET}"
+
+[rate_limiting]
+enabled = true
+requests_per_minute = 60
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+max_forwarded_hops = 8
+max_tracked_ips = 50000
+login_ip_max_attempts = 30
+login_pair_max_failures = 10
+login_window_secs = 900
 
 [shipping]
 default_provider = "shipstation"

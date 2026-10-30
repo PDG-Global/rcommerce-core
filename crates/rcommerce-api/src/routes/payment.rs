@@ -6,13 +6,15 @@
 use axum::{
     extract::{Path, State},
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{middleware::JwtAuth, state::AppState};
 use rcommerce_core::payment::agnostic::*;
 use rcommerce_core::Error;
 
@@ -95,79 +97,181 @@ pub struct InitiatePaymentApiRequest {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct OrderAuthority {
+    id: Uuid,
+    customer_id: Option<Uuid>,
+    customer_email: String,
+    total: Decimal,
+    currency: String,
+    status: String,
+    payment_status: String,
+}
+
+impl OrderAuthority {
+    fn require_awaiting_payment(&self) -> Result<(), Error> {
+        if self.status != "pending" || !matches!(self.payment_status.as_str(), "pending" | "failed")
+        {
+            return Err(Error::validation(
+                "Order is not awaiting a retryable payment",
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn authoritative_order(
+    db: &rcommerce_core::repository::Database,
+    order_id: Uuid,
+    auth: &JwtAuth,
+) -> Result<OrderAuthority, Error> {
+    let order = sqlx::query_as::<_, OrderAuthority>(
+        "SELECT id, customer_id, customer_email, total, currency::text AS currency, \
+         status::text AS status, payment_status::text AS payment_status \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| Error::not_found("Order not found"))?;
+
+    if !auth.is_admin() && order.customer_id != Some(auth.customer_id) {
+        return Err(Error::not_found("Order not found"));
+    }
+    Ok(order)
+}
+
+async fn acquire_payment_attempt(
+    db: &rcommerce_core::repository::Database,
+    order_id: Uuid,
+    gateway_id: &str,
+) -> Result<Uuid, Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO payment_initiation_attempts (id, order_id, gateway) \
+         SELECT $1, $2, $3 FROM orders \
+         WHERE id = $2 AND status = 'pending' AND payment_status IN ('pending', 'failed') \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM payments WHERE order_id = $2 AND status IN ('pending', 'authorized', 'paid', 'refunded') \
+         ) \
+         ON CONFLICT (order_id) DO NOTHING RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(order_id)
+    .bind(gateway_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| {
+        Error::validation("Order is not awaiting payment or already has a payment in progress")
+    })
+}
+
+async fn release_payment_attempt(db: &rcommerce_core::repository::Database, attempt_id: Uuid) {
+    if let Err(error) = sqlx::query("DELETE FROM payment_initiation_attempts WHERE id = $1")
+        .bind(attempt_id)
+        .execute(db.pool())
+        .await
+    {
+        warn!(
+            "Failed to release payment attempt {}: {}",
+            attempt_id, error
+        );
+    }
+}
+
 /// Initiate a payment
 pub async fn initiate_payment(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<InitiatePaymentApiRequest>,
 ) -> Result<Json<InitiatePaymentResponse>, Error> {
-    // Parse amount
-    let amount = request
-        .amount
-        .parse::<rust_decimal::Decimal>()
-        .map_err(|_| Error::validation("Invalid amount format"))?;
-
-    // Parse order_id
     let order_id = Uuid::parse_str(&request.order_id)
         .map_err(|_| Error::validation("Invalid order_id format"))?;
-
-    // Log idempotency key if provided
-    if let Some(ref key) = request.idempotency_key {
-        info!("Processing payment with idempotency key: {}", key);
+    let order = authoritative_order(&state.db, order_id, &auth).await?;
+    order.require_awaiting_payment()?;
+    let amount = request
+        .amount
+        .parse::<Decimal>()
+        .map_err(|_| Error::validation("Invalid amount format"))?;
+    if amount != order.total {
+        return Err(Error::validation(
+            "Payment amount does not match the order total",
+        ));
+    }
+    if !request.currency.eq_ignore_ascii_case(&order.currency) {
+        return Err(Error::validation(
+            "Payment currency does not match the order currency",
+        ));
+    }
+    if request.save_payment_method {
+        return Err(Error::validation(
+            "Save payment methods through the payment-methods endpoint",
+        ));
     }
 
-    // Get the gateway
     let gateway = state
         .payment_service
         .get_gateway(Some(&request.gateway_id))
         .ok_or_else(|| Error::validation(format!("Gateway '{}' not found", request.gateway_id)))?;
-
-    // Build the initiate payment request
-    let initiate_request = InitiatePaymentRequest {
-        amount,
-        currency: request.currency,
-        payment_method_type: request.payment_method_type,
-        order_id,
-        customer_id: None, // Could be extracted from auth context
-        customer_email: request.customer_email,
-        customer_ip: None,
-        billing_address: None,
-        shipping_address: None,
-        payment_method_data: request.payment_method_data,
-        save_payment_method: request.save_payment_method,
-        description: request.description,
-        metadata: serde_json::json!({
-            "order_id": order_id.to_string(),
-            "idempotency_key": request.idempotency_key,
-        }),
-    };
-
-    // Process the payment
-    let response = gateway.initiate_payment(initiate_request).await?;
-
-    // Log the result
-    match &response {
-        InitiatePaymentResponse::Success { payment_id, .. } => {
-            info!("Payment initiated successfully: {}", payment_id);
-        }
-        InitiatePaymentResponse::RequiresAction {
-            payment_id,
-            action_type,
-            ..
-        } => {
-            info!(
-                "Payment requires action: {}, type: {:?}",
-                payment_id, action_type
-            );
-        }
-        InitiatePaymentResponse::Failed {
-            payment_id,
-            error_message,
-            ..
-        } => {
-            warn!("Payment failed: {}, error: {}", payment_id, error_message);
-        }
+    let mut gateway_customer_id = None;
+    if let PaymentMethodData::CardToken { token, .. } = &request.payment_method_data {
+        let customer_id = order
+            .customer_id
+            .ok_or_else(|| Error::not_found("Saved payment method not found"))?;
+        require_saved_method_owner(&state.db, customer_id, &request.gateway_id, token).await?;
+        let contact = gateway_customer_contact(&state.db, customer_id).await?;
+        gateway_customer_id = Some(
+            existing_gateway_customer_id(&state.db, customer_id, &request.gateway_id, &contact)
+                .await?
+                .ok_or_else(|| Error::payment_error("Gateway customer mapping is missing"))?,
+        );
     }
 
+    let attempt_id = acquire_payment_attempt(&state.db, order_id, &request.gateway_id).await?;
+    let response = match gateway
+        .initiate_payment(InitiatePaymentRequest {
+            amount: order.total,
+            currency: order.currency.clone(),
+            payment_method_type: request.payment_method_type,
+            order_id,
+            customer_id: order.customer_id,
+            customer_email: order.customer_email.clone(),
+            customer_ip: None,
+            billing_address: None,
+            shipping_address: None,
+            payment_method_data: request.payment_method_data,
+            save_payment_method: false,
+            description: request.description,
+            metadata: serde_json::json!({
+                "order_id": order_id.to_string(),
+                "idempotency_key": request.idempotency_key,
+                "gateway_customer_id": gateway_customer_id,
+            }),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            release_payment_attempt(&state.db, attempt_id).await;
+            return Err(error);
+        }
+    };
+
+    let persisted = persist_payment_outcome(
+        &state,
+        &order,
+        &request.gateway_id,
+        DirectPaymentOutcome::from_initiate(&response),
+    )
+    .await;
+    if persisted.is_ok() {
+        release_payment_attempt(&state.db, attempt_id).await;
+    } else {
+        warn!(
+            "Retaining payment attempt {} after the gateway returned an outcome that could not be persisted",
+            attempt_id
+        );
+    }
+    persisted?;
     Ok(Json(response))
 }
 
@@ -180,47 +284,34 @@ pub struct CompletePaymentActionApiRequest {
 
 pub async fn complete_payment_action(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
     Json(request): Json<CompletePaymentActionApiRequest>,
 ) -> Result<Json<CompletePaymentActionResponse>, Error> {
-    // Get the gateway - we need to determine which gateway this payment belongs to
-    // For now, we'll use the default gateway from the payment service
-    // In production, you'd look up the payment in the database to find the gateway
+    let (payment, order) = authorized_payment(&state.db, &payment_id, &auth).await?;
+    let gateway_payment_id = payment
+        .gateway_payment_id
+        .clone()
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
     let gateway = state
         .payment_service
-        .get_gateway(None)
-        .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
-
-    // Build the complete action request
-    let complete_request = CompletePaymentActionRequest {
-        payment_id: payment_id.clone(),
-        action_type: request.action_type,
-        action_data: request.action_data,
-    };
-
-    // Complete the payment action
-    let response = gateway.complete_payment_action(complete_request).await?;
-
-    // Log the result
-    match &response {
-        CompletePaymentActionResponse::Success { payment_id, .. } => {
-            info!("Payment action completed successfully: {}", payment_id);
-        }
-        CompletePaymentActionResponse::RequiresAction { payment_id, .. } => {
-            info!("Payment still requires action: {}", payment_id);
-        }
-        CompletePaymentActionResponse::Failed {
-            payment_id,
-            error_message,
-            ..
-        } => {
-            warn!(
-                "Payment action failed: {}, error: {}",
-                payment_id, error_message
-            );
-        }
+        .get_gateway(Some(&payment.gateway))
+        .ok_or_else(|| Error::payment_error("Stored payment gateway is not configured"))?;
+    let response = gateway
+        .complete_payment_action(CompletePaymentActionRequest {
+            payment_id: gateway_payment_id.clone(),
+            action_type: request.action_type,
+            action_data: request.action_data,
+        })
+        .await?;
+    let outcome = DirectPaymentOutcome::from_complete(&response);
+    if outcome.payment_id != gateway_payment_id {
+        return Err(Error::payment_error(
+            "Gateway returned a different payment identifier",
+        ));
     }
 
+    persist_payment_outcome(&state, &order, &payment.gateway, outcome).await?;
     Ok(Json(response))
 }
 
@@ -251,75 +342,362 @@ struct PaymentRow {
     updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Look up a stored payment by the gateway's payment/transaction id
 async fn find_payment_by_gateway_id(
     db: &rcommerce_core::repository::Database,
+    gateway_id: &str,
     gateway_payment_id: &str,
 ) -> Result<Option<PaymentRow>, Error> {
-    let row = sqlx::query_as::<_, PaymentRow>(
+    let rows = sqlx::query_as::<_, PaymentRow>(
+        r#"
+        SELECT id, order_id, amount, currency::text AS currency, gateway,
+               gateway_payment_id, status::text AS status, created_at, updated_at
+        FROM payments
+        WHERE gateway = $1 AND gateway_payment_id = $2
+        ORDER BY created_at DESC
+        LIMIT 2
+        "#,
+    )
+    .bind(gateway_id)
+    .bind(gateway_payment_id)
+    .fetch_all(db.pool())
+    .await?;
+    if rows.len() > 1 {
+        return Err(Error::payment_error(
+            "Multiple local payments match the gateway payment identifier",
+        ));
+    }
+
+    Ok(rows.into_iter().next())
+}
+
+async fn find_payment_for_api(
+    db: &rcommerce_core::repository::Database,
+    payment_reference: &str,
+) -> Result<Option<PaymentRow>, Error> {
+    if let Ok(id) = Uuid::parse_str(payment_reference) {
+        return sqlx::query_as::<_, PaymentRow>(
+            r#"
+            SELECT id, order_id, amount, currency::text AS currency, gateway,
+                   gateway_payment_id, status::text AS status, created_at, updated_at
+            FROM payments WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(Into::into);
+    }
+    if let Some((gateway_id, gateway_payment_id)) = payment_reference.split_once(':') {
+        if !gateway_id.is_empty() && !gateway_payment_id.is_empty() {
+            return find_payment_by_gateway_id(db, gateway_id, gateway_payment_id).await;
+        }
+    }
+
+    let rows = sqlx::query_as::<_, PaymentRow>(
         r#"
         SELECT id, order_id, amount, currency::text AS currency, gateway,
                gateway_payment_id, status::text AS status, created_at, updated_at
         FROM payments
         WHERE gateway_payment_id = $1
         ORDER BY created_at DESC
-        LIMIT 1
+        LIMIT 2
         "#,
     )
-    .bind(gateway_payment_id)
-    .fetch_optional(db.pool())
+    .bind(payment_reference)
+    .fetch_all(db.pool())
     .await?;
+    if rows.len() > 1 {
+        return Err(Error::payment_error(
+            "Payment identifier is ambiguous; use <gateway>:<payment_id> or the local payment UUID",
+        ));
+    }
+    Ok(rows.into_iter().next())
+}
 
-    Ok(row)
+async fn authorized_payment(
+    db: &rcommerce_core::repository::Database,
+    payment_id: &str,
+    auth: &JwtAuth,
+) -> Result<(PaymentRow, OrderAuthority), Error> {
+    let payment = find_payment_for_api(db, payment_id)
+        .await?
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
+    let order = authoritative_order(db, payment.order_id, auth).await?;
+    Ok((payment, order))
+}
+
+struct DirectPaymentOutcome {
+    payment_id: String,
+    status: PaymentStatus,
+    payment_method: Option<PaymentMethodInfo>,
+    error_message: Option<String>,
+}
+
+impl DirectPaymentOutcome {
+    fn from_initiate(response: &InitiatePaymentResponse) -> Self {
+        match response {
+            InitiatePaymentResponse::Success {
+                payment_id,
+                payment_status,
+                payment_method,
+                ..
+            } => Self {
+                payment_id: payment_id.clone(),
+                status: payment_status.clone(),
+                payment_method: Some(payment_method.clone()),
+                error_message: None,
+            },
+            InitiatePaymentResponse::RequiresAction { payment_id, .. } => Self {
+                payment_id: payment_id.clone(),
+                status: PaymentStatus::RequiresAction,
+                payment_method: None,
+                error_message: None,
+            },
+            InitiatePaymentResponse::Failed {
+                payment_id,
+                error_code,
+                error_message,
+                ..
+            } => Self {
+                payment_id: payment_id.clone(),
+                status: if error_code == "payment_cancelled" {
+                    PaymentStatus::Cancelled
+                } else {
+                    PaymentStatus::Failed
+                },
+                payment_method: None,
+                error_message: Some(error_message.clone()),
+            },
+        }
+    }
+
+    fn from_complete(response: &CompletePaymentActionResponse) -> Self {
+        match response {
+            CompletePaymentActionResponse::Success {
+                payment_id,
+                payment_status,
+                payment_method,
+                ..
+            } => Self {
+                payment_id: payment_id.clone(),
+                status: payment_status.clone(),
+                payment_method: Some(payment_method.clone()),
+                error_message: None,
+            },
+            CompletePaymentActionResponse::RequiresAction { payment_id, .. } => Self {
+                payment_id: payment_id.clone(),
+                status: PaymentStatus::RequiresAction,
+                payment_method: None,
+                error_message: None,
+            },
+            CompletePaymentActionResponse::Failed {
+                payment_id,
+                error_code,
+                error_message,
+                ..
+            } => Self {
+                payment_id: payment_id.clone(),
+                status: if error_code == "payment_cancelled" {
+                    PaymentStatus::Cancelled
+                } else {
+                    PaymentStatus::Failed
+                },
+                payment_method: None,
+                error_message: Some(error_message.clone()),
+            },
+        }
+    }
+
+    fn from_status(payment_id: &str, status: PaymentStatus) -> Self {
+        Self {
+            payment_id: payment_id.to_string(),
+            status,
+            payment_method: None,
+            error_message: None,
+        }
+    }
+}
+
+fn payment_status_for_db(status: &PaymentStatus) -> &'static str {
+    match status {
+        PaymentStatus::Pending | PaymentStatus::Processing | PaymentStatus::RequiresAction => {
+            "pending"
+        }
+        PaymentStatus::Succeeded => "paid",
+        PaymentStatus::Failed => "failed",
+        PaymentStatus::Cancelled => "cancelled",
+        PaymentStatus::Refunded => "refunded",
+        PaymentStatus::PartiallyRefunded => "paid",
+        PaymentStatus::Disputed => "pending",
+    }
+}
+
+fn payment_method_for_db(method: Option<&PaymentMethodInfo>) -> Option<&'static str> {
+    match method.map(|m| &m.method_type) {
+        Some(PaymentMethodType::Card) => Some("credit_card"),
+        Some(PaymentMethodType::BankTransfer) => Some("bank_transfer"),
+        Some(PaymentMethodType::CashOnDelivery) => Some("cash_on_delivery"),
+        Some(PaymentMethodType::GooglePay | PaymentMethodType::ApplePay) => Some("digital_wallet"),
+        Some(PaymentMethodType::Crypto) => Some("cryptocurrency"),
+        _ => None,
+    }
+}
+
+const PAYMENT_ROW_RETURNING: &str = "id, order_id, amount, currency::text AS currency, gateway, gateway_payment_id, status::text AS status, created_at, updated_at";
+
+async fn cancel_pending_order_for_payment(state: &AppState, order_id: Uuid) -> Result<(), Error> {
+    let cancellable = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM orders WHERE id = $1 AND status = 'pending' \
+         AND payment_status NOT IN ('paid', 'refunded')",
+    )
+    .bind(order_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    if cancellable.is_some() {
+        state
+            .order_service
+            .cancel_order(order_id, "Payment cancelled by payment gateway".to_string())
+            .await?;
+        sqlx::query(
+            "UPDATE orders SET payment_status = 'cancelled', updated_at = NOW() \
+             WHERE id = $1 AND status = 'cancelled' AND payment_status NOT IN ('paid', 'refunded')",
+        )
+        .bind(order_id)
+        .execute(state.db.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn persist_payment_outcome(
+    state: &AppState,
+    order: &OrderAuthority,
+    gateway_id: &str,
+    outcome: DirectPaymentOutcome,
+) -> Result<PaymentRow, Error> {
+    let status = payment_status_for_db(&outcome.status);
+    let method = outcome.payment_method.as_ref();
+    let method_type = payment_method_for_db(method);
+    let last_four = method.and_then(|m| m.last_four.as_deref());
+    let card_brand = method.and_then(|m| m.card_brand.as_deref());
+    let existing = find_payment_by_gateway_id(&state.db, gateway_id, &outcome.payment_id).await?;
+    let payment = match existing {
+        Some(existing) => {
+            if existing.order_id != order.id {
+                return Err(Error::payment_error(
+                    "Gateway payment identifier is already bound to another order",
+                ));
+            }
+            let update_sql = format!(
+                "UPDATE payments SET amount = $1, currency = UPPER($2)::currency, \
+                 status = CASE \
+                       WHEN payments.status = 'refunded' THEN payments.status \
+                       WHEN payments.status = 'paid' AND $3 NOT IN ('paid', 'refunded') \
+                       THEN payments.status ELSE $3::payment_status END, \
+                 payment_method = COALESCE($4::payment_method_type, payment_method), \
+                 card_last_four = COALESCE($5, card_last_four), card_brand = COALESCE($6, card_brand), \
+                 error_message = $7, \
+                 processed_at = CASE WHEN $3 = 'paid' THEN COALESCE(processed_at, NOW()) ELSE processed_at END, \
+                 updated_at = NOW() \
+                 WHERE id = $8 AND order_id = $9 RETURNING {PAYMENT_ROW_RETURNING}"
+            );
+            sqlx::query_as::<_, PaymentRow>(&update_sql)
+                .bind(order.total)
+                .bind(&order.currency)
+                .bind(status)
+                .bind(method_type)
+                .bind(last_four)
+                .bind(card_brand)
+                .bind(&outcome.error_message)
+                .bind(existing.id)
+                .bind(order.id)
+                .fetch_one(state.db.pool())
+                .await?
+        }
+        None => {
+            let insert_sql = format!(
+                "INSERT INTO payments (order_id, amount, currency, status, gateway, gateway_payment_id, \
+                 payment_method, card_last_four, card_brand, error_message, processed_at, test) \
+                 VALUES ($1, $2, UPPER($3)::currency, $4::payment_status, $5, $6, \
+                 $7::payment_method_type, $8, $9, $10, \
+                 CASE WHEN $4 = 'paid' THEN NOW() ELSE NULL END, \
+                 (SELECT test FROM orders WHERE id = $1)) RETURNING {PAYMENT_ROW_RETURNING}"
+            );
+            sqlx::query_as::<_, PaymentRow>(&insert_sql)
+                .bind(order.id)
+                .bind(order.total)
+                .bind(&order.currency)
+                .bind(status)
+                .bind(gateway_id)
+                .bind(&outcome.payment_id)
+                .bind(method_type)
+                .bind(last_four)
+                .bind(card_brand)
+                .bind(&outcome.error_message)
+                .fetch_one(state.db.pool())
+                .await?
+        }
+    };
+
+    if payment.status == "paid" {
+        state
+            .order_service
+            .confirm_order_after_payment(order.id)
+            .await?;
+    } else if payment.status == "cancelled" {
+        cancel_pending_order_for_payment(state, order.id).await?;
+    } else {
+        let order_payment_status = match payment.status.as_str() {
+            "failed" => "failed",
+            "refunded" => "refunded",
+            _ => "pending",
+        };
+        sqlx::query(
+            "UPDATE orders SET payment_status = $1::payment_status, updated_at = NOW() \
+             WHERE id = $2 AND status = 'pending' AND payment_status <> 'paid'",
+        )
+        .bind(order_payment_status)
+        .bind(order.id)
+        .execute(state.db.pool())
+        .await?;
+    }
+
+    Ok(payment)
 }
 
 /// Get payment status
 pub async fn get_payment_status(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
 ) -> Result<Json<PaymentStatusResponse>, Error> {
-    // Get the gateway
+    let (payment, order) = authorized_payment(&state.db, &payment_id, &auth).await?;
+    let gateway_payment_id = payment
+        .gateway_payment_id
+        .clone()
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
     let gateway = state
         .payment_service
-        .get_gateway(None)
-        .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
-
-    // Get payment status from gateway
-    let status = gateway.get_payment_status(&payment_id).await?;
-
-    // Enrich the response with the stored payment record when available
-    let payment_row = find_payment_by_gateway_id(&state.db, &payment_id).await?;
-
-    info!("Retrieved payment status for {}: {:?}", payment_id, status);
-
-    let (amount, currency, gateway_id, transaction_id, created_at, updated_at) = match payment_row {
-        Some(row) => (
-            row.amount.to_string(),
-            row.currency,
-            row.gateway,
-            row.gateway_payment_id,
-            row.created_at.to_rfc3339(),
-            row.updated_at.map(|t| t.to_rfc3339()),
-        ),
-        None => (
-            String::new(),
-            String::new(),
-            String::new(),
-            Some(payment_id.clone()),
-            chrono::Utc::now().to_rfc3339(),
-            None,
-        ),
-    };
+        .get_gateway(Some(&payment.gateway))
+        .ok_or_else(|| Error::payment_error("Stored payment gateway is not configured"))?;
+    let status = gateway.get_payment_status(&gateway_payment_id).await?;
+    let payment = persist_payment_outcome(
+        &state,
+        &order,
+        &payment.gateway,
+        DirectPaymentOutcome::from_status(&gateway_payment_id, status.clone()),
+    )
+    .await?;
 
     Ok(Json(PaymentStatusResponse {
-        payment_id: payment_id.clone(),
+        payment_id: gateway_payment_id,
         status,
-        amount,
-        currency,
-        gateway_id,
-        transaction_id,
-        created_at,
-        updated_at,
+        amount: payment.amount.to_string(),
+        currency: payment.currency,
+        gateway_id: payment.gateway,
+        transaction_id: payment.gateway_payment_id,
+        created_at: payment.created_at.to_rfc3339(),
+        updated_at: payment.updated_at.map(|t| t.to_rfc3339()),
     }))
 }
 
@@ -332,74 +710,72 @@ pub struct RefundRequest {
 
 pub async fn refund_payment(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(payment_id): Path<String>,
     Json(request): Json<RefundRequest>,
 ) -> Result<Json<RefundResponse>, Error> {
-    // Parse amount if provided
-    let amount = match request.amount {
-        Some(amt_str) => {
-            let amt = amt_str
-                .parse::<rust_decimal::Decimal>()
-                .map_err(|_| Error::validation("Invalid amount format"))?;
-            Some(amt)
-        }
-        None => None,
-    };
-
-    // Get the gateway
+    if !auth.is_admin() {
+        return Err(Error::forbidden("Admin access required for refunds"));
+    }
+    let payment = find_payment_for_api(&state.db, &payment_id)
+        .await?
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
+    let gateway_payment_id = payment
+        .gateway_payment_id
+        .clone()
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
+    let amount = request
+        .amount
+        .as_deref()
+        .map(|amount| {
+            amount
+                .parse::<Decimal>()
+                .map_err(|_| Error::validation("Invalid amount format"))
+        })
+        .transpose()?;
+    if amount.is_some_and(|amount| amount <= Decimal::ZERO) {
+        return Err(Error::validation("Refund amount must be positive"));
+    }
     let gateway = state
         .payment_service
-        .get_gateway(None)
-        .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
-
-    // Process the refund
+        .get_gateway(Some(&payment.gateway))
+        .ok_or_else(|| Error::payment_error("Stored payment gateway is not configured"))?;
     let response = gateway
-        .refund_payment(&payment_id, amount, &request.reason)
+        .refund_payment(&gateway_payment_id, amount, &request.reason)
         .await?;
-
-    // Persist a refunds row for the accounting export (idempotent on the
-    // gateway refund id; the webhook finalizes status/settled_at later).
-    // A refund whose payment we never recorded locally can't be linked — skip.
-    match find_payment_by_gateway_id(&state.db, &response.payment_id)
-        .await?
-        .or(find_payment_by_gateway_id(&state.db, &payment_id).await?)
-    {
-        Some(payment) => {
-            if let Err(e) = record_refund_row(
-                &state.db,
-                &payment,
-                response.amount,
-                &response.currency,
-                Some(&response.reason),
-                refund_status_for_db(&response.status),
-                &response.refund_id,
-                None,
-            )
-            .await
-            {
-                // The refund itself succeeded; a failed bookkeeping insert must
-                // not turn the API call into an error.
-                tracing::warn!(
-                    "Refund {} succeeded but recording the refunds row failed: {}",
-                    response.refund_id,
-                    e
-                );
-            }
-        }
-        None => {
-            tracing::warn!(
-                "Refund {} (payment {}) has no local payments row; refunds record skipped",
-                response.refund_id,
-                payment_id
-            );
-        }
+    if response.payment_id != gateway_payment_id {
+        return Err(Error::payment_error(
+            "Gateway returned a refund for a different payment",
+        ));
     }
+    if !response.currency.eq_ignore_ascii_case(&payment.currency) {
+        return Err(Error::payment_error(
+            "Gateway returned a refund in a different currency",
+        ));
+    }
+    if response.amount < Decimal::ZERO {
+        return Err(Error::payment_error(
+            "Gateway returned a negative refund amount",
+        ));
+    }
+
+    let settled_at = (response.status == RefundStatus::Succeeded).then_some(response.created_at);
+    reconcile_refund(
+        &state,
+        &payment,
+        response.amount,
+        &response.currency,
+        Some(&response.reason),
+        refund_status_for_db(&response.status),
+        &response.refund_id,
+        settled_at,
+    )
+    .await?;
 
     info!(
         "Refund processed for payment {}: refund_id={}, status={:?}",
-        payment_id, response.refund_id, response.status
+        gateway_payment_id, response.refund_id, response.status
     );
-
     Ok(Json(response))
 }
 
@@ -415,28 +791,26 @@ fn refund_status_for_db(status: &rcommerce_core::payment::agnostic::RefundStatus
     }
 }
 
-/// Insert a refunds row unless one with the same gateway_refund_id exists.
-/// `settled_at` is Some for already-settled refunds (webhook path) and None
-/// for async refunds whose settlement the webhook will record later.
 async fn record_refund_row(
-    db: &rcommerce_core::repository::Database,
+    connection: &mut sqlx::PgConnection,
     payment: &PaymentRow,
-    amount: rust_decimal::Decimal,
+    amount: Decimal,
     currency: &str,
     reason: Option<&str>,
     status: &str,
     gateway_refund_id: &str,
     settled_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> rcommerce_core::Result<u64> {
-    let result = sqlx::query(
-        r#"
-        INSERT INTO refunds (id, payment_id, order_id, amount, currency, reason, status,
-                             gateway_refund_id, settled_at, created_at, updated_at)
-        SELECT $1, $2, $3, $4, UPPER($5)::currency, $6, $7::payment_status, $8, $9, NOW(), NOW()
-        WHERE NOT EXISTS (SELECT 1 FROM refunds WHERE gateway_refund_id = $8)
-        "#,
+) -> rcommerce_core::Result<()> {
+    let updated = sqlx::query(
+        "UPDATE refunds SET amount = $4, currency = UPPER($5)::currency, \
+         reason = COALESCE($6, reason), \
+         status = CASE WHEN refunds.status = 'refunded' THEN refunds.status ELSE $7::payment_status END, \
+         settled_at = CASE WHEN $7 = 'refunded' THEN COALESCE(refunds.settled_at, $9, NOW()) \
+                           ELSE refunds.settled_at END, \
+         updated_at = NOW() \
+         WHERE payment_id = $2 AND gateway_refund_id = $8",
     )
-    .bind(uuid::Uuid::new_v4())
+    .bind(Uuid::new_v4())
     .bind(payment.id)
     .bind(payment.order_id)
     .bind(amount)
@@ -445,10 +819,119 @@ async fn record_refund_row(
     .bind(status)
     .bind(gateway_refund_id)
     .bind(settled_at)
-    .execute(db.pool())
+    .execute(&mut *connection)
     .await?;
+    if updated.rows_affected() > 0 {
+        return Ok(());
+    }
 
-    Ok(result.rows_affected())
+    sqlx::query(
+        r#"
+        INSERT INTO refunds (id, payment_id, order_id, amount, currency, reason, status,
+                             gateway_refund_id, settled_at, created_at, updated_at)
+        SELECT $1, $2, $3, $4, UPPER($5)::currency, $6, $7::payment_status, $8,
+               CASE WHEN $7 = 'refunded' THEN COALESCE($9, NOW()) ELSE NULL END, NOW(), NOW()
+        WHERE NOT EXISTS (
+            SELECT 1 FROM refunds WHERE payment_id = $2 AND gateway_refund_id = $8
+        )
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(payment.id)
+    .bind(payment.order_id)
+    .bind(amount)
+    .bind(currency)
+    .bind(reason)
+    .bind(status)
+    .bind(gateway_refund_id)
+    .bind(settled_at)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+async fn reconcile_refund(
+    state: &AppState,
+    payment: &PaymentRow,
+    amount: Decimal,
+    currency: &str,
+    reason: Option<&str>,
+    status: &str,
+    gateway_refund_id: &str,
+    settled_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), Error> {
+    if amount < Decimal::ZERO {
+        return Err(Error::payment_error("Refund amount cannot be negative"));
+    }
+    let mut transaction = state.db.pool().begin().await?;
+    let payment_sql =
+        format!("SELECT {PAYMENT_ROW_RETURNING} FROM payments WHERE id = $1 FOR UPDATE");
+    let locked = sqlx::query_as::<_, PaymentRow>(&payment_sql)
+        .bind(payment.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| Error::not_found("Payment not found"))?;
+    if locked.order_id != payment.order_id || locked.gateway != payment.gateway {
+        return Err(Error::payment_error(
+            "Payment binding changed during refund",
+        ));
+    }
+    if !matches!(locked.status.as_str(), "paid" | "refunded") {
+        return Err(Error::validation("Payment is not in a refundable state"));
+    }
+    if !currency.eq_ignore_ascii_case(&locked.currency) {
+        return Err(Error::payment_error(
+            "Refund currency does not match the payment currency",
+        ));
+    }
+
+    record_refund_row(
+        &mut transaction,
+        &locked,
+        amount,
+        currency,
+        reason,
+        status,
+        gateway_refund_id,
+        settled_at,
+    )
+    .await?;
+    let settled: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount), 0) FROM refunds \
+         WHERE payment_id = $1 AND status = 'refunded'",
+    )
+    .bind(locked.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let fully_refunded = settled > Decimal::ZERO && settled >= locked.amount;
+    sqlx::query(
+        "UPDATE payments SET status = CASE WHEN $2 THEN 'refunded'::payment_status \
+                                           ELSE 'paid'::payment_status END, \
+         updated_at = NOW() WHERE id = $1",
+    )
+    .bind(locked.id)
+    .bind(fully_refunded)
+    .execute(&mut *transaction)
+    .await?;
+    if !fully_refunded && settled > Decimal::ZERO {
+        sqlx::query(
+            "UPDATE orders SET payment_status = 'paid', updated_at = NOW() \
+             WHERE id = $1 AND status NOT IN ('refunded', 'cancelled') \
+             AND payment_status = 'refunded'",
+        )
+        .bind(locked.order_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+
+    if fully_refunded {
+        state
+            .order_service
+            .reconcile_order_refund(locked.order_id)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Extract amount/currency from a refund webhook payload when the gateway
@@ -479,47 +962,316 @@ pub struct SavePaymentMethodRequest {
     pub payment_method_data: PaymentMethodData,
 }
 
+fn saved_method_token_hash(_gateway_id: &str, token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SavedMethodOwnership {
+    id: Uuid,
+    customer_id: Uuid,
+    gateway: String,
+}
+
+async fn require_saved_method_owner(
+    db: &rcommerce_core::repository::Database,
+    customer_id: Uuid,
+    gateway_id: &str,
+    token: &str,
+) -> Result<(), Error> {
+    let owned = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM saved_payment_methods \
+         WHERE customer_id = $1 AND gateway = $2 AND token_hash = $3)",
+    )
+    .bind(customer_id)
+    .bind(gateway_id)
+    .bind(saved_method_token_hash(gateway_id, token))
+    .fetch_one(db.pool())
+    .await?;
+    if !owned {
+        return Err(Error::not_found("Saved payment method not found"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GatewayCustomerContact {
+    email: String,
+    first_name: String,
+    last_name: String,
+    airwallex_customer_id: Option<String>,
+}
+
+async fn gateway_customer_contact(
+    db: &rcommerce_core::repository::Database,
+    customer_id: Uuid,
+) -> Result<GatewayCustomerContact, Error> {
+    sqlx::query_as::<_, GatewayCustomerContact>(
+        "SELECT email, COALESCE(first_name, '') AS first_name, \
+         COALESCE(last_name, '') AS last_name, airwallex_customer_id FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| Error::not_found("Customer not found"))
+}
+
+fn validate_provider_customer_id(
+    customer_id: Uuid,
+    provider_customer_id: &str,
+) -> Result<(), Error> {
+    if provider_customer_id.is_empty()
+        || Uuid::parse_str(provider_customer_id).is_ok_and(|id| id == customer_id)
+    {
+        return Err(Error::payment_error(
+            "Gateway returned an invalid customer identifier",
+        ));
+    }
+    Ok(())
+}
+
+async fn store_gateway_customer_mapping(
+    db: &rcommerce_core::repository::Database,
+    customer_id: Uuid,
+    gateway_id: &str,
+    provider_customer_id: &str,
+    legacy_airwallex_id: Option<&str>,
+) -> Result<String, Error> {
+    validate_provider_customer_id(customer_id, provider_customer_id)?;
+    if gateway_id == "airwallex"
+        && legacy_airwallex_id.is_some_and(|legacy| legacy != provider_customer_id)
+    {
+        return Err(Error::payment_error(
+            "Conflicting Airwallex customer mappings",
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO payment_gateway_customers (customer_id, gateway, gateway_customer_id) \
+         VALUES ($1, $2, $3) ON CONFLICT (customer_id, gateway) DO NOTHING",
+    )
+    .bind(customer_id)
+    .bind(gateway_id)
+    .bind(provider_customer_id)
+    .execute(db.pool())
+    .await?;
+    let stored = sqlx::query_scalar::<_, String>(
+        "SELECT gateway_customer_id FROM payment_gateway_customers \
+         WHERE customer_id = $1 AND gateway = $2",
+    )
+    .bind(customer_id)
+    .bind(gateway_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| {
+        Error::payment_error("Gateway customer is already mapped to another customer")
+    })?;
+    if stored != provider_customer_id {
+        return Err(Error::payment_error(
+            "Conflicting gateway customer mappings",
+        ));
+    }
+
+    if gateway_id == "airwallex" {
+        sqlx::query(
+            "UPDATE customers SET airwallex_customer_id = $1, updated_at = NOW() \
+             WHERE id = $2 AND airwallex_customer_id IS NULL",
+        )
+        .bind(provider_customer_id)
+        .bind(customer_id)
+        .execute(db.pool())
+        .await?;
+    }
+    Ok(stored)
+}
+
+async fn existing_gateway_customer_id(
+    db: &rcommerce_core::repository::Database,
+    customer_id: Uuid,
+    gateway_id: &str,
+    contact: &GatewayCustomerContact,
+) -> Result<Option<String>, Error> {
+    let mapped = sqlx::query_scalar::<_, String>(
+        "SELECT gateway_customer_id FROM payment_gateway_customers \
+         WHERE customer_id = $1 AND gateway = $2",
+    )
+    .bind(customer_id)
+    .bind(gateway_id)
+    .fetch_optional(db.pool())
+    .await?;
+    if let Some(mapped) = mapped.as_deref() {
+        validate_provider_customer_id(customer_id, mapped)?;
+    }
+    let legacy = (gateway_id == "airwallex")
+        .then_some(contact.airwallex_customer_id.as_deref())
+        .flatten()
+        .filter(|id| !id.is_empty());
+    if let Some(legacy) = legacy {
+        validate_provider_customer_id(customer_id, legacy)?;
+    }
+    match (mapped, legacy) {
+        (Some(mapped), Some(legacy)) if mapped != legacy => Err(Error::payment_error(
+            "Conflicting Airwallex customer mappings",
+        )),
+        (Some(mapped), _) => Ok(Some(mapped)),
+        (None, Some(legacy)) => {
+            store_gateway_customer_mapping(db, customer_id, gateway_id, legacy, Some(legacy))
+                .await
+                .map(Some)
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn saved_method_type(method_type: &PaymentMethodType) -> &'static str {
+    match method_type {
+        PaymentMethodType::Card => "card",
+        PaymentMethodType::GooglePay => "google_pay",
+        PaymentMethodType::ApplePay => "apple_pay",
+        PaymentMethodType::Alipay => "alipay",
+        PaymentMethodType::WechatPay => "wechat_pay",
+        PaymentMethodType::PayPal => "paypal",
+        PaymentMethodType::BankTransfer => "bank_transfer",
+        PaymentMethodType::BuyNowPayLater => "buy_now_pay_later",
+        PaymentMethodType::Crypto => "crypto",
+        PaymentMethodType::CashOnDelivery => "cash_on_delivery",
+    }
+}
+
 pub async fn save_payment_method(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Json(request): Json<SavePaymentMethodRequest>,
 ) -> Result<Json<PaymentMethodToken>, Error> {
-    // Get the gateway
+    let contact = gateway_customer_contact(&state.db, auth.customer_id).await?;
+    let provider_customer_id = match existing_gateway_customer_id(
+        &state.db,
+        auth.customer_id,
+        &request.gateway_id,
+        &contact,
+    )
+    .await?
+    {
+        Some(id) => id,
+        None => {
+            let gateway = state
+                .payment_service
+                .get_gateway(Some(&request.gateway_id))
+                .ok_or_else(|| {
+                    Error::validation(format!("Gateway '{}' not found", request.gateway_id))
+                })?;
+            let name = format!("{} {}", contact.first_name, contact.last_name);
+            let provider_customer_id = gateway.create_customer(&contact.email, name.trim()).await?;
+            store_gateway_customer_mapping(
+                &state.db,
+                auth.customer_id,
+                &request.gateway_id,
+                &provider_customer_id,
+                contact.airwallex_customer_id.as_deref(),
+            )
+            .await?
+        }
+    };
     let gateway = state
         .payment_service
         .get_gateway(Some(&request.gateway_id))
         .ok_or_else(|| Error::validation(format!("Gateway '{}' not found", request.gateway_id)))?;
-
-    // Tokenize the payment method
     let token = gateway
-        .tokenize_payment_method(request.payment_method_data)
+        .tokenize_payment_method_for_customer(&provider_customer_id, request.payment_method_data)
         .await?;
+    let method = &token.payment_method;
+    let token_hash = saved_method_token_hash(&request.gateway_id, &token.token);
+    let insert_result = sqlx::query(
+        "INSERT INTO saved_payment_methods (customer_id, gateway, token_hash, method_type, \
+         card_last_four, card_brand, exp_month, exp_year, cardholder_name, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(auth.customer_id)
+    .bind(&request.gateway_id)
+    .bind(&token_hash)
+    .bind(saved_method_type(&method.method_type))
+    .bind(&method.last_four)
+    .bind(&method.card_brand)
+    .bind(&method.exp_month)
+    .bind(&method.exp_year)
+    .bind(&method.cardholder_name)
+    .bind(token.expires_at)
+    .execute(state.db.pool())
+    .await;
+    if let Err(error) = insert_result {
+        let already_registered = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM saved_payment_methods WHERE token_hash = $1)",
+        )
+        .bind(&token_hash)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or(true);
+        if !already_registered {
+            if let Err(cleanup_error) = gateway.delete_payment_method(&token.token).await {
+                warn!(
+                    "Failed to disable an unattached provider payment method after a database error: {}",
+                    cleanup_error
+                );
+            }
+        } else {
+            return Err(Error::forbidden("Payment method is already registered"));
+        }
+        return Err(error.into());
+    }
 
-    info!("Payment method tokenized: {}", token.token);
-
+    info!(
+        "Saved a payment method for customer {} using {}",
+        auth.customer_id, request.gateway_id
+    );
     Ok(Json(token))
 }
 
 /// Get saved payment methods for a customer
 pub async fn get_saved_payment_methods(
     State(state): State<AppState>,
-    Path(customer_id): Path<String>,
+    Extension(auth): Extension<JwtAuth>,
+    Path(customer_id): Path<Uuid>,
 ) -> Result<Json<Vec<PaymentMethodInfo>>, Error> {
-    // Get the default gateway
-    let gateway = state
-        .payment_service
-        .get_gateway(None)
-        .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
-
-    // Get saved payment methods
-    let methods = gateway.get_saved_payment_methods(&customer_id).await?;
-
-    info!(
-        "Retrieved {} saved payment methods for customer {}",
-        methods.len(),
-        customer_id
-    );
-
-    Ok(Json(methods))
+    if !auth.is_admin() && auth.customer_id != customer_id {
+        return Err(Error::not_found("Customer not found"));
+    }
+    let contact = gateway_customer_contact(&state.db, customer_id).await?;
+    let gateway_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT gateway FROM saved_payment_methods WHERE customer_id = $1 ORDER BY gateway",
+    )
+    .bind(customer_id)
+    .fetch_all(state.db.pool())
+    .await?;
+    let mut owned_methods = Vec::new();
+    for gateway_id in gateway_ids {
+        let token_hashes = sqlx::query_scalar::<_, String>(
+            "SELECT token_hash FROM saved_payment_methods WHERE customer_id = $1 AND gateway = $2",
+        )
+        .bind(customer_id)
+        .bind(&gateway_id)
+        .fetch_all(state.db.pool())
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let Some(provider_customer_id) =
+            existing_gateway_customer_id(&state.db, customer_id, &gateway_id, &contact).await?
+        else {
+            continue;
+        };
+        let gateway = state
+            .payment_service
+            .get_gateway(Some(&gateway_id))
+            .ok_or_else(|| Error::payment_error("Stored payment gateway is not configured"))?;
+        let methods = gateway
+            .get_saved_payment_methods(&provider_customer_id)
+            .await?;
+        owned_methods.extend(methods.into_iter().filter(|method| {
+            method.token.as_deref().is_some_and(|token| {
+                token_hashes.contains(&saved_method_token_hash(&gateway_id, token))
+            })
+        }));
+    }
+    Ok(Json(owned_methods))
 }
 
 /// Delete a saved payment method response
@@ -533,19 +1285,38 @@ pub struct DeletePaymentMethodResponse {
 /// Delete a saved payment method
 pub async fn delete_payment_method(
     State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
     Path(token): Path<String>,
 ) -> Result<Json<DeletePaymentMethodResponse>, Error> {
-    // Get the default gateway
+    let method = sqlx::query_as::<_, SavedMethodOwnership>(
+        "SELECT id, customer_id, gateway FROM saved_payment_methods WHERE token_hash = $1",
+    )
+    .bind(saved_method_token_hash("", &token))
+    .fetch_optional(state.db.pool())
+    .await?
+    .ok_or_else(|| Error::not_found("Saved payment method not found"))?;
+    if !auth.is_admin() && method.customer_id != auth.customer_id {
+        return Err(Error::not_found("Saved payment method not found"));
+    }
+
+    let contact = gateway_customer_contact(&state.db, method.customer_id).await?;
+    existing_gateway_customer_id(&state.db, method.customer_id, &method.gateway, &contact)
+        .await?
+        .ok_or_else(|| Error::payment_error("Gateway customer mapping is missing"))?;
     let gateway = state
         .payment_service
-        .get_gateway(None)
-        .ok_or_else(|| Error::payment_error("No payment gateway configured"))?;
-
-    // Delete the payment method
+        .get_gateway(Some(&method.gateway))
+        .ok_or_else(|| Error::payment_error("Stored payment gateway is not configured"))?;
     gateway.delete_payment_method(&token).await?;
+    sqlx::query("DELETE FROM saved_payment_methods WHERE id = $1")
+        .bind(method.id)
+        .execute(state.db.pool())
+        .await?;
 
-    info!("Payment method deleted: {}", token);
-
+    info!(
+        "Deleted a saved payment method for customer {} using {}",
+        method.customer_id, method.gateway
+    );
     Ok(Json(DeletePaymentMethodResponse {
         success: true,
         message: "Payment method deleted successfully".to_string(),
@@ -596,19 +1367,19 @@ pub async fn handle_webhook(
     match webhook_action(&event.event_type) {
         WebhookAction::ConfirmPayment => {
             info!("Payment succeeded: {}", event.payment_id);
-            handle_payment_succeeded(&state, &event).await?;
+            handle_payment_succeeded(&state, &gateway_id, &event).await?;
         }
         WebhookAction::FailPayment => {
             warn!("Payment failed: {}", event.payment_id);
-            handle_payment_failed(&state, &event).await?;
+            handle_payment_failed(&state, &gateway_id, &event).await?;
         }
         WebhookAction::CancelPayment => {
             warn!("Payment cancelled: {}", event.payment_id);
-            handle_payment_cancelled(&state, &event).await?;
+            handle_payment_cancelled(&state, &gateway_id, &event).await?;
         }
         WebhookAction::MarkRefunded => {
             info!("Payment refunded: {}", event.payment_id);
-            handle_payment_refunded(&state, &event).await?;
+            handle_payment_refunded(&state, &gateway_id, &event).await?;
         }
         WebhookAction::ConsentVerified => {
             // Stored-card consent verified at the gateway. Consent status is
@@ -649,7 +1420,9 @@ fn webhook_action(event_type: &WebhookEventType) -> WebhookAction {
         WebhookEventType::PaymentSucceeded => WebhookAction::ConfirmPayment,
         WebhookEventType::PaymentFailed => WebhookAction::FailPayment,
         WebhookEventType::PaymentCancelled => WebhookAction::CancelPayment,
-        WebhookEventType::PaymentRefunded => WebhookAction::MarkRefunded,
+        WebhookEventType::PaymentRefunded | WebhookEventType::PaymentPartiallyRefunded => {
+            WebhookAction::MarkRefunded
+        }
         WebhookEventType::SubscriptionPaymentSucceeded => WebhookAction::Ignore,
         WebhookEventType::SubscriptionPaymentFailed => WebhookAction::Ignore,
         WebhookEventType::SubscriptionCreated => WebhookAction::Ignore,
@@ -662,8 +1435,12 @@ fn webhook_action(event_type: &WebhookEventType) -> WebhookAction {
 /// Handle a successful payment webhook:
 /// mark the payment paid, confirm the order (committing inventory), and send
 /// the order-confirmation email.
-async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Result<(), Error> {
-    let payment = find_payment_by_gateway_id(&state.db, &event.payment_id).await?;
+async fn handle_payment_succeeded(
+    state: &AppState,
+    gateway_id: &str,
+    event: &WebhookEvent,
+) -> Result<(), Error> {
+    let payment = find_payment_by_gateway_id(&state.db, gateway_id, &event.payment_id).await?;
     let Some(payment) = payment else {
         warn!(
             "payment_intent.succeeded for unknown payment {}; nothing to update",
@@ -672,6 +1449,13 @@ async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Res
         return Ok(());
     };
 
+    if payment.status == "refunded" {
+        warn!(
+            "Received succeeded webhook for refunded payment {}; ignoring",
+            event.payment_id
+        );
+        return Ok(());
+    }
     if payment.status == "paid" {
         // The payment row is updated before the order is confirmed, so a
         // previous attempt may have recorded the payment but failed to
@@ -682,12 +1466,20 @@ async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Res
             event.payment_id
         );
     } else {
-        sqlx::query(
-            "UPDATE payments SET status = 'paid', processed_at = NOW(), updated_at = NOW() WHERE id = $1",
+        let updated = sqlx::query(
+            "UPDATE payments SET status = 'paid', processed_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND status <> 'refunded'",
         )
         .bind(payment.id)
         .execute(state.db.pool())
         .await?;
+        if updated.rows_affected() == 0 {
+            warn!(
+                "Succeeded webhook arrived after payment {} was refunded; ignoring",
+                event.payment_id
+            );
+            return Ok(());
+        }
     }
 
     // Confirm the order if it is still awaiting payment. Orders already
@@ -701,10 +1493,13 @@ async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Res
 
     match order_status.as_deref() {
         Some("pending") => {
-            let detail = state
+            let (detail, transitioned) = state
                 .order_service
-                .confirm_order_after_payment(payment.order_id)
+                .confirm_order_after_payment_transition(payment.order_id)
                 .await?;
+            if !transitioned {
+                return Ok(());
+            }
 
             // A paid subscription-initial order starts the subscription.
             super::checkout::finalize_subscription_for_order(state, payment.order_id).await;
@@ -753,8 +1548,12 @@ async fn handle_payment_succeeded(state: &AppState, event: &WebhookEvent) -> Res
 
 /// Handle a failed payment webhook: mark the payment failed and put the
 /// order's payment status back to failed while it stays pending.
-async fn handle_payment_failed(state: &AppState, event: &WebhookEvent) -> Result<(), Error> {
-    let payment = find_payment_by_gateway_id(&state.db, &event.payment_id).await?;
+async fn handle_payment_failed(
+    state: &AppState,
+    gateway_id: &str,
+    event: &WebhookEvent,
+) -> Result<(), Error> {
+    let payment = find_payment_by_gateway_id(&state.db, gateway_id, &event.payment_id).await?;
     let Some(payment) = payment else {
         warn!(
             "payment_intent.failed for unknown payment {}; nothing to update",
@@ -763,18 +1562,28 @@ async fn handle_payment_failed(state: &AppState, event: &WebhookEvent) -> Result
         return Ok(());
     };
 
-    if payment.status == "paid" {
+    if matches!(payment.status.as_str(), "paid" | "refunded") {
         warn!(
-            "Received failed webhook for already-paid payment {}; ignoring",
+            "Received failed webhook for terminal payment {}; ignoring",
             event.payment_id
         );
         return Ok(());
     }
 
-    sqlx::query("UPDATE payments SET status = 'failed', updated_at = NOW() WHERE id = $1")
-        .bind(payment.id)
-        .execute(state.db.pool())
-        .await?;
+    let updated = sqlx::query(
+        "UPDATE payments SET status = 'failed', updated_at = NOW() \
+         WHERE id = $1 AND status NOT IN ('paid', 'refunded')",
+    )
+    .bind(payment.id)
+    .execute(state.db.pool())
+    .await?;
+    if updated.rows_affected() == 0 {
+        warn!(
+            "Failed webhook arrived after payment {} reached a terminal state; ignoring",
+            event.payment_id
+        );
+        return Ok(());
+    }
 
     // Only touch orders still awaiting payment; a failed webhook must never
     // roll back an order that was already confirmed.
@@ -832,8 +1641,12 @@ async fn handle_payment_failed(state: &AppState, event: &WebhookEvent) -> Result
 
 /// Handle a cancelled payment webhook: mark the payment cancelled and cancel
 /// the order through the order service so inventory reservations are released.
-async fn handle_payment_cancelled(state: &AppState, event: &WebhookEvent) -> Result<(), Error> {
-    let payment = find_payment_by_gateway_id(&state.db, &event.payment_id).await?;
+async fn handle_payment_cancelled(
+    state: &AppState,
+    gateway_id: &str,
+    event: &WebhookEvent,
+) -> Result<(), Error> {
+    let payment = find_payment_by_gateway_id(&state.db, gateway_id, &event.payment_id).await?;
     let Some(payment) = payment else {
         warn!(
             "payment_intent.cancelled for unknown payment {}; nothing to update",
@@ -842,48 +1655,49 @@ async fn handle_payment_cancelled(state: &AppState, event: &WebhookEvent) -> Res
         return Ok(());
     };
 
-    if payment.status == "paid" {
+    if matches!(payment.status.as_str(), "paid" | "refunded") {
         warn!(
-            "Received cancelled webhook for already-paid payment {}; ignoring",
+            "Received cancelled webhook for terminal payment {}; ignoring",
             event.payment_id
         );
         return Ok(());
     }
 
-    sqlx::query("UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1")
-        .bind(payment.id)
-        .execute(state.db.pool())
-        .await?;
-
-    let order_status: Option<String> =
-        sqlx::query_scalar("SELECT status::text FROM orders WHERE id = $1")
-            .bind(payment.order_id)
-            .fetch_optional(state.db.pool())
-            .await?;
-
-    if order_status.as_deref() == Some("pending") {
-        state
-            .order_service
-            .cancel_order(
-                payment.order_id,
-                "Payment cancelled by payment gateway".to_string(),
-            )
-            .await?;
+    let updated = sqlx::query(
+        "UPDATE payments SET status = 'cancelled', updated_at = NOW() \
+         WHERE id = $1 AND status NOT IN ('paid', 'refunded')",
+    )
+    .bind(payment.id)
+    .execute(state.db.pool())
+    .await?;
+    if updated.rows_affected() == 0 {
+        warn!(
+            "Cancelled webhook arrived after payment {} reached a terminal state; ignoring",
+            event.payment_id
+        );
+        return Ok(());
     }
+
+    cancel_pending_order_for_payment(state, payment.order_id).await?;
 
     Ok(())
 }
 
-/// Handle a refund webhook: mark the payment refunded and the matching refund
-/// record completed.
-async fn handle_payment_refunded(state: &AppState, event: &WebhookEvent) -> Result<(), Error> {
-    // For refund events `payment_id` is the refund object id and
-    // `transaction_id` is the payment intent id our payments row was keyed by.
+async fn handle_payment_refunded(
+    state: &AppState,
+    gateway_id: &str,
+    event: &WebhookEvent,
+) -> Result<(), Error> {
     let payment = match event.transaction_id.as_deref() {
-        Some(tid) => find_payment_by_gateway_id(&state.db, tid).await?,
+        Some(transaction_id) => {
+            find_payment_by_gateway_id(&state.db, gateway_id, transaction_id).await?
+        }
         None => None,
-    }
-    .or(find_payment_by_gateway_id(&state.db, &event.payment_id).await?);
+    };
+    let payment = match payment {
+        Some(payment) => Some(payment),
+        None => find_payment_by_gateway_id(&state.db, gateway_id, &event.payment_id).await?,
+    };
 
     let Some(payment) = payment else {
         warn!(
@@ -894,54 +1708,33 @@ async fn handle_payment_refunded(state: &AppState, event: &WebhookEvent) -> Resu
         return Ok(());
     };
 
-    sqlx::query("UPDATE payments SET status = 'refunded', updated_at = NOW() WHERE id = $1")
-        .bind(payment.id)
-        .execute(state.db.pool())
-        .await?;
-
-    // Finalize the matching refund record when present. An AWX refund webhook
-    // means the refund has settled: mark it refunded and stamp settled_at.
-    let updated = sqlx::query(
-        "UPDATE refunds SET status = 'refunded', settled_at = COALESCE(settled_at, NOW()), \
-         updated_at = NOW() WHERE gateway_refund_id = $1",
+    let refund_id = event
+        .data
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&event.payment_id);
+    let existing = sqlx::query_as::<_, (Decimal, String)>(
+        "SELECT amount, currency::text FROM refunds \
+         WHERE payment_id = $1 AND gateway_refund_id = $2",
     )
-    .bind(&event.payment_id)
-    .execute(state.db.pool())
+    .bind(payment.id)
+    .bind(refund_id)
+    .fetch_optional(state.db.pool())
     .await?;
-
-    // Refund created outside rcommerce (e.g. Airwallex dashboard): no row yet,
-    // so create one now, pulling amount/currency from the payload when present
-    // and falling back to the original payment.
-    if updated.rows_affected() == 0 {
-        let (amount, currency) = refund_amount_currency_from_payload(&event.data)
-            .unwrap_or((payment.amount, payment.currency.clone()));
-        if let Err(e) = record_refund_row(
-            &state.db,
-            &payment,
-            amount,
-            &currency,
-            None,
-            "refunded",
-            &event.payment_id,
-            Some(chrono::Utc::now()),
-        )
-        .await
-        {
-            tracing::warn!(
-                "refund webhook for {}: recording the refunds row failed: {}",
-                event.payment_id,
-                e
-            );
-        }
-    }
-
-    sqlx::query(
-        "UPDATE orders SET payment_status = 'refunded', updated_at = NOW() WHERE id = $1 AND payment_status = 'paid'",
+    let (amount, currency) = refund_amount_currency_from_payload(&event.data)
+        .or(existing)
+        .unwrap_or((payment.amount, payment.currency.clone()));
+    reconcile_refund(
+        state,
+        &payment,
+        amount,
+        &currency,
+        None,
+        "refunded",
+        refund_id,
+        Some(event.timestamp),
     )
-    .bind(payment.order_id)
-    .execute(state.db.pool())
     .await?;
-
     Ok(())
 }
 
@@ -1266,12 +2059,15 @@ mod tests {
             webhook_action(&PaymentRefunded),
             WebhookAction::MarkRefunded
         );
+        assert_eq!(
+            webhook_action(&PaymentPartiallyRefunded),
+            WebhookAction::MarkRefunded
+        );
 
         // Everything else is logged and ignored
         for event in [
             PaymentPending,
             PaymentProcessing,
-            PaymentPartiallyRefunded,
             DisputeCreated,
             DisputeResolved,
             SubscriptionCreated,
@@ -1325,5 +2121,127 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn payment_cancelled_error_maps_to_cancelled_outcomes() {
+        let initiated = InitiatePaymentResponse::Failed {
+            payment_id: "intent_cancelled".to_string(),
+            error_code: "payment_cancelled".to_string(),
+            error_message: "Payment cancelled".to_string(),
+            retry_allowed: false,
+        };
+        assert_eq!(
+            DirectPaymentOutcome::from_initiate(&initiated).status,
+            PaymentStatus::Cancelled
+        );
+        let completed = CompletePaymentActionResponse::Failed {
+            payment_id: "intent_cancelled".to_string(),
+            error_code: "payment_cancelled".to_string(),
+            error_message: "Payment cancelled".to_string(),
+            retry_allowed: false,
+        };
+        assert_eq!(
+            DirectPaymentOutcome::from_complete(&completed).status,
+            PaymentStatus::Cancelled
+        );
+        let failed = InitiatePaymentResponse::Failed {
+            payment_id: "intent_failed".to_string(),
+            error_code: "card_declined".to_string(),
+            error_message: "Card declined".to_string(),
+            retry_allowed: true,
+        };
+        assert_eq!(
+            DirectPaymentOutcome::from_initiate(&failed).status,
+            PaymentStatus::Failed
+        );
+    }
+
+    #[test]
+    fn direct_payment_statuses_map_to_paid_only_on_success() {
+        for status in [
+            PaymentStatus::Pending,
+            PaymentStatus::Processing,
+            PaymentStatus::RequiresAction,
+        ] {
+            assert_eq!(payment_status_for_db(&status), "pending");
+        }
+        assert_eq!(payment_status_for_db(&PaymentStatus::Succeeded), "paid");
+        assert_eq!(payment_status_for_db(&PaymentStatus::Failed), "failed");
+        assert_eq!(
+            payment_status_for_db(&PaymentStatus::PartiallyRefunded),
+            "paid"
+        );
+        assert_eq!(payment_status_for_db(&PaymentStatus::Refunded), "refunded");
+    }
+
+    #[test]
+    fn saved_method_hashes_and_provider_ids_are_safe() {
+        let owner = Uuid::new_v4();
+        let first = saved_method_token_hash("airwallex", "provider_token");
+        let second = saved_method_token_hash("stripe", "provider_token");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("provider_token"));
+        assert!(validate_provider_customer_id(owner, &owner.to_string()).is_err());
+        assert!(validate_provider_customer_id(owner, "").is_err());
+        assert!(validate_provider_customer_id(owner, "cus_provider").is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires PostgreSQL TEST_DATABASE_URL"]
+    async fn airwallex_customer_mapping_backfills_without_breaking_legacy_consents() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        rcommerce_core::Migrator::new(pool.clone())
+            .migrate()
+            .await
+            .unwrap();
+        let db = rcommerce_core::repository::Database::new(pool.clone());
+        let legacy_customer = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO customers (id, email, airwallex_customer_id) VALUES ($1, $2, 'cus_legacy')",
+        )
+        .bind(legacy_customer)
+        .bind(format!("legacy-{legacy_customer}@example.com"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let contact = gateway_customer_contact(&db, legacy_customer)
+            .await
+            .unwrap();
+        let resolved = existing_gateway_customer_id(&db, legacy_customer, "airwallex", &contact)
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("cus_legacy"));
+        let legacy: String =
+            sqlx::query_scalar("SELECT airwallex_customer_id FROM customers WHERE id = $1")
+                .bind(legacy_customer)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy, "cus_legacy");
+
+        let new_customer = Uuid::new_v4();
+        sqlx::query("INSERT INTO customers (id, email) VALUES ($1, $2)")
+            .bind(new_customer)
+            .bind(format!("new-{new_customer}@example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        store_gateway_customer_mapping(&db, new_customer, "airwallex", "cus_new", None)
+            .await
+            .unwrap();
+        let legacy: String =
+            sqlx::query_scalar("SELECT airwallex_customer_id FROM customers WHERE id = $1")
+                .bind(new_customer)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy, "cus_new");
     }
 }

@@ -16,6 +16,22 @@ use rcommerce_core::{
     services::{Action, AuthService, Resource, ScopeChecker},
 };
 
+/// Client IP recorded on the API key's `last_used` audit column.
+///
+/// Prefers the `ClientIp` extension inserted by the trusted-proxy-aware
+/// client-IP middleware. Without it, falls back to the raw TCP peer — never
+/// to a forwarding header, which a client can forge at will.
+fn audit_client_ip(request: &Request<Body>) -> Option<String> {
+    use axum::extract::ConnectInfo;
+    if let Some(client_ip) = request.extensions().get::<crate::middleware::ClientIp>() {
+        return Some(client_ip.ip().to_string());
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+}
+
 /// API key authentication result
 #[derive(Debug, Clone)]
 pub struct ApiKeyAuth {
@@ -104,13 +120,8 @@ pub async fn api_key_auth_middleware(
         }
     };
 
-    // Get client IP for logging
-    let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string());
+    // Get client IP for the audit trail
+    let client_ip = audit_client_ip(&request);
 
     // Update last used timestamp (fire and forget)
     let repo_clone = repo.clone();
@@ -231,13 +242,8 @@ pub async fn combined_auth_middleware(
 
         match repo.verify_key(&api_key).await {
             Ok(Some(record)) => {
-                // Get client IP for logging
-                let client_ip = request
-                    .headers()
-                    .get("x-forwarded-for")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.split(',').next())
-                    .map(|s| s.trim().to_string());
+                // Get client IP for the audit trail
+                let client_ip = audit_client_ip(&request);
 
                 // Update last used timestamp (fire and forget)
                 let repo_clone = repo.clone();

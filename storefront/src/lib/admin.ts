@@ -82,12 +82,23 @@ export interface AdminOrderListItem {
   created_at: string;
 }
 
+export interface AdminFulfillment {
+  id: string;
+  status: string;
+  tracking_number: string | null;
+  tracking_url: string | null;
+  tracking_company: string | null;
+  shipped_at: string | null;
+  created_at: string;
+}
+
 export interface AdminOrderDetail extends AdminOrderListItem {
   items: AdminOrderItem[];
   payments: AdminPayment[];
   billing_address: AdminAddress | null;
   shipping_address: AdminAddress | null;
   notes?: string | null;
+  fulfillments?: AdminFulfillment[];
 }
 
 // Statuses accepted by PUT /orders/:id/status (crates/rcommerce-api/src/routes/order.rs)

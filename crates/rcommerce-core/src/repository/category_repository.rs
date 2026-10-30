@@ -417,7 +417,7 @@ mod tests {
                 return None;
             }
         };
-        if let Err(e) = crate::Migrator::new(pool.clone()).migrate().await {
+        if let Err(e) = crate::ensure_test_migrations(&pool).await {
             eprintln!("Skipping DB test: migration failed: {e}");
             return None;
         }

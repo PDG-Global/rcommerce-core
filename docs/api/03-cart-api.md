@@ -1,12 +1,12 @@
 # Cart API Documentation
 
-The Cart API provides a complete shopping cart system that supports both guest users (via session tokens) and authenticated customers. Carts persist for 30 days by default and can be seamlessly merged when a guest user logs in.
+The Cart API provides a complete shopping cart system that supports guest users and authenticated customers. Carts persist for 30 days by default and can be merged when a guest user logs in.
 
 > **Status:** ✅ Fully Implemented with CartService Integration
 
 ## Overview
 
-- **Guest Carts**: Identified by session token, no authentication required
+- **Guest Carts**: Accessed by an unguessable cart UUID; the separate session token supports merging after login
 - **Customer Carts**: Tied to authenticated customer accounts via JWT
 - **Cart Merging**: Automatic merging when guest logs in
 - **Database Persistence**: All carts stored in PostgreSQL via CartService
@@ -22,14 +22,20 @@ The Cart API provides a complete shopping cart system that supports both guest u
 
 | Endpoint | Authentication |
 |----------|---------------|
-| `POST /carts/guest` | None (creates session token) |
-| `GET /carts/:id` | None (cart ID is the identifier) |
+| `POST /carts/guest` | None |
+| `/carts/:id` and its item/coupon subroutes | Optional JWT for guests; matching customer JWT required for customer-owned carts |
 | `GET /carts/me` | Required (JWT Bearer token) |
-| All other endpoints | Required (JWT Bearer token) |
+| `POST /carts/merge` | Required (JWT Bearer token) |
+
+Treat a guest cart UUID as a bearer capability. For a customer-owned cart,
+**every** read, mutation, coupon, and checkout operation requires a JWT whose
+customer ID matches the cart owner. A missing or foreign token returns `404`,
+just like an unknown cart. The storefront sends the JWT when a customer session
+exists and otherwise uses guest access.
 
 ### Using JWT Authentication
 
-Protected endpoints require a valid JWT token in the Authorization header:
+Customer endpoints and customer-owned carts use the Authorization header:
 
 ```http
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
@@ -44,6 +50,9 @@ pub struct JwtAuth {
     pub permissions: Vec<String>, // Extracted from JWT permissions
 }
 ```
+
+Authorization headers in the examples below are required for customer-owned
+carts and can be omitted for guest carts.
 
 ## Endpoints
 
@@ -87,7 +96,7 @@ Content-Type: application/json
 }
 ```
 
-**Important:** Store the `session_token` in localStorage or cookies for subsequent requests.
+**Important:** Store the cart `id` for guest cart/checkout requests and the `session_token` for merging after login.
 
 **Implementation Details:**
 - Generates a session token: `sess_<uuid>`
@@ -368,15 +377,26 @@ Authorization: Bearer <jwt_token>
 
 ## Cart Calculations
 
-The cart automatically calculates totals:
+The cart automatically calculates totals, excluding bundle component lines
+from the merchandise subtotal so they are not charged twice:
 
 ```
-subtotal = sum(item.quantity * item.unit_price)
-discount_total = sum(item.discount_amount) + cart-level discount
-tax_total = calculated based on shipping address (via TaxService)
-shipping_total = calculated based on shipping method (via ShippingService)
+subtotal = sum(non-component item.quantity * item.unit_price)
+discount_total = allocated coupon discount
+tax_total = calculated at checkout based on shipping address (via TaxService)
+shipping_total = calculated at checkout based on shipping method (via ShippingService)
 total = subtotal - discount_total + tax_total + shipping_total
 ```
+
+### Stock and Mutation Consistency
+
+Stock validation includes the quantity already in the cart plus the requested
+increment, including bundle component requirements. PostgreSQL mutations lock
+the cart and its items, serializing concurrent changes per cart, and repeat the
+stock check inside the transaction. Bundle parent/child metadata is preserved;
+children are changed or removed through their parent. Recalculation is limited
+to stored line quantities/subtotals, discount allocations, and cart totals and
+does not reprice unchanged products.
 
 ## Error Codes
 

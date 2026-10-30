@@ -65,6 +65,7 @@ async fn run_http_server(config: Config) -> Result<()> {
     let app_state = create_app_state(&config).await?;
     spawn_abandoned_order_sweeper(&config, &app_state);
     spawn_subscription_billing_loop(&config, &app_state);
+    spawn_state_cleanup(&app_state);
 
     // Build router
     let app = build_router(app_state, None, &config.server.cors, &config.rate_limiting);
@@ -72,14 +73,18 @@ async fn run_http_server(config: Config) -> Result<()> {
     info!("R Commerce API server listening on http://{}", addr);
     log_routes(&config);
 
-    // Start server
+    // Start server. Peer addresses feed the trusted-proxy-aware client IP
+    // resolution used by the limiters and the API-key audit trail.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| rcommerce_core::Error::Network(e.to_string()))?;
 
     Ok(())
 }
@@ -122,6 +127,7 @@ async fn run_tls_server(config: Config) -> Result<()> {
     let app_state = create_app_state(&config).await?;
     spawn_abandoned_order_sweeper(&config, &app_state);
     spawn_subscription_billing_loop(&config, &app_state);
+    spawn_state_cleanup(&app_state);
 
     // Build main API router (HTTPS)
     let api_app = build_router(
@@ -204,7 +210,7 @@ async fn start_manual_tls_server(
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             error!("HTTPS server error: {}", e);
@@ -274,7 +280,7 @@ async fn start_lets_encrypt_server(
     let handle = tokio::spawn(async move {
         if let Err(e) = axum_server::bind(addr)
             .acceptor(acceptor)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             error!("HTTPS server error: {}", e);
@@ -343,8 +349,241 @@ async fn handle_http_redirect(
     )
 }
 
+#[derive(Default, Clone)]
+struct PaymentCredentials {
+    stripe_secret_key: Option<String>,
+    stripe_webhook_secret: Option<String>,
+    airwallex_client_id: Option<String>,
+    airwallex_api_key: Option<String>,
+    airwallex_webhook_secret: Option<String>,
+}
+
+impl PaymentCredentials {
+    fn resolve(config: &Config) -> Self {
+        fn present(value: Option<String>) -> Option<String> {
+            value.filter(|value| !value.trim().is_empty())
+        }
+
+        Self {
+            stripe_secret_key: present(
+                config
+                    .payment
+                    .stripe
+                    .secret_key
+                    .clone()
+                    .or_else(|| std::env::var("STRIPE_API_KEY").ok()),
+            ),
+            stripe_webhook_secret: present(
+                config
+                    .payment
+                    .stripe
+                    .webhook_secret
+                    .clone()
+                    .or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").ok()),
+            ),
+            airwallex_client_id: present(
+                config
+                    .payment
+                    .airwallex
+                    .client_id
+                    .clone()
+                    .or_else(|| std::env::var("AIRWALLEX_CLIENT_ID").ok()),
+            ),
+            airwallex_api_key: present(
+                config
+                    .payment
+                    .airwallex
+                    .api_key
+                    .clone()
+                    .or_else(|| std::env::var("AIRWALLEX_API_KEY").ok()),
+            ),
+            airwallex_webhook_secret: present(
+                config
+                    .payment
+                    .airwallex
+                    .webhook_secret
+                    .clone()
+                    .or_else(|| std::env::var("AIRWALLEX_WEBHOOK_SECRET").ok()),
+            ),
+        }
+    }
+}
+
+fn required_webhook_secret(
+    gateway: &str,
+    secret: &Option<String>,
+    config_key: &str,
+    env_var: &str,
+) -> Result<String> {
+    secret
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            rcommerce_core::Error::Config(format!(
+                "{} is enabled but its webhook secret is missing or empty; set {} or {}",
+                gateway, config_key, env_var
+            ))
+        })
+}
+
+fn stripe_webhook_secret(credentials: &PaymentCredentials) -> Result<String> {
+    required_webhook_secret(
+        "Stripe",
+        &credentials.stripe_webhook_secret,
+        "payment.stripe.webhook_secret",
+        "STRIPE_WEBHOOK_SECRET",
+    )
+}
+
+fn airwallex_webhook_secret(credentials: &PaymentCredentials) -> Result<String> {
+    required_webhook_secret(
+        "Airwallex",
+        &credentials.airwallex_webhook_secret,
+        "payment.airwallex.webhook_secret",
+        "AIRWALLEX_WEBHOOK_SECRET",
+    )
+}
+
+fn validate_enabled_gateway_webhook_secrets(
+    config: &Config,
+    credentials: &PaymentCredentials,
+) -> Result<()> {
+    if config.payment.stripe.enabled {
+        stripe_webhook_secret(credentials)?;
+    }
+    if config.payment.airwallex.enabled {
+        airwallex_webhook_secret(credentials)?;
+    }
+    Ok(())
+}
+
+enum LegacyGatewaySelection {
+    Mock,
+    Stripe {
+        secret_key: String,
+        webhook_secret: String,
+    },
+    Airwallex {
+        client_id: String,
+        api_key: String,
+        webhook_secret: String,
+    },
+}
+
+fn resolve_legacy_gateway(
+    config: &Config,
+    credentials: &PaymentCredentials,
+) -> Result<LegacyGatewaySelection> {
+    match config.payment.default_gateway.as_str() {
+        "mock" if config.payment.test_mode => Ok(LegacyGatewaySelection::Mock),
+        "mock" => Err(rcommerce_core::Error::Config(
+            "The mock payment gateway requires payment.test_mode = true".to_string(),
+        )),
+        "stripe" => {
+            if !config.payment.stripe.enabled {
+                return Err(rcommerce_core::Error::Config(
+                    "Stripe is selected as the default gateway but is not enabled".to_string(),
+                ));
+            }
+            let secret_key = credentials.stripe_secret_key.clone().ok_or_else(|| {
+                rcommerce_core::Error::Config(
+                    "Stripe is selected but STRIPE_API_KEY/secret_key is missing".to_string(),
+                )
+            })?;
+            let webhook_secret = stripe_webhook_secret(credentials)?;
+            Ok(LegacyGatewaySelection::Stripe {
+                secret_key,
+                webhook_secret,
+            })
+        }
+        "airwallex" => {
+            if !config.payment.airwallex.enabled {
+                return Err(rcommerce_core::Error::Config(
+                    "Airwallex is selected as the default gateway but is not enabled".to_string(),
+                ));
+            }
+            let client_id = credentials.airwallex_client_id.clone().ok_or_else(|| {
+                rcommerce_core::Error::Config(
+                    "Airwallex is selected but AIRWALLEX_CLIENT_ID/client_id is missing"
+                        .to_string(),
+                )
+            })?;
+            let api_key = credentials.airwallex_api_key.clone().ok_or_else(|| {
+                rcommerce_core::Error::Config(
+                    "Airwallex is selected but AIRWALLEX_API_KEY/api_key is missing".to_string(),
+                )
+            })?;
+            let webhook_secret = airwallex_webhook_secret(credentials)?;
+            Ok(LegacyGatewaySelection::Airwallex {
+                client_id,
+                api_key,
+                webhook_secret,
+            })
+        }
+        selected => Err(rcommerce_core::Error::Config(format!(
+            "Unsupported checkout gateway '{}'; select mock (test mode), stripe, or airwallex",
+            selected
+        ))),
+    }
+}
+
+fn build_legacy_gateway(
+    selection: &LegacyGatewaySelection,
+) -> Box<dyn rcommerce_core::payment::PaymentGateway> {
+    match selection {
+        LegacyGatewaySelection::Mock => Box::new(MockPaymentGateway::new()),
+        LegacyGatewaySelection::Stripe {
+            secret_key,
+            webhook_secret,
+        } => Box::new(StripeGateway::new(
+            secret_key.clone(),
+            webhook_secret.clone(),
+        )),
+        LegacyGatewaySelection::Airwallex {
+            client_id,
+            api_key,
+            webhook_secret,
+        } => Box::new(AirwallexGateway::new(
+            client_id.clone(),
+            api_key.clone(),
+            webhook_secret.clone(),
+        )),
+    }
+}
+
+fn refund_gateway(
+    gateway: &str,
+    config: &Config,
+    credentials: &PaymentCredentials,
+) -> Option<Arc<dyn rcommerce_core::payment::PaymentGateway>> {
+    match gateway {
+        "mock" if config.payment.test_mode => Some(Arc::new(MockPaymentGateway::new())),
+        "stripe" if config.payment.stripe.enabled => Some(Arc::new(StripeGateway::new(
+            credentials.stripe_secret_key.clone()?,
+            credentials.stripe_webhook_secret.clone()?,
+        ))),
+        "airwallex" if config.payment.airwallex.enabled => Some(Arc::new(AirwallexGateway::new(
+            credentials.airwallex_client_id.clone()?,
+            credentials.airwallex_api_key.clone()?,
+            credentials.airwallex_webhook_secret.clone()?,
+        ))),
+        _ => None,
+    }
+}
+
 /// Create application state
 async fn create_app_state(config: &Config) -> Result<AppState> {
+    let payment_credentials = PaymentCredentials::resolve(config);
+    validate_enabled_gateway_webhook_secrets(config, &payment_credentials)?;
+    let legacy_gateway_selection = resolve_legacy_gateway(config, &payment_credentials)?;
+
+    // Validate the trusted-proxy CIDRs before anything else touches them;
+    // a typo here must fail startup, not silently disable proxy handling.
+    if let Err(e) = config.rate_limiting.trusted_proxy_nets() {
+        return Err(rcommerce_core::Error::Config(e));
+    }
+
     // Initialize database connection
     info!("Connecting to PostgreSQL database...");
     let pool = create_pool(
@@ -384,26 +623,16 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     let default_gateway = config.payment.default_gateway.clone();
     let mut payment_service = PaymentService::new(default_gateway);
 
-    // Register mock gateway for testing/development
-    let mock_gateway = Box::new(MockPaymentGateway::new());
-    payment_service.register_gateway("mock".to_string(), mock_gateway);
-    info!("Mock payment gateway registered");
+    if config.payment.test_mode {
+        let mock_gateway = Box::new(MockPaymentGateway::new());
+        payment_service.register_gateway("mock".to_string(), mock_gateway);
+        warn!("Mock payment gateway enabled (test mode)");
+    }
 
     // Register Stripe gateway if enabled and API key is available
     if config.payment.stripe.enabled {
-        if let Some(stripe_key) = config
-            .payment
-            .stripe
-            .secret_key
-            .clone()
-            .or_else(|| std::env::var("STRIPE_API_KEY").ok())
-        {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
+        if let Some(stripe_key) = payment_credentials.stripe_secret_key.clone() {
+            let webhook_secret = stripe_webhook_secret(&payment_credentials)?;
             let stripe_gateway = Box::new(StripeAgnosticGateway::new(stripe_key, webhook_secret));
             payment_service.register_gateway("stripe".to_string(), stripe_gateway);
             info!("Stripe gateway registered");
@@ -503,54 +732,37 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     }
 
     // Register Airwallex gateway if enabled
-    let airwallex_config: Option<(String, String, String, bool)> =
-        if config.payment.airwallex.enabled {
-            if let (Some(client_id), Some(api_key)) = (
-                config
-                    .payment
-                    .airwallex
-                    .client_id
-                    .clone()
-                    .or_else(|| std::env::var("AIRWALLEX_CLIENT_ID").ok()),
-                config
-                    .payment
-                    .airwallex
-                    .api_key
-                    .clone()
-                    .or_else(|| std::env::var("AIRWALLEX_API_KEY").ok()),
-            ) {
-                let webhook_secret = config
-                    .payment
-                    .airwallex
-                    .webhook_secret
-                    .clone()
-                    .unwrap_or_else(|| {
-                        std::env::var("AIRWALLEX_WEBHOOK_SECRET").unwrap_or_default()
-                    });
-                let airwallex_gateway = Box::new(AirwallexAgnosticGateway::new(
-                    client_id.clone(),
-                    api_key.clone(),
-                    webhook_secret.clone(),
-                    config.payment.airwallex.demo,
-                ));
-                payment_service.register_gateway("airwallex".to_string(), airwallex_gateway);
-                info!(
-                    "Airwallex gateway registered (demo: {})",
-                    config.payment.airwallex.demo
-                );
-                Some((
-                    client_id,
-                    api_key,
-                    webhook_secret,
-                    config.payment.airwallex.demo,
-                ))
-            } else {
-                warn!("Airwallex gateway enabled but configuration incomplete");
-                None
-            }
+    if config.payment.airwallex.enabled {
+        if let (Some(client_id), Some(api_key)) = (
+            payment_credentials.airwallex_client_id.clone(),
+            payment_credentials.airwallex_api_key.clone(),
+        ) {
+            let webhook_secret = airwallex_webhook_secret(&payment_credentials)?;
+            let airwallex_gateway = Box::new(AirwallexAgnosticGateway::new(
+                client_id,
+                api_key,
+                webhook_secret,
+                config.payment.airwallex.demo,
+            ));
+            payment_service.register_gateway("airwallex".to_string(), airwallex_gateway);
+            info!(
+                "Airwallex gateway registered (demo: {})",
+                config.payment.airwallex.demo
+            );
         } else {
-            None
-        };
+            warn!("Airwallex gateway enabled but configuration incomplete");
+        }
+    }
+
+    if payment_service
+        .get_gateway(Some(&config.payment.default_gateway))
+        .is_none()
+    {
+        return Err(rcommerce_core::Error::Config(format!(
+            "Default gateway '{}' is not registered; check its enabled flag and credentials",
+            config.payment.default_gateway
+        )));
+    }
 
     // Initialize Redis (optional)
     let redis = init_redis(config).await;
@@ -568,37 +780,9 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     let inventory_service = InventoryService::new(db.clone(), inventory_config);
     let event_dispatcher = OrderEventDispatcher::new();
 
-    // Resolve legacy payment gateway for order/checkout service
-    let stripe_legacy_config: Option<String> =
-        if config.payment.default_gateway == "stripe" || config.payment.stripe.enabled {
-            config
-                .payment
-                .stripe
-                .secret_key
-                .clone()
-                .or_else(|| std::env::var("STRIPE_API_KEY").ok())
-        } else {
-            None
-        };
-
-    let order_payment_gateway: Box<dyn rcommerce_core::payment::PaymentGateway> =
-        if let Some(stripe_key) = &stripe_legacy_config {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
-            Box::new(StripeGateway::new(stripe_key.clone(), webhook_secret))
-        } else if let Some((client_id, api_key, webhook_secret, _demo)) = &airwallex_config {
-            Box::new(AirwallexGateway::new(
-                client_id.clone(),
-                api_key.clone(),
-                webhook_secret.clone(),
-            ))
-        } else {
-            Box::new(MockPaymentGateway::new())
-        };
+    let order_payment_gateway = build_legacy_gateway(&legacy_gateway_selection);
+    let refund_config = config.clone();
+    let refund_credentials = payment_credentials.clone();
     let order_service = Arc::new(
         OrderService::new(
             db.clone(),
@@ -606,6 +790,9 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
             inventory_service.clone(),
             event_dispatcher,
         )
+        .with_payment_gateway_resolver(Arc::new(move |gateway: &str| {
+            refund_gateway(gateway, &refund_config, &refund_credentials)
+        }))
         .with_store_code(config.accounting.store_code.clone()),
     );
 
@@ -613,7 +800,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     let tax_service = Arc::new(DefaultTaxService::new(db.pool().clone()));
 
     // Initialize shipping provider factory
-    let shipping_factory = Arc::new(ShippingProviderFactory::from_config(&config));
+    let shipping_factory = Arc::new(ShippingProviderFactory::from_config(config));
     info!("Shipping provider factory initialized");
 
     // Wrap cart_service in Arc for checkout service
@@ -637,23 +824,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         ..CheckoutConfig::default()
     };
     let checkout_payment_gateway: Arc<dyn rcommerce_core::payment::PaymentGateway> =
-        if let Some(stripe_key) = &stripe_legacy_config {
-            let webhook_secret = config
-                .payment
-                .stripe
-                .webhook_secret
-                .clone()
-                .unwrap_or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default());
-            Arc::new(StripeGateway::new(stripe_key.clone(), webhook_secret))
-        } else if let Some((client_id, api_key, webhook_secret, _demo)) = &airwallex_config {
-            Arc::new(AirwallexGateway::new(
-                client_id.clone(),
-                api_key.clone(),
-                webhook_secret.clone(),
-            ))
-        } else {
-            Arc::new(MockPaymentGateway::new())
-        };
+        Arc::from(build_legacy_gateway(&legacy_gateway_selection));
     let checkout_service = Arc::new(CheckoutService::with_coupon_service(
         cart_service.clone(),
         tax_service.clone(),
@@ -730,7 +901,7 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
     };
 
     // Create app state
-    Ok(AppState::new(AppStateParams::new(
+    let params = AppStateParams::new(
         product_service,
         customer_service,
         auth_service,
@@ -759,8 +930,9 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         config.accounting.clone(),
         config.default_currency.clone(),
         Some(config.payment.airwallex.clone()),
-    ))
-    .await)
+    )
+    .with_rate_limiting(config.rate_limiting.clone());
+    Ok(AppState::new(params).await)
 }
 
 /// Build CORS layer from configuration
@@ -975,11 +1147,13 @@ fn build_router(
     if rate_limit_config.enabled {
         let limiter = RateLimiter::new(rate_limit_config);
         info!(
-            "Rate limiting enabled: {} requests/minute per IP ({} allowlisted, {} blocklisted)",
+            "Rate limiting enabled: {} requests/minute per IP ({} allowlisted, {} blocklisted, {} trusted proxy CIDRs)",
             limiter.max_requests(),
             rate_limit_config.allowlist.len(),
-            rate_limit_config.blocklist.len()
+            rate_limit_config.blocklist.len(),
+            rate_limit_config.trusted_proxies.len(),
         );
+        schedule_limiter_cleanup(limiter.clone());
         app = app.layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -995,7 +1169,44 @@ fn build_router(
         security_headers_middleware,
     ));
 
+    // Resolve the client IP (trusted-proxy aware) once per request, outermost
+    // so the rate limiter and API-key audit trail can rely on the extension.
+    app = app.layer(middleware::from_fn_with_state(
+        app_state.clone(),
+        crate::middleware::client_ip_middleware,
+    ));
+
     app.with_state(app_state)
+}
+
+/// Periodically drop expired entries from an in-memory limiter. Best effort:
+/// skipped when there is no runtime (e.g. a synchronous test building a
+/// router); the limiters also evict on access, so cleanup is an optimization.
+fn schedule_limiter_cleanup(limiter: RateLimiter) {
+    use std::time::Duration;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                limiter.cleanup().await;
+            }
+        });
+    }
+}
+
+/// Periodically clean the AppState-owned login throttle and auth limiter.
+fn spawn_state_cleanup(app_state: &AppState) {
+    let login_throttle = app_state.login_throttle.clone();
+    let auth_limiter = app_state.auth_rate_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            login_throttle.cleanup();
+            auth_limiter.cleanup().await;
+        }
+    });
 }
 
 /// Log available routes
@@ -1161,13 +1372,23 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::coupon_router())
         .merge(crate::routes::subscription_admin_router())
         .merge(crate::routes::dunning_admin_router())
-        .route_layer(middleware::from_fn_with_state(app_state, admin_middleware));
+        .route_layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            admin_middleware,
+        ));
 
+    // Resolve the client IP once per request (trusted-proxy aware) so
+    // handlers — e.g. login throttling — and middleware can rely on the
+    // ClientIp extension even when this router is served directly (tests).
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .merge(accounting_routes)
         .merge(admin_routes)
+        .route_layer(middleware::from_fn_with_state(
+            app_state,
+            crate::middleware::client_ip_middleware,
+        ))
 }
 
 async fn health_check() -> &'static str {
@@ -1187,9 +1408,125 @@ async fn root() -> axum::Json<serde_json::Value> {
 mod tests {
     use super::*;
 
+    fn real_credentials() -> PaymentCredentials {
+        PaymentCredentials {
+            stripe_secret_key: Some("sk_test_selected".to_string()),
+            stripe_webhook_secret: Some("whsec_test_selected".to_string()),
+            airwallex_client_id: Some("client_selected".to_string()),
+            airwallex_api_key: Some("key_selected".to_string()),
+            airwallex_webhook_secret: Some("airwallex_whsec_test_selected".to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn test_health_check() {
         let response = health_check().await;
         assert_eq!(response, "OK");
+    }
+
+    #[test]
+    fn mock_gateway_requires_explicit_test_mode() {
+        let mut config = Config::default();
+        let credentials = PaymentCredentials::default();
+        assert!(resolve_legacy_gateway(&config, &credentials).is_err());
+
+        config.payment.test_mode = true;
+        assert!(validate_enabled_gateway_webhook_secrets(&config, &credentials).is_ok());
+        assert!(matches!(
+            resolve_legacy_gateway(&config, &credentials),
+            Ok(LegacyGatewaySelection::Mock)
+        ));
+    }
+
+    #[test]
+    fn unsupported_or_disabled_gateway_is_rejected() {
+        let mut config = Config::default();
+        let credentials = PaymentCredentials::default();
+        config.payment.default_gateway = "wechatpay".to_string();
+        assert!(resolve_legacy_gateway(&config, &credentials).is_err());
+
+        config.payment.default_gateway = "airwallex".to_string();
+        assert!(resolve_legacy_gateway(&config, &credentials).is_err());
+
+        config.payment.airwallex.enabled = true;
+        assert!(resolve_legacy_gateway(&config, &credentials).is_err());
+    }
+
+    #[test]
+    fn selected_real_gateway_does_not_fall_back_to_another_provider() {
+        let mut config = Config::default();
+        config.payment.stripe.enabled = true;
+        config.payment.airwallex.enabled = true;
+        let credentials = real_credentials();
+
+        config.payment.default_gateway = "airwallex".to_string();
+        assert!(matches!(
+            resolve_legacy_gateway(&config, &credentials),
+            Ok(LegacyGatewaySelection::Airwallex { .. })
+        ));
+
+        config.payment.default_gateway = "stripe".to_string();
+        assert!(matches!(
+            resolve_legacy_gateway(&config, &credentials),
+            Ok(LegacyGatewaySelection::Stripe { .. })
+        ));
+
+        let without_stripe = PaymentCredentials {
+            stripe_secret_key: None,
+            ..credentials
+        };
+        assert!(resolve_legacy_gateway(&config, &without_stripe).is_err());
+    }
+
+    #[test]
+    fn enabled_nonselected_gateways_require_nonempty_webhook_secrets() {
+        let mut config = Config::default();
+        config.payment.test_mode = true;
+        config.payment.stripe.enabled = true;
+        config.payment.airwallex.enabled = true;
+        let mut credentials = real_credentials();
+        credentials.stripe_webhook_secret = Some("   ".to_string());
+
+        let error = validate_enabled_gateway_webhook_secrets(&config, &credentials).unwrap_err();
+        assert!(error.to_string().contains("payment.stripe.webhook_secret"));
+        assert!(error.to_string().contains("STRIPE_WEBHOOK_SECRET"));
+
+        credentials.stripe_webhook_secret = Some("whsec_test_selected".to_string());
+        credentials.airwallex_webhook_secret = Some(String::new());
+        let error = validate_enabled_gateway_webhook_secrets(&config, &credentials).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("payment.airwallex.webhook_secret"));
+        assert!(error.to_string().contains("AIRWALLEX_WEBHOOK_SECRET"));
+
+        credentials.airwallex_webhook_secret = Some("airwallex_whsec_test_selected".to_string());
+        assert!(validate_enabled_gateway_webhook_secrets(&config, &credentials).is_ok());
+    }
+
+    #[test]
+    fn selected_legacy_gateways_require_webhook_secrets() {
+        let mut config = Config::default();
+        config.payment.stripe.enabled = true;
+        config.payment.default_gateway = "stripe".to_string();
+        let mut credentials = real_credentials();
+        credentials.stripe_webhook_secret = None;
+        let error = resolve_legacy_gateway(&config, &credentials).err().unwrap();
+        assert!(error.to_string().contains("payment.stripe.webhook_secret"));
+
+        config.payment.airwallex.enabled = true;
+        config.payment.default_gateway = "airwallex".to_string();
+        credentials.stripe_webhook_secret = Some("whsec_test_selected".to_string());
+        credentials.airwallex_webhook_secret = Some("  ".to_string());
+        let error = resolve_legacy_gateway(&config, &credentials).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("payment.airwallex.webhook_secret"));
+    }
+
+    #[test]
+    fn payment_defaults_match_toml_defaults() {
+        let config = Config::default();
+        assert_eq!(config.payment.default_gateway, "mock");
+        assert!(!config.payment.test_mode);
     }
 }

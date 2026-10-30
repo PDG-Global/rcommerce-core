@@ -52,6 +52,7 @@ export async function apiFetchJson<T = unknown>(path: string, options?: RequestI
     throw apiErr;
   }
   const jsonText = await res.text();
+  if (!jsonText) return undefined as T;
   try {
     return JSON.parse(jsonText) as T;
   } catch (parseErr) {
@@ -197,4 +198,25 @@ export async function apiFetchAuthenticated<T = unknown>(
     }
     throw e;
   }
+}
+
+export async function apiFetchOptionalAuth<T = unknown>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const token = getAuthToken();
+  if (!token) return apiFetchJson<T>(path, options);
+  const expiry = tokenExpiryMs(token);
+  if (expiry !== null && expiry - Date.now() <= REFRESH_BUFFER_MS) {
+    try {
+      await refreshAccessToken();
+    } catch (error) {
+      clearAuth();
+      if (typeof window !== 'undefined') {
+        window.location.href = '/account/login?redirect=' + encodeURIComponent(window.location.pathname + window.location.search);
+      }
+      throw error;
+    }
+  }
+  return apiFetchAuthenticated<T>(path, options);
 }
