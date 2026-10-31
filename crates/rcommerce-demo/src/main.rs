@@ -56,7 +56,7 @@ struct Cli {
     api_url: String,
 
     /// API Key for service-to-service authentication
-    #[arg(short, long, env = "RCOMMERCE_API_KEY")]
+    #[arg(short = 'k', long, env = "RCOMMERCE_API_KEY")]
     api_key: Option<String>,
 
     /// Configuration file path
