@@ -5,6 +5,7 @@
 use rust_decimal::Decimal;
 use sqlx::Row;
 use uuid::Uuid;
+use validator::Validate;
 
 use crate::{
     models::{
@@ -33,6 +34,7 @@ impl BundleService {
         bundle_product_id: Uuid,
         request: CreateBundleComponentRequest,
     ) -> Result<BundleComponent> {
+        validate_component(&request)?;
         // Verify the bundle product exists and is a bundle type
         let bundle = sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = $1")
             .bind(bundle_product_id)
@@ -101,6 +103,7 @@ impl BundleService {
         component_id: Uuid,
         request: UpdateBundleComponentRequest,
     ) -> Result<BundleComponent> {
+        validate_component(&request)?;
         // Build dynamic update query
         let mut sets = Vec::new();
         let mut param_count = 0;
@@ -152,9 +155,10 @@ impl BundleService {
         query_builder = query_builder.bind(component_id);
         query_builder = query_builder.bind(bundle_product_id);
 
-        let component = query_builder.fetch_one(self.db.pool()).await?;
-
-        Ok(component)
+        query_builder
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| Error::not_found("Component not found"))
     }
 
     /// Remove a component from a bundle
@@ -596,6 +600,13 @@ pub fn derive_bundle_stock(components: &[(i32, i32, bool)], own_stock: i32) -> i
     }
 }
 
+/// Check a component request's declared bounds (quantity at least 1)
+fn validate_component(request: &impl Validate) -> Result<()> {
+    request
+        .validate()
+        .map_err(|e| Error::validation(format!("Invalid bundle component: {}", e)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +653,24 @@ mod tests {
     fn test_derive_bundle_stock_uses_floor_division() {
         let components = vec![(3, 10, true)];
         assert_eq!(derive_bundle_stock(&components, 100), 3);
+    }
+
+    #[test]
+    fn component_requests_need_a_positive_quantity() {
+        let create = |quantity| CreateBundleComponentRequest {
+            component_product_id: Uuid::new_v4(),
+            quantity,
+            is_optional: false,
+            sort_order: 0,
+        };
+        assert!(validate_component(&create(1)).is_ok());
+        assert!(validate_component(&create(0)).is_err());
+        let update = |quantity| UpdateBundleComponentRequest {
+            quantity,
+            is_optional: None,
+            sort_order: None,
+        };
+        assert!(validate_component(&update(None)).is_ok());
+        assert!(validate_component(&update(Some(-2))).is_err());
     }
 }
