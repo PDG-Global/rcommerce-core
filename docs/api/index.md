@@ -20,6 +20,7 @@ R Commerce provides a complete API-first ecommerce platform with:
 | [03-cart-api.md](03-cart-api.md) | Shopping cart API endpoints |
 | [04-coupon-api.md](04-coupon-api.md) | Coupon and discount API |
 | [statistics.md](statistics.md) | Statistics and analytics API |
+| [staff-roles.md](staff-roles.md) | Staff roles: partial admin access for back-office accounts |
 
 ## API Endpoints
 

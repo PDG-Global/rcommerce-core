@@ -56,7 +56,7 @@ pub use services::{
     JwtClaims, OrderService, PaginationInfo, PaginationParams, ProductService, Resource,
     RetryProcessingResult, RetryableInvoice, Scope, ScopeChecker, Service,
 };
-pub use services::{BundleService, DigitalProductService};
+pub use services::{BundleService, DigitalProductService, StaffService};
 pub use traits::Repository;
 // Order types come from the order module (not models), which includes lifecycle, fulfillment, etc.
 pub use order::{

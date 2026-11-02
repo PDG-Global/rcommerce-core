@@ -2181,6 +2181,199 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Call an `/api/v1` route with a bearer token; returns the status and the JSON
+/// body (`Null` when there is none)
+async fn admin_api_call(
+    app: &TestApp,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let mut request = app
+        .http_client
+        .request(method, format!("{}/api/v1{}", app.base_url(), path))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+/// A valid product body with a unique slug
+fn staff_test_product() -> serde_json::Value {
+    serde_json::json!({
+        "title": "Staff Test Product",
+        "slug": format!("staff-test-product-{}", Uuid::new_v4().simple()),
+        "product_type": "Simple",
+        "price": "9.90",
+        "currency": "EUR",
+        "inventory_quantity": 0,
+        "inventory_policy": "Deny",
+        "inventory_management": true,
+        "continues_selling_when_out_of_stock": false,
+        "requires_shipping": true,
+        "is_active": true,
+        "is_featured": false
+    })
+}
+
+/// A staff role opens its admin areas and nothing else, and changes to the role
+/// or its assignment apply to the next request
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_staff_roles_open_only_their_admin_areas() {
+    use reqwest::Method;
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (staff, password) = app.create_test_customer().await.unwrap();
+    let token = app.login(&staff.email, &password).await.unwrap();
+    let roles_path = format!("/admin/staff/members/{}/roles", staff.id);
+
+    // Without a role the account reaches no admin route
+    let (status, _) = admin_api_call(
+        &app,
+        &token,
+        Method::POST,
+        "/products",
+        Some(staff_test_product()),
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    let role = serde_json::json!({"name": "Catalogue", "permissions": ["products:write"]});
+    let (status, body) =
+        admin_api_call(&app, &admin, Method::POST, "/admin/staff/roles", Some(role)).await;
+    assert_eq!(status, 201, "{body}");
+    let role_id = body["role"]["id"].as_str().unwrap().to_string();
+    let assign = serde_json::json!({"role_ids": [role_id]});
+    let (status, body) = admin_api_call(&app, &admin, Method::PUT, &roles_path, Some(assign)).await;
+    assert_eq!(status, 200, "{body}");
+
+    // products:write opens product management, and nothing else
+    let (status, body) = admin_api_call(
+        &app,
+        &token,
+        Method::POST,
+        "/products",
+        Some(staff_test_product()),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    for path in [
+        "/admin/statistics/dashboard",
+        "/admin/api-keys",
+        "/admin/staff/roles",
+        "/coupons",
+    ] {
+        let (status, _) = admin_api_call(&app, &token, Method::GET, path, None).await;
+        assert_eq!(status, 403, "{path}");
+    }
+    let (status, _) = admin_api_call(
+        &app,
+        &token,
+        Method::PUT,
+        &roles_path,
+        Some(serde_json::json!({"role_ids": []})),
+    )
+    .await;
+    assert_eq!(status, 403, "staff cannot change its own roles");
+
+    // Narrowing the role applies at once
+    let narrow = serde_json::json!({"permissions": ["products:read", "coupons:read"]});
+    let (status, body) = admin_api_call(
+        &app,
+        &admin,
+        Method::PUT,
+        &format!("/admin/staff/roles/{role_id}"),
+        Some(narrow),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = admin_api_call(
+        &app,
+        &token,
+        Method::POST,
+        "/products",
+        Some(staff_test_product()),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, body) = admin_api_call(&app, &token, Method::GET, "/coupons", None).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Removing the account's roles closes the admin API again
+    let (status, _) = admin_api_call(
+        &app,
+        &admin,
+        Method::PUT,
+        &roles_path,
+        Some(serde_json::json!({"role_ids": []})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = admin_api_call(&app, &token, Method::GET, "/coupons", None).await;
+    assert_eq!(status, 403);
+
+    app.cleanup().await.ok();
+}
+
+/// Role permissions are limited to `<resource>:read|write`, names are unique, and
+/// unknown roles or accounts are 404
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_staff_role_management_checks_its_input() {
+    use reqwest::Method;
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (member, _) = app.create_test_customer().await.unwrap();
+    let roles = "/admin/staff/roles";
+
+    for bad in ["admin", "read", "products:admin", "nope:read"] {
+        let role = serde_json::json!({"name": "Bad", "permissions": [bad]});
+        let (status, body) = admin_api_call(&app, &admin, Method::POST, roles, Some(role)).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+    let role = serde_json::json!({"name": "Orders", "permissions": ["orders:read"]});
+    let (status, body) =
+        admin_api_call(&app, &admin, Method::POST, roles, Some(role.clone())).await;
+    assert_eq!(status, 201, "{body}");
+    let role_id = body["role"]["id"].as_str().unwrap().to_string();
+    let (status, _) = admin_api_call(&app, &admin, Method::POST, roles, Some(role)).await;
+    assert_eq!(status, 400, "duplicate name");
+
+    let member_roles = format!("/admin/staff/members/{}/roles", member.id);
+    let unknown = serde_json::json!({"role_ids": [Uuid::new_v4()]});
+    let (status, _) = admin_api_call(&app, &admin, Method::PUT, &member_roles, Some(unknown)).await;
+    assert_eq!(status, 404);
+    let assign = serde_json::json!({"role_ids": [role_id]});
+    let nobody = format!("/admin/staff/members/{}/roles", Uuid::new_v4());
+    let (status, _) =
+        admin_api_call(&app, &admin, Method::PUT, &nobody, Some(assign.clone())).await;
+    assert_eq!(status, 404);
+    let (status, _) = admin_api_call(&app, &admin, Method::PUT, &member_roles, Some(assign)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) =
+        admin_api_call(&app, &admin, Method::GET, "/admin/staff/members", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["members"][0]["customer_id"], member.id.to_string());
+    assert_eq!(body["members"][0]["role_ids"][0], role_id);
+
+    // Deleting the role removes its assignments
+    let role_path = format!("{roles}/{role_id}");
+    let (status, _) = admin_api_call(&app, &admin, Method::DELETE, &role_path, None).await;
+    assert_eq!(status, 204);
+    let (status, _) = admin_api_call(&app, &admin, Method::DELETE, &role_path, None).await;
+    assert_eq!(status, 404);
+    let (_, body) = admin_api_call(&app, &admin, Method::GET, "/admin/staff/members", None).await;
+    assert_eq!(body["members"], serde_json::json!([]));
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {

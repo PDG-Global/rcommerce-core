@@ -12,6 +12,7 @@ pub mod newsletter_service;
 pub mod order_service;
 pub mod product_service;
 pub mod review_service;
+pub mod staff_service;
 pub mod statistics_service;
 pub mod subscription_service;
 
@@ -38,6 +39,7 @@ pub use newsletter_service::NewsletterService;
 pub use order_service::OrderService;
 pub use product_service::ProductService;
 pub use review_service::ReviewService;
+pub use staff_service::StaffService;
 pub use statistics_service::{FullDashboardData, SalesReport, StatisticsService};
 pub use subscription_service::{
     next_billing_at, BillingReport, CreateSubscriptionFromOrder, SubscriptionService,

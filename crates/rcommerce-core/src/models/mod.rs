@@ -11,6 +11,7 @@ pub mod newsletter;
 pub mod order;
 pub mod product;
 pub mod review;
+pub mod staff;
 pub mod subscription;
 
 // Re-export common models
@@ -22,6 +23,7 @@ pub use newsletter::*;
 pub use order::*;
 pub use product::*;
 pub use review::*;
+pub use staff::*;
 pub use subscription::*;
 
 /// Common trait for all entities

@@ -17,6 +17,7 @@ use rcommerce_core::models::{
 use rcommerce_core::repository::{CategoryRepository, PostgresCategoryRepository};
 use rcommerce_core::services::product_service::ProductList;
 use rcommerce_core::services::{PaginationInfo, PaginationParams};
+use rcommerce_core::Resource;
 
 /// List products from database
 pub async fn list_products(
@@ -432,15 +433,13 @@ pub async fn get_pack_options(
     Ok(Json(serde_json::json!({ "options": options })))
 }
 
-/// Create a new product (admin only)
+/// Create a new product (admins, and staff with `products:write`)
 pub async fn create_product(
     State(state): State<AppState>,
     Extension(auth): Extension<JwtAuth>,
     Json(request): Json<CreateProductRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), rcommerce_core::Error> {
-    if !auth.is_admin() {
-        return Err(rcommerce_core::Error::unauthorized("Admin access required"));
-    }
+    require_product_write(&auth)?;
 
     let product = state.product_service.create_product(request).await?;
 
@@ -458,16 +457,14 @@ pub async fn create_product(
     ))
 }
 
-/// Update a product (admin only)
+/// Update a product (admins, and staff with `products:write`)
 pub async fn update_product(
     State(state): State<AppState>,
     Extension(auth): Extension<JwtAuth>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateProductRequest>,
 ) -> Result<Json<serde_json::Value>, rcommerce_core::Error> {
-    if !auth.is_admin() {
-        return Err(rcommerce_core::Error::unauthorized("Admin access required"));
-    }
+    require_product_write(&auth)?;
 
     let product = state.product_service.update_product(id, request).await?;
 
@@ -482,19 +479,27 @@ pub async fn update_product(
     })))
 }
 
-/// Delete a product (admin only)
+/// Delete a product (admins, and staff with `products:write`)
 pub async fn delete_product(
     State(state): State<AppState>,
     Extension(auth): Extension<JwtAuth>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, rcommerce_core::Error> {
-    if !auth.is_admin() {
-        return Err(rcommerce_core::Error::unauthorized("Admin access required"));
-    }
+    require_product_write(&auth)?;
 
     state.product_service.delete_product(id).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Product changes need write access to products: global admins have it, and
+/// so does staff whose role grants `products:write`
+fn require_product_write(auth: &JwtAuth) -> Result<(), rcommerce_core::Error> {
+    if auth.can_write(Resource::Products) {
+        Ok(())
+    } else {
+        Err(rcommerce_core::Error::unauthorized("Admin access required"))
+    }
 }
 
 /// Router for public product routes
@@ -620,6 +625,19 @@ mod tests {
         assert!(!product_visible(false, None));
         assert!(!product_visible(false, Some(&customer)));
         assert!(product_visible(false, Some(&admin)));
+    }
+
+    #[test]
+    fn product_changes_need_products_write() {
+        let with = |permissions: &[&str]| JwtAuth {
+            customer_id: uuid::Uuid::new_v4(),
+            email: "s@example.com".to_string(),
+            permissions: permissions.iter().map(|p| p.to_string()).collect(),
+        };
+        assert!(require_product_write(&with(&["read", "write", "admin"])).is_ok());
+        assert!(require_product_write(&with(&["products:write"])).is_ok());
+        assert!(require_product_write(&with(&["products:read", "reports:read"])).is_err());
+        assert!(require_product_write(&with(&[])).is_err());
     }
 
     #[test]
