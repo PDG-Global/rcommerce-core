@@ -4,6 +4,9 @@
 //! - Creating, updating, and deleting webhooks
 //! - Testing webhook deliveries
 //! - Viewing delivery history
+//!
+//! Admin only: mounted behind admin_middleware under `/admin/webhooks`
+//! (`/webhooks/:gateway_id` receives payment provider webhooks).
 
 use axum::{
     extract::{Path, Query, State},
@@ -495,11 +498,14 @@ fn sign_payload(payload: &serde_json::Value, secret: &str) -> String {
 /// Create webhook router
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/webhooks", get(list_webhooks).post(create_webhook))
+        .route("/admin/webhooks", get(list_webhooks).post(create_webhook))
         .route(
-            "/webhooks/:id",
+            "/admin/webhooks/:id",
             get(get_webhook).put(update_webhook).delete(delete_webhook),
         )
-        .route("/webhooks/:id/test", post(test_webhook))
-        .route("/webhooks/:id/deliveries", get(get_webhook_deliveries))
+        .route("/admin/webhooks/:id/test", post(test_webhook))
+        .route(
+            "/admin/webhooks/:id/deliveries",
+            get(get_webhook_deliveries),
+        )
 }
