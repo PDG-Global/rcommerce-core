@@ -56,10 +56,6 @@ pub use statistics::router as statistics_router;
 pub use subscription::{admin_router as subscription_admin_router, router as subscription_router};
 pub use webhook::router as webhook_router;
 
-use crate::state::AppState;
-use axum::{routing::get, Router};
-use tower_http::trace::TraceLayer;
-
 /// WooCommerce-format error response
 pub fn woocommerce_error(status: u16, code: &str, message: &str) -> axum::response::Response {
     let body = serde_json::json!({
@@ -74,59 +70,6 @@ pub fn woocommerce_error(status: u16, code: &str, message: &str) -> axum::respon
             serde_json::to_string(&body).unwrap_or_default(),
         ))
         .unwrap()
-}
-
-/// Create the main API router with all routes
-/// Note: CORS is configured in server.rs, not here, to avoid conflicts
-pub fn create_router(app_state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/", get(api_info))
-        .nest("/api/v1", api_v1_routes())
-        .layer(TraceLayer::new_for_http())
-        .with_state(app_state)
-}
-
-/// API v1 routes
-fn api_v1_routes() -> Router<AppState> {
-    Router::new()
-        .merge(product_router())
-        .merge(customer_router())
-        .merge(order_router())
-        .merge(auth_public_router())
-        .merge(auth_protected_router())
-        // Cart routes split by auth requirement:
-        // Public routes (guest cart, get cart) + Protected routes (modify, merge, coupons)
-        .merge(cart_public_router())
-        .merge(cart_protected_router())
-        .merge(checkout_router())
-        .merge(coupon_router())
-        .merge(payment_router())
-        .merge(subscription_router())
-        .merge(subscription_admin_router())
-        .merge(newsletter_router())
-        .merge(review_public_router())
-        .merge(review_protected_router())
-        .merge(admin_router())
-        .merge(statistics_router())
-        .merge(dunning_router())
-        .merge(dunning_admin_router())
-        .merge(downloads_router())
-        .merge(webhook_router())
-}
-
-/// Health check endpoint
-async fn health_check() -> &'static str {
-    "OK"
-}
-
-/// API info endpoint
-async fn api_info() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "name": "R Commerce API",
-        "version": "1.0.0",
-        "status": "operational"
-    }))
 }
 
 #[cfg(test)]
