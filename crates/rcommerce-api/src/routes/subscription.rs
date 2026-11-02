@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::middleware::JwtAuth;
 use crate::state::AppState;
+use rcommerce_core::db::{job_names, run_exclusive};
 use rcommerce_core::models::{
     CancelSubscriptionRequest, CreateSubscriptionRequest, SubscriptionFilter, SubscriptionStatus,
     UpdateSubscriptionRequest,
@@ -501,18 +502,21 @@ async fn admin_get_summary(
 }
 
 /// Admin: Process due subscriptions (billing run with charging)
+///
+/// 409 while another run (the background loop, another instance or admin) is
+/// in progress, so a subscription is never charged twice for a cycle.
 async fn admin_process_billing(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let Some(gateway) = state.subscription_gateway.clone() else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    match state
+    let run = state
         .subscription_service
-        .process_due_subscriptions_with_charging(&gateway, &state.order_service)
-        .await
-    {
-        Ok(report) => Ok(Json(serde_json::json!({
+        .process_due_subscriptions_with_charging(&gateway, &state.order_service);
+    match run_exclusive(state.db.pool(), job_names::SUBSCRIPTION_BILLING, run).await {
+        Ok(None) => Err(StatusCode::CONFLICT),
+        Ok(Some(report)) => Ok(Json(serde_json::json!({
             "success": true,
             "message": format!(
                 "Processed {} subscriptions: {} charged, {} failed",

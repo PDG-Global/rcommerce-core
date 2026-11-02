@@ -14,6 +14,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::state::AppState;
+use rcommerce_core::db::{job_names, run_exclusive};
 use rcommerce_core::models::DunningConfig;
 use rcommerce_core::DunningService;
 
@@ -27,6 +28,8 @@ pub struct ListRetriesQuery {
 /// Admin: Trigger manual dunning processing
 ///
 /// POST /api/v1/admin/dunning/process
+///
+/// 409 while another run is in progress, so a retry is never charged twice.
 async fn admin_process_dunning(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -40,11 +43,10 @@ async fn admin_process_dunning(
         DunningConfig::default(),
     );
 
-    match dunning_service
-        .process_all_due_retries(gateway.as_ref(), Some(&state.order_service))
-        .await
-    {
-        Ok(result) => Ok(Json(serde_json::json!({
+    let run = dunning_service.process_all_due_retries(gateway.as_ref(), Some(&state.order_service));
+    match run_exclusive(state.db.pool(), job_names::DUNNING_RETRIES, run).await {
+        Ok(None) => Err(StatusCode::CONFLICT),
+        Ok(Some(result)) => Ok(Json(serde_json::json!({
             "success": true,
             "message": format!("Processed {} retries", result.processed),
             "result": {

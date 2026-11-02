@@ -3,6 +3,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use rcommerce_core::db::{job_names, run_exclusive};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -989,21 +990,25 @@ fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
 
 /// Spawn the abandoned-order sweeper when configured
 /// (`[orders] auto_cancel_pending_minutes`). First sweep ~60s after startup,
-/// then every 300s. Silent when disabled.
+/// then every 300s. Silent when disabled. A sweep is skipped while another
+/// instance on the same database runs one, so stock is never released twice.
 fn spawn_abandoned_order_sweeper(config: &Config, app_state: &AppState) {
     let Some(minutes) = config.orders.auto_cancel_pending_minutes else {
         return;
     };
     info!("abandoned-order sweeper enabled ({} min)", minutes);
     let order_service = app_state.order_service.clone();
+    let db = app_state.db.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
-            match order_service.cancel_abandoned_orders(minutes).await {
-                Ok(ids) if !ids.is_empty() => {
+            let sweep = order_service.cancel_abandoned_orders(minutes);
+            match run_exclusive(db.pool(), job_names::ABANDONED_ORDER_SWEEP, sweep).await {
+                Ok(Some(ids)) if !ids.is_empty() => {
                     info!("abandoned-order sweeper cancelled {} order(s)", ids.len())
                 }
-                Ok(_) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => info!("abandoned-order sweep skipped: another instance is running it"),
                 Err(e) => warn!("abandoned-order sweeper run failed: {}", e),
             }
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -1015,7 +1020,9 @@ fn spawn_abandoned_order_sweeper(config: &Config, app_state: &AppState) {
 /// (`[subscriptions] enabled`). First run ~60s after startup, then every
 /// `billing_interval_minutes`. For each due subscription a renewal order is
 /// created and the stored-card consent charged; per-subscription errors are
-/// logged and swallowed so one bad subscription never stops the loop.
+/// logged and swallowed so one bad subscription never stops the loop. A run is
+/// skipped while another one (another instance, or the admin trigger) is in
+/// progress, so a subscription is never charged twice for a cycle.
 fn spawn_subscription_billing_loop(config: &Config, app_state: &AppState) {
     if !config.subscriptions.enabled {
         return;
@@ -1038,11 +1045,11 @@ fn spawn_subscription_billing_loop(config: &Config, app_state: &AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
-            match subscription_service
-                .process_due_subscriptions_with_charging(&gateway, &order_service)
-                .await
-            {
-                Ok(report) => {
+            let run = subscription_service
+                .process_due_subscriptions_with_charging(&gateway, &order_service);
+            match run_exclusive(db.pool(), job_names::SUBSCRIPTION_BILLING, run).await {
+                Ok(None) => info!("subscription billing skipped: another run is in progress"),
+                Ok(Some(report)) => {
                     if report.processed > 0 {
                         info!(
                             "subscription billing: {} processed, {} charged, {} failed",
