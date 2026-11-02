@@ -826,8 +826,36 @@ impl OrderService {
         Ok(cancelled)
     }
 
-    /// Cancel an order
+    /// Cancel an order: release its stock, refund or void its payment, and
+    /// mark it canceled
+    ///
+    /// Cancellations of one order (customer, payment gateway, abandoned-order
+    /// sweep) never overlap: a call made while another is in progress fails
+    /// validation at once, and one made after it finds the order canceled, so
+    /// the stock is released and the payment refunded once. The guard is a
+    /// transaction-level advisory lock on its own connection, taken without
+    /// waiting (a waiting call would hold a pooled connection the running one
+    /// may need), and not a row lock, since the cancellation itself updates the
+    /// order through the pool.
     pub async fn cancel_order(&self, order_id: Uuid, reason: String) -> Result<Order> {
+        let mut guard = self.db.pool().begin().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1))")
+            .bind(format!("rcommerce:cancel_order:{}", order_id))
+            .fetch_one(&mut *guard)
+            .await?;
+        if !acquired {
+            return Err(Error::validation(
+                "A cancellation of this order is already in progress",
+            ));
+        }
+        let result = self.cancel_order_locked(order_id, reason).await;
+        // Nothing was written through this transaction; ending it frees the lock
+        guard.rollback().await?;
+        result
+    }
+
+    /// The cancellation itself; callers hold the order's cancel lock
+    async fn cancel_order_locked(&self, order_id: Uuid, reason: String) -> Result<Order> {
         // Get order
         let order = self
             .get_order(order_id)

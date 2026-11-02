@@ -2128,6 +2128,59 @@ async fn test_confirm_checkout_cart_mismatch_returns_404() {
     app.cleanup().await.ok();
 }
 
+/// Concurrent cancellations of one order: exactly one succeeds, the others are
+/// refused (before, each could release its stock and refund it)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_concurrent_cancellations_cancel_an_order_once() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let token = app.login(&customer.email, &password).await.unwrap();
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_id, customer_email, status, payment_status, fulfillment_status, subtotal, total) VALUES ($1, $2, $3, $4, 'pending', 'pending', 'pending', 60, 60)",
+    )
+    .bind(order_id)
+    .bind(format!("TEST-CANCEL-{order_id}"))
+    .bind(customer.id)
+    .bind(&customer.email)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+
+    let url = format!("{}/api/v1/orders/{}/cancel", app.base_url(), order_id);
+    let requests: Vec<_> = (0..5)
+        .map(|_| {
+            let (client, url, token) = (app.http_client.clone(), url.clone(), token.clone());
+            tokio::spawn(async move {
+                let response = client
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({"reason": "changed my mind"}))
+                    .send()
+                    .await
+                    .unwrap();
+                response.status().as_u16()
+            })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.unwrap());
+    }
+    statuses.sort_unstable();
+    assert_eq!(statuses, vec![200, 400, 400, 400, 400], "{statuses:?}");
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(&app.db_pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "cancelled");
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
