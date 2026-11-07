@@ -194,6 +194,42 @@ impl CartService {
         Ok(weights)
     }
 
+    /// Get selected variant weights for cart items (variant_id -> weight in kg)
+    pub async fn get_variant_weights(
+        &self,
+        variant_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Decimal>> {
+        use std::collections::HashMap;
+
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::internal("Database not available"))?;
+        let mut weights = HashMap::new();
+
+        for chunk in variant_ids.chunks(100) {
+            let rows: Vec<(Uuid, Option<Decimal>, Option<String>)> = sqlx::query_as(
+                "SELECT id, weight, weight_unit::text AS weight_unit FROM product_variants WHERE id = ANY($1)"
+            )
+            .bind(chunk)
+            .fetch_all(db.pool())
+            .await?;
+
+            for (id, weight, weight_unit) in rows {
+                if let Some(w) = weight {
+                    let weight_kg = match weight_unit.as_deref() {
+                        Some("lb") => w * dec!(0.453592),
+                        Some("oz") => w * dec!(0.0283495),
+                        _ => w,
+                    };
+                    weights.insert(id, weight_kg);
+                }
+            }
+        }
+
+        Ok(weights)
+    }
+
     /// Total component weight (kg) for each bundle product in `parent_ids`:
     /// sum of component quantity x component product weight. Parents with no
     /// components (or only weightless ones) are absent from the map. Used to

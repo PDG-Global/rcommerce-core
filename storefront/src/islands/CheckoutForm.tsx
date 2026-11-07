@@ -251,14 +251,20 @@ function isPendingFailure(message: string | undefined): boolean {
 /// Hosted-field styling approximating coInput (iframes can't inherit CSS).
 const AWX_FIELD_STYLE: Payment.InputStyle = {
   base: {
-    border: '1px solid #c9c5bc',
+    border: brand.slug === 'swb' ? '1px solid #454239' : '1px solid #c9c5bc',
     borderRadius: '6px',
+    boxSizing: 'border-box',
+    width: '100%',
     padding: '12px 14px',
     fontSize: '15px',
     lineHeight: '22px',
-    color: '#161616',
+    color: brand.slug === 'swb' ? '#f5f1e8' : '#161616',
+    backgroundColor: brand.slug === 'swb' ? '#171713' : '#ffffff',
     fontFamily: "'Work Sans', system-ui, sans-serif",
-  },
+    '::placeholder': {
+      color: brand.slug === 'swb' ? '#a39f94' : '#757575',
+    },
+  } as Payment.InputStyle['base'],
 };
 
 function PaymentSection({
@@ -286,7 +292,6 @@ function PaymentSection({
   const [initError, setInitError] = useState<string | null>(null);
   const [method, setMethod] = useState<PaymentMethodKey>('card');
   const [wallets, setWallets] = useState<{ google: boolean; apple: boolean }>({ google: false, apple: false });
-  const [cardComplete, setCardComplete] = useState({ number: false, expiry: false, cvc: false });
   const [fieldsReady, setFieldsReady] = useState({ number: false, expiry: false, cvc: false });
   const [cardholderName, setCardholderName] = useState('');
   const [paying, setPaying] = useState(false);
@@ -510,10 +515,6 @@ function PaymentSection({
           throw new Error('Card field containers are not mounted in the DOM.');
         }
 
-        // Split card fields (Step 3) — validity tracked via 'change' events.
-        const onFieldChange = (key: 'number' | 'expiry' | 'cvc') => (event: Payment.SplitElementEvent['change']) => {
-          setCardComplete((prev) => ({ ...prev, [key]: event.detail.completed }));
-        };
         const cardNumber = track(
           await createElement('cardNumber', {
             placeholder: 'Card number',
@@ -521,18 +522,15 @@ function PaymentSection({
           }),
         );
         cardNumber.on('ready', () => setFieldsReady((prev) => ({ ...prev, number: true })));
-        cardNumber.on('change', onFieldChange('number'));
         cardNumber.mount(cardNumberHostRef.current);
         elementsRef.current.cardNumber = cardNumber;
 
         const expiry = track(await createElement('expiry', { placeholder: 'MM / YY', style: AWX_FIELD_STYLE }));
         expiry.on('ready', () => setFieldsReady((prev) => ({ ...prev, expiry: true })));
-        expiry.on('change', onFieldChange('expiry'));
         expiry.mount(cardExpiryHostRef.current);
 
         const cvc = track(await createElement('cvc', { placeholder: 'CVC', style: AWX_FIELD_STYLE }));
         cvc.on('ready', () => setFieldsReady((prev) => ({ ...prev, cvc: true })));
-        cvc.on('change', onFieldChange('cvc'));
         cvc.mount(cardCvcHostRef.current);
 
         // The SDK's 'ready' event is not guaranteed for split fields — mark a
@@ -705,27 +703,29 @@ function PaymentSection({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [method, paymentResult]);
 
-  // Step 3: card Pay button — confirm the intent with the hosted fields.
   const handleCardPay = async () => {
     const result = paymentResultRef.current;
     const cardNumber = elementsRef.current.cardNumber;
     const payments = paymentsRef.current;
-    if (!result || !cardNumber || !payments) return;
+    if (!result || !cardNumber || !payments) {
+      setPaymentError('The card form is not ready. Please reload the page and try again.');
+      return;
+    }
+    if (!cardholderName.trim()) {
+      setPaymentError('Enter the name on card.');
+      return;
+    }
     setPaying(true);
     setPaymentError(null);
     try {
-      const confirmed = await payments.confirmPaymentIntent({
-        element: cardNumber as unknown as Payment.PaymentMethod['element'],
+      await cardNumber.confirm({
         intent_id: result.payment_intent_id || undefined,
-        client_secret: result.client_secret || undefined,
-        payment_method: { card: { name: cardholderName.trim() || undefined } },
+        client_secret: result.client_secret!,
+        payment_method: { card: { name: cardholderName.trim() } },
       });
-      if (confirmed === false) throw new Error('Your payment was not completed.');
       await finalizePayment();
     } catch (e: any) {
-      // Only errors the SDK actually reports are surfaced here — while the
-      // intent can still be processing we say nothing.
-      setPaymentError(e.message || 'Payment failed. Please try again.');
+      setPaymentError(e.message || 'Payment failed. Please check your card details and try again.');
     } finally {
       setPaying(false);
     }
@@ -739,7 +739,7 @@ function PaymentSection({
     { key: 'alipay', label: 'Alipay' },
   ];
 
-  const cardReady = cardComplete.number && cardComplete.expiry && cardComplete.cvc;
+  const cardFieldsMounted = fieldsReady.number && fieldsReady.expiry && fieldsReady.cvc;
 
   return (
     <div className="space-y-8">
@@ -835,12 +835,13 @@ function PaymentSection({
                   {!fieldsReady.number && !initError && (
                     <p className="text-sm text-rcommerce-500">Loading card fields…</p>
                   )}
-                  <label htmlFor="cardholder-name" className="sr-only">Name on card</label>
+                  <label htmlFor="cardholder-name" className="block text-sm font-medium text-rcommerce-900">Name on card</label>
                   <input
                     id="cardholder-name"
                     type="text"
-                    placeholder="Name on card"
+                    placeholder="Cardholder name"
                     autoComplete="cc-name"
+                    required
                     value={cardholderName}
                     onChange={(e) => setCardholderName(e.target.value)}
                     className={coInput}
@@ -848,11 +849,14 @@ function PaymentSection({
                   <button
                     type="button"
                     onClick={() => void handleCardPay()}
-                    disabled={paying || !cardReady || !cardholderName.trim()}
+                    disabled={paying || !cardFieldsMounted}
                     className={'w-full ' + coBtn}
                   >
                     {paying ? 'Processing…' : `Pay ${summary.currency} ${formatMoney(summary.total)}`}
                   </button>
+                  {!cardFieldsMounted && (
+                    <p className="text-xs text-rcommerce-500 text-center">Loading the secure card fields…</p>
+                  )}
                 </div>
 
                 <div className={method === 'googlepay' ? 'space-y-3' : 'space-y-3 hidden'}>

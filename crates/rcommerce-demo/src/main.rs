@@ -603,6 +603,7 @@ async fn fallback_handler(uri: Uri) -> impl IntoResponse {
 mod tests {
     use super::*;
     use axum::{routing::post, Json};
+    use clap::CommandFactory;
     use serde_json::{json, Value};
 
     async fn spawn_backend() -> SocketAddr {
@@ -627,6 +628,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 
     #[tokio::test]

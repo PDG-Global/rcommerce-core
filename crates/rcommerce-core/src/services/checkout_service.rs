@@ -1363,22 +1363,31 @@ impl CheckoutService {
         Ok(rates)
     }
 
-    /// Weight (kg) for one cart line: the product's own weight, else the weight
-    /// derived from its bundle components, else the legacy 0.5kg fallback.
+    /// Weight (kg) for one cart line: the selected variant's weight, else the
+    /// product's own weight, else the bundle-derived or legacy fallback.
     fn resolve_item_weight(
+        variant_weights: &std::collections::HashMap<uuid::Uuid, Decimal>,
         weights: &std::collections::HashMap<uuid::Uuid, Decimal>,
         derived_weights: &std::collections::HashMap<uuid::Uuid, Decimal>,
         item: &CartItem,
     ) -> Decimal {
-        weights
-            .get(&item.product_id)
+        item.variant_id
+            .and_then(|id| variant_weights.get(&id))
             .copied()
+            .or_else(|| weights.get(&item.product_id).copied())
             .or_else(|| derived_weights.get(&item.product_id).copied())
             .unwrap_or(dec!(0.5))
     }
 
     /// Estimate package dimensions from cart items
     async fn estimate_package(&self, items: &[CartItem]) -> Result<Package> {
+        let variant_ids: Vec<Uuid> = items.iter().filter_map(|item| item.variant_id).collect();
+        let variant_weights = self
+            .cart_service
+            .get_variant_weights(&variant_ids)
+            .await
+            .unwrap_or_default();
+
         // Fetch actual product weights from database
         let product_ids: Vec<Uuid> = items.iter().map(|i| i.product_id).collect();
         let weights = self
@@ -1393,6 +1402,11 @@ impl CheckoutService {
         let missing_weight: Vec<uuid::Uuid> = items
             .iter()
             .filter(|item| !self.is_bundle_component(item))
+            .filter(|item| {
+                item.variant_id
+                    .and_then(|id| variant_weights.get(&id))
+                    .is_none()
+            })
             .map(|item| item.product_id)
             .filter(|id| !weights.contains_key(id))
             .collect();
@@ -1409,7 +1423,8 @@ impl CheckoutService {
             .iter()
             .filter(|item| !self.is_bundle_component(item))
             .map(|item| {
-                let weight_per_item = Self::resolve_item_weight(&weights, &derived_weights, item);
+                let weight_per_item =
+                    Self::resolve_item_weight(&variant_weights, &weights, &derived_weights, item);
                 Decimal::from(item.quantity) * weight_per_item
             })
             .sum();
@@ -1585,12 +1600,30 @@ mod tests {
     #[test]
     fn test_resolve_item_weight_prefers_own_weight() {
         let pid = uuid::Uuid::new_v4();
+        let variants = std::collections::HashMap::new();
         let mut weights = std::collections::HashMap::new();
         weights.insert(pid, dec!(1.1));
         let derived = std::collections::HashMap::new();
         assert_eq!(
-            CheckoutService::resolve_item_weight(&weights, &derived, &cart_item(pid)),
+            CheckoutService::resolve_item_weight(&variants, &weights, &derived, &cart_item(pid)),
             dec!(1.1)
+        );
+    }
+
+    #[test]
+    fn test_resolve_item_weight_prefers_selected_variant() {
+        let pid = uuid::Uuid::new_v4();
+        let variant_id = uuid::Uuid::new_v4();
+        let mut item = cart_item(pid);
+        item.variant_id = Some(variant_id);
+        let mut variants = std::collections::HashMap::new();
+        variants.insert(variant_id, dec!(7.0));
+        let mut weights = std::collections::HashMap::new();
+        weights.insert(pid, dec!(5.0));
+        let derived = std::collections::HashMap::new();
+        assert_eq!(
+            CheckoutService::resolve_item_weight(&variants, &weights, &derived, &item),
+            dec!(7.0)
         );
     }
 
@@ -1598,11 +1631,12 @@ mod tests {
     fn test_resolve_item_weight_derives_bundle_weight() {
         // Bundle parent with no weight of its own: 16 x 1.1kg = 17.6kg
         let parent = uuid::Uuid::new_v4();
+        let variants = std::collections::HashMap::new();
         let weights = std::collections::HashMap::new();
         let mut derived = std::collections::HashMap::new();
         derived.insert(parent, dec!(17.6));
         assert_eq!(
-            CheckoutService::resolve_item_weight(&weights, &derived, &cart_item(parent)),
+            CheckoutService::resolve_item_weight(&variants, &weights, &derived, &cart_item(parent)),
             dec!(17.6)
         );
     }
@@ -1610,10 +1644,11 @@ mod tests {
     #[test]
     fn test_resolve_item_weight_fallback() {
         let pid = uuid::Uuid::new_v4();
+        let variants = std::collections::HashMap::new();
         let weights = std::collections::HashMap::new();
         let derived = std::collections::HashMap::new();
         assert_eq!(
-            CheckoutService::resolve_item_weight(&weights, &derived, &cart_item(pid)),
+            CheckoutService::resolve_item_weight(&variants, &weights, &derived, &cart_item(pid)),
             dec!(0.5)
         );
     }
