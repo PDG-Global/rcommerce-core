@@ -2181,6 +2181,117 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Status and JSON body of a request to the admin product routes
+async fn admin_product_call(
+    app: &TestApp,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let url = format!("{}/api/v1/admin/products/{}", app.base_url(), path);
+    let mut request = app.http_client.request(method, url).bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+/// Bundle component routes answer failures with their status (all were 200)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_admin_bundle_routes_answer_errors_with_their_status() {
+    use reqwest::Method;
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let bundle = app
+        .create_test_product("Test Bundle", Decimal::new(2000, 2), 0)
+        .await
+        .unwrap();
+    let part = app
+        .create_test_product("Test Part", Decimal::new(500, 2), 0)
+        .await
+        .unwrap();
+    let components = format!("{bundle}/bundle-components");
+    let add = |quantity: i32| {
+        Some(serde_json::json!({ "component_product_id": part.to_string(), "quantity": quantity }))
+    };
+
+    let (status, _) =
+        admin_product_call(&app, &admin, Method::GET, "nope/bundle-components", None).await;
+    assert_eq!(status, 400, "malformed product id");
+    let (status, body) = admin_product_call(&app, &admin, Method::POST, &components, add(1)).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not a bundle"));
+
+    sqlx::query("UPDATE products SET product_type = 'bundle' WHERE id = $1")
+        .bind(bundle)
+        .execute(&app.db_pool)
+        .await
+        .unwrap();
+    let (status, body) = admin_product_call(&app, &admin, Method::POST, &components, add(0)).await;
+    assert_eq!(status, 400, "quantity 0 was stored: {body}");
+    let (status, body) = admin_product_call(&app, &admin, Method::POST, &components, add(2)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["component"]["quantity"], 2);
+
+    // An unknown component: 404 (the update was a database error)
+    let missing = format!("{components}/{}", Uuid::new_v4());
+    let quantity = Some(serde_json::json!({ "quantity": 3 }));
+    let (status, _) = admin_product_call(&app, &admin, Method::PUT, &missing, quantity).await;
+    assert_eq!(status, 404);
+    let (status, _) = admin_product_call(&app, &admin, Method::DELETE, &missing, None).await;
+    assert_eq!(status, 404);
+
+    app.cleanup().await.ok();
+}
+
+/// License key generation checks the product and bounds `count`
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_admin_license_keys_check_product_and_count() {
+    use reqwest::Method;
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let product = app
+        .create_test_product("Test Download", Decimal::new(900, 2), 0)
+        .await
+        .unwrap();
+    let keys = format!("{product}/license-keys");
+    let count = |count: i32| Some(serde_json::json!({ "count": count }));
+
+    let unknown = format!("{}/license-keys", Uuid::new_v4());
+    let (status, _) = admin_product_call(&app, &admin, Method::POST, &unknown, count(1)).await;
+    assert_eq!(status, 404);
+    let (status, _) = admin_product_call(&app, &admin, Method::POST, &keys, count(1)).await;
+    assert_eq!(status, 400, "not a digital product");
+
+    sqlx::query(
+        "UPDATE products SET product_type = 'digital', license_key_enabled = true WHERE id = $1",
+    )
+    .bind(product)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+    for bad in [0, -5, 1001] {
+        let (status, _) = admin_product_call(&app, &admin, Method::POST, &keys, count(bad)).await;
+        assert_eq!(status, 400, "count {bad}");
+    }
+    let (status, body) = admin_product_call(&app, &admin, Method::POST, &keys, count(2)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["license_keys"].as_array().unwrap().len(), 2);
+    let (status, body) = admin_product_call(&app, &admin, Method::GET, &keys, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["license_keys"].as_array().unwrap().len(), 2);
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
