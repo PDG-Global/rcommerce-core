@@ -1,9 +1,9 @@
 //! Download routes for digital products
 //!
 //! Provides endpoints for:
-//! - Listing available downloads for an order
-//! - Downloading files with token validation
-//! - Generating download tokens
+//! - Downloading files with a download token (public: the token is the secret)
+//! - Listing an order's downloads (the order's customer, or an admin)
+//! - Generating a download token for an order item (admin)
 
 use axum::{
     body::Body,
@@ -11,64 +11,61 @@ use axum::{
     http::{header, StatusCode},
     response::Response,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use uuid::Uuid;
 
+use crate::middleware::JwtAuth;
 use crate::state::AppState;
+use rcommerce_core::models::{OrderItem, Product};
 use rcommerce_core::Error;
 
-/// List downloads for an order
+/// JSON body on success, the error's status and message otherwise
+type JsonResult = Result<Json<serde_json::Value>, Error>;
+
+/// Download URL for a token
+fn download_url(token: &str) -> String {
+    format!("/api/v1/downloads/{}", token)
+}
+
+/// List downloads for an order (its customer, or an admin)
 ///
-/// GET /api/v1/orders/:order_id/downloads
+/// GET /api/v1/orders/:id/downloads
 pub async fn list_order_downloads(
     State(state): State<AppState>,
-    Path(order_id): Path<String>,
-) -> Json<serde_json::Value> {
-    let order_id = match Uuid::parse_str(&order_id) {
-        Ok(uuid) => uuid,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "error": "Invalid order ID format"
-            }));
-        }
-    };
+    Extension(auth): Extension<JwtAuth>,
+    Path(order_id): Path<Uuid>,
+) -> JsonResult {
+    let owner: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT customer_id FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    // Someone else's order answers as a missing one
+    match owner {
+        Some(owner) if owner == Some(auth.customer_id) || auth.is_admin() => {}
+        _ => return Err(Error::not_found("Order not found")),
+    }
 
-    // This would need authentication middleware to get customer_id
-    // For now, return downloads for the order
-    match state
+    let downloads: Vec<serde_json::Value> = state
         .digital_product_service
         .get_order_downloads(order_id)
-        .await
-    {
-        Ok(downloads) => {
-            let downloads_json: Vec<serde_json::Value> = downloads
-                .into_iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "id": d.id,
-                        "order_item_id": d.order_item_id,
-                        "download_token": d.download_token,
-                        "download_count": d.download_count,
-                        "download_limit": d.download_limit,
-                        "expires_at": d.expires_at,
-                        "created_at": d.created_at,
-                        "download_url": format!("/api/v1/downloads/{}", d.download_token)
-                    })
-                })
-                .collect();
-
-            Json(serde_json::json!({
-                "downloads": downloads_json
-            }))
-        }
-        Err(e) => {
-            tracing::error!("Failed to get order downloads: {}", e);
-            Json(serde_json::json!({
-                "error": "Failed to retrieve downloads"
-            }))
-        }
-    }
+        .await?
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "order_item_id": d.order_item_id,
+                "download_token": d.download_token,
+                "download_count": d.download_count,
+                "download_limit": d.download_limit,
+                "expires_at": d.expires_at,
+                "created_at": d.created_at,
+                "download_url": download_url(&d.download_token),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "downloads": downloads })))
 }
 
 /// Download a file using a token
@@ -129,128 +126,87 @@ pub async fn download_file(
 pub async fn get_download_info(
     State(state): State<AppState>,
     Path(token): Path<String>,
-) -> Json<serde_json::Value> {
-    match state
+) -> JsonResult {
+    let download = state
         .digital_product_service
         .get_download_by_token(&token)
-        .await
-    {
-        Ok(Some(download)) => Json(serde_json::json!({
-            "id": download.id,
-            "download_token": download.download_token,
-            "download_count": download.download_count,
-            "download_limit": download.download_limit,
-            "expires_at": download.expires_at,
-            "is_expired": download.expires_at.map(|exp| chrono::Utc::now() > exp).unwrap_or(false),
-            "downloads_remaining": download.download_limit.map(|limit| limit - download.download_count),
-        })),
-        Ok(None) => Json(serde_json::json!({
-            "error": "Download not found"
-        })),
-        Err(e) => {
-            tracing::error!("Failed to get download info: {}", e);
-            Json(serde_json::json!({
-                "error": "Failed to retrieve download info"
-            }))
-        }
-    }
+        .await?
+        .ok_or_else(|| Error::not_found("Download not found"))?;
+    Ok(Json(serde_json::json!({
+        "id": download.id,
+        "download_token": download.download_token,
+        "download_count": download.download_count,
+        "download_limit": download.download_limit,
+        "expires_at": download.expires_at,
+        "is_expired": download.expires_at.map(|exp| chrono::Utc::now() > exp).unwrap_or(false),
+        "downloads_remaining": download.download_limit.map(|limit| limit - download.download_count),
+    })))
 }
 
-/// Generate a new download token (for admin or re-download scenarios)
+/// Generate a new download token for an order item, with the product's
+/// download limit and expiry (admin: a customer creating its own would reset
+/// its download limit)
 ///
-/// POST /api/v1/orders/:order_id/items/:item_id/downloads
+/// POST /api/v1/admin/orders/:id/items/:item_id/downloads
 pub async fn create_download(
     State(state): State<AppState>,
-    Path((order_id, item_id)): Path<(String, String)>,
-) -> Json<serde_json::Value> {
-    let order_id = match Uuid::parse_str(&order_id) {
-        Ok(uuid) => uuid,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "error": "Invalid order ID format"
-            }));
-        }
-    };
+    Path((order_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), Error> {
+    let item =
+        sqlx::query_as::<_, OrderItem>("SELECT * FROM order_items WHERE id = $1 AND order_id = $2")
+            .bind(item_id)
+            .bind(order_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| Error::not_found("Order item not found"))?;
+    let product = sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = $1")
+        .bind(item.product_id)
+        .fetch_optional(state.db.pool())
+        .await?
+        .ok_or_else(|| Error::not_found("Product not found"))?;
+    let customer_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT customer_id FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(state.db.pool())
+            .await?;
 
-    let item_id = match Uuid::parse_str(&item_id) {
-        Ok(uuid) => uuid,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "error": "Invalid item ID format"
-            }));
-        }
-    };
-
-    // Get the order item to find product details for download limits
-    let order_item = match sqlx::query_as::<_, rcommerce_core::models::OrderItem>(
-        "SELECT * FROM order_items WHERE id = $1 AND order_id = $2",
-    )
-    .bind(item_id)
-    .bind(order_id)
-    .fetch_one(state.db.pool())
-    .await
-    {
-        Ok(item) => item,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "error": "Order item not found"
-            }));
-        }
-    };
-
-    // Get product details
-    let product = match sqlx::query_as::<_, rcommerce_core::models::Product>(
-        "SELECT * FROM products WHERE id = $1",
-    )
-    .bind(order_item.product_id)
-    .fetch_one(state.db.pool())
-    .await
-    {
-        Ok(product) => product,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "error": "Product not found"
-            }));
-        }
-    };
-
-    // Create download
-    match state
+    let download = state
         .digital_product_service
         .create_download(
             item_id,
-            None, // customer_id would come from auth
+            customer_id,
             product.download_limit,
             product.download_expiry_days,
         )
-        .await
-    {
-        Ok(download) => Json(serde_json::json!({
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
             "id": download.id,
             "download_token": download.download_token,
-            "download_url": format!("/api/v1/downloads/{}", download.download_token),
+            "download_url": download_url(&download.download_token),
             "expires_at": download.expires_at,
             "download_limit": download.download_limit,
         })),
-        Err(e) => {
-            tracing::error!("Failed to create download: {}", e);
-            Json(serde_json::json!({
-                "error": "Failed to create download"
-            }))
-        }
-    }
+    ))
 }
 
-/// Router for download routes
+/// Public download routes: the token in the path is the credential
 pub fn router() -> Router<AppState> {
     Router::new()
-        // Public download endpoint (with token)
         .route("/downloads/:token", get(download_file))
         .route("/downloads/:token/info", get(get_download_info))
-        // Protected endpoints (would need auth middleware)
-        .route("/orders/:order_id/downloads", get(list_order_downloads))
-        .route(
-            "/orders/:order_id/items/:item_id/downloads",
-            post(create_download),
-        )
+}
+
+/// Download routes for signed-in customers (mounted behind auth_middleware)
+pub fn protected_router() -> Router<AppState> {
+    Router::new().route("/orders/:id/downloads", get(list_order_downloads))
+}
+
+/// Admin download routes (mounted behind admin_middleware)
+pub fn admin_router() -> Router<AppState> {
+    Router::new().route(
+        "/admin/orders/:id/items/:item_id/downloads",
+        post(create_download),
+    )
 }

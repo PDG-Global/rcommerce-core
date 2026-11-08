@@ -1332,6 +1332,8 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::newsletter_router())
         // Product reviews are publicly readable
         .merge(crate::routes::review_public_router())
+        // Digital downloads: the token in the path is the credential
+        .merge(crate::routes::downloads_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             optional_auth_middleware,
@@ -1355,6 +1357,8 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::cart_protected_router())
         // Submitting a product review requires authentication
         .merge(crate::routes::review_protected_router())
+        // An order's downloads, for its customer (or an admin)
+        .merge(crate::routes::downloads_protected_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
@@ -1379,6 +1383,9 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::coupon_router())
         .merge(crate::routes::subscription_admin_router())
         .merge(crate::routes::dunning_admin_router())
+        // Outgoing webhook management and download links for order items
+        .merge(crate::routes::webhook_router())
+        .merge(crate::routes::downloads_admin_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             admin_middleware,

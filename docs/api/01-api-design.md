@@ -517,15 +517,26 @@ and production uses `test_mode = false`.
 ### Webhook Management ✅ Fully Implemented
 
 Manage outgoing webhooks for event notifications to external systems.
+Admin only; `/v1/webhooks/:gateway` stays the endpoint that receives payment
+provider webhooks.
 
 ```
-GET    /v1/webhooks                 # List all webhooks
-POST   /v1/webhooks                 # Create new webhook
-GET    /v1/webhooks/:id             # Get webhook details
-PUT    /v1/webhooks/:id             # Update webhook
-DELETE /v1/webhooks/:id             # Delete webhook
-POST   /v1/webhooks/:id/test        # Test webhook delivery
-GET    /v1/webhooks/:id/deliveries  # Get delivery history
+GET    /v1/admin/webhooks                 # List all webhooks
+POST   /v1/admin/webhooks                 # Create new webhook
+GET    /v1/admin/webhooks/:id             # Get webhook details
+PUT    /v1/admin/webhooks/:id             # Update webhook
+DELETE /v1/admin/webhooks/:id             # Delete webhook
+POST   /v1/admin/webhooks/:id/test        # Test webhook delivery
+GET    /v1/admin/webhooks/:id/deliveries  # Get delivery history
+```
+
+### Digital Downloads
+
+```
+GET    /v1/downloads/:token                                # Download the file (the token is the credential)
+GET    /v1/downloads/:token/info                           # Count, limit and expiry of a download
+GET    /v1/orders/:id/downloads                            # An order's downloads (its customer, or an admin)
+POST   /v1/admin/orders/:id/items/:item_id/downloads       # New download link for an order item (admin)
 ```
 
 **Webhook Events:**

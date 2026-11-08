@@ -2181,6 +2181,108 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Status and JSON body (`Null` when there is none) of a request, with an
+/// optional bearer token
+async fn call_api(
+    app: &TestApp,
+    token: Option<&str>,
+    method: reqwest::Method,
+    path: &str,
+) -> (u16, serde_json::Value) {
+    let mut request = app
+        .http_client
+        .request(method, format!("{}/api/v1{}", app.base_url(), path));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+/// Digital downloads and webhook management are served, each behind the
+/// right auth (none of these routes was mounted before)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_download_and_webhook_routes_are_served_with_their_auth() {
+    use reqwest::Method;
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (buyer, password) = app.create_test_customer().await.unwrap();
+    let buyer_token = app.login(&buyer.email, &password).await.unwrap();
+    let (other, password) = app.create_test_customer().await.unwrap();
+    let other_token = app.login(&other.email, &password).await.unwrap();
+    let product_id = app
+        .create_test_product("Download Test Ebook", Decimal::from(10), 10)
+        .await
+        .unwrap();
+    let (order_id, item_id) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_id, customer_email, status, payment_status, fulfillment_status, subtotal, total) VALUES ($1, $2, $3, $4, 'confirmed', 'paid', 'pending', 10, 10)",
+    )
+    .bind(order_id)
+    .bind(format!("TEST-DL-{order_id}"))
+    .bind(buyer.id)
+    .bind(&buyer.email)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO order_items (id, order_id, product_id, title, quantity, price, total) VALUES ($1, $2, $3, 'Test ebook', 1, 10, 10)",
+    )
+    .bind(item_id)
+    .bind(order_id)
+    .bind(product_id)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+
+    // Creating a download link is for admins
+    let create = format!("/admin/orders/{order_id}/items/{item_id}/downloads");
+    let (status, _) = call_api(&app, Some(&buyer_token), Method::POST, &create).await;
+    assert_eq!(status, 403);
+    let (status, body) = call_api(&app, Some(&admin), Method::POST, &create).await;
+    assert_eq!(status, 201, "{body}");
+    let token = body["download_token"].as_str().unwrap().to_string();
+
+    // The order's downloads: its customer and admins; anyone else sees no order
+    let list = format!("/orders/{order_id}/downloads");
+    let (status, body) = call_api(&app, Some(&buyer_token), Method::GET, &list).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["downloads"][0]["download_token"], token);
+    assert_eq!(
+        call_api(&app, Some(&admin), Method::GET, &list).await.0,
+        200
+    );
+    assert_eq!(
+        call_api(&app, Some(&other_token), Method::GET, &list)
+            .await
+            .0,
+        404
+    );
+    assert_eq!(call_api(&app, None, Method::GET, &list).await.0, 401);
+
+    // The token itself is the credential for its info (and the file)
+    let (status, body) =
+        call_api(&app, None, Method::GET, &format!("/downloads/{token}/info")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["download_count"], 0);
+    let (status, _) = call_api(&app, None, Method::GET, "/downloads/not-a-token/info").await;
+    assert_eq!(status, 404);
+
+    // Webhook management is for admins, under /admin
+    assert_eq!(
+        call_api(&app, Some(&admin), Method::GET, "/admin/webhooks")
+            .await
+            .0,
+        200
+    );
+    let (status, _) = call_api(&app, Some(&buyer_token), Method::GET, "/admin/webhooks").await;
+    assert_eq!(status, 403);
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
