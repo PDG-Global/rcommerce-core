@@ -1,6 +1,7 @@
 pub mod notification;
 pub mod reservation;
 pub mod service;
+pub mod stock_admin;
 pub mod tracking;
 
 use chrono::{DateTime, Utc};
