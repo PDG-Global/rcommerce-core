@@ -32,6 +32,27 @@ pub(crate) fn require_address_phone(phone: &Option<String>) -> Result<(), rcomme
     }
 }
 
+/// The `{"error": message}` response of handlers that answer 400 when a request
+/// fails. Client errors keep their message and answer 400 (404 when something
+/// was not found); server failures (database, network...) answer their own 5xx
+/// status with a generic message, and their details only go to the log.
+pub(crate) fn error_json(
+    e: impl Into<rcommerce_core::Error>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    let e = e.into();
+    let status = match e.status_code() {
+        code @ 500.. => {
+            tracing::error!(category = e.category(), "request failed: {}", e);
+            axum::http::StatusCode::from_u16(code)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        404 => axum::http::StatusCode::NOT_FOUND,
+        _ => axum::http::StatusCode::BAD_REQUEST,
+    };
+    let body = serde_json::json!({ "error": e.public_message() });
+    (status, axum::Json(body))
+}
+
 pub use accounting::accounting_router;
 pub use admin::router as admin_router;
 pub use auth::protected_router as auth_protected_router;
@@ -74,7 +95,33 @@ pub fn woocommerce_error(status: u16, code: &str, message: &str) -> axum::respon
 
 #[cfg(test)]
 mod tests {
-    use super::require_address_phone;
+    use super::{error_json, require_address_phone};
+    use rcommerce_core::Error;
+
+    #[test]
+    fn error_json_hides_server_failures() {
+        let (status, body) = error_json(sqlx::Error::Protocol(
+            "column \"airwallex_customer_id\" does not exist".into(),
+        ));
+        assert_eq!(status, 500);
+        assert_eq!(body["error"], "Internal server error");
+        let (status, body) = error_json(Error::network("timeout calling 10.0.0.5"));
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "Service temporarily unavailable");
+    }
+
+    #[test]
+    fn error_json_keeps_client_errors() {
+        let (status, body) = error_json(Error::validation("Cart is empty"));
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("Cart is empty"));
+        let (status, body) = error_json(Error::payment_error("Card declined"));
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("Card declined"));
+        let (status, body) = error_json(Error::not_found("Order not found"));
+        assert_eq!(status, 404);
+        assert!(body["error"].as_str().unwrap().contains("Order not found"));
+    }
 
     #[test]
     fn require_address_phone_accepts_present_numbers() {
