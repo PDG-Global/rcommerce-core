@@ -261,6 +261,19 @@ impl PostgresProductRepository {
             .collect())
     }
 
+    /// Several products by id, in one query (order not preserved)
+    pub async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<Product>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(self.db.pool())
+                .await?,
+        )
+    }
+
     /// First image (lowest position) of several products, in one query
     pub async fn find_first_images(
         &self,

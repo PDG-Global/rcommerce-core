@@ -81,10 +81,12 @@ impl PostgresCategoryRepository {
     }
 
     /// Categories of several products in one query (listing pages), ordered like
-    /// `get_product_categories`
+    /// `get_product_categories`; name, slug and description in `locale` when a
+    /// translation exists (see `CatalogI18nRepository`)
     pub async fn categories_for_products(
         &self,
         product_ids: &[Uuid],
+        locale: Option<&str>,
     ) -> Result<std::collections::HashMap<Uuid, Vec<ProductCategory>>> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -99,12 +101,18 @@ impl PostgresCategoryRepository {
             return Ok(by_product);
         }
         let rows = sqlx::query_as::<_, Row>(
-            "SELECT pcr.product_id, c.* FROM product_categories c
+            "SELECT pcr.product_id, c.id, COALESCE(t.name, c.name) AS name,
+                    COALESCE(t.slug, c.slug) AS slug,
+                    COALESCE(t.description, c.description) AS description,
+                    c.parent_id, c.sort_order, c.created_at, c.updated_at
+             FROM product_categories c
              INNER JOIN product_category_relations pcr ON c.id = pcr.category_id
+             LEFT JOIN category_translations t ON t.category_id = c.id AND t.locale = $2
              WHERE pcr.product_id = ANY($1)
              ORDER BY c.sort_order, c.name",
         )
         .bind(product_ids)
+        .bind(locale)
         .fetch_all(&self.db)
         .await
         .map_err(|e| Error::Other(format!("Failed to fetch product categories: {}", e)))?;
@@ -467,7 +475,7 @@ mod tests {
         }
 
         let batched = repo
-            .categories_for_products(&[product, uncategorised])
+            .categories_for_products(&[product, uncategorised], None)
             .await
             .unwrap();
         let names: Vec<&str> = batched[&product].iter().map(|c| c.name.as_str()).collect();

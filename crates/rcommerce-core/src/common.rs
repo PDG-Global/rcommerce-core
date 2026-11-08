@@ -269,6 +269,19 @@ pub mod validation {
         url.starts_with("http://") || url.starts_with("https://")
     }
 
+    /// URL-safe slug: lower-case letters and digits separated by single
+    /// hyphens, e.g. "perceuse-sans-fil-p000001"
+    pub fn validate_slug(slug: &str) -> bool {
+        !slug.is_empty()
+            && slug.len() <= 255
+            && slug.split('-').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+    }
+
     /// Format phone number
     pub fn format_phone(phone: &str) -> String {
         let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -283,6 +296,57 @@ pub mod validation {
                 &digits[7..11]
             ),
             _ => phone.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::validate_slug;
+
+        #[test]
+        fn slug_validation() {
+            assert!(validate_slug("perceuse-sans-fil-p000001"));
+            assert!(validate_slug("p1"));
+            assert!(!validate_slug(""));
+            assert!(!validate_slug("-perceuse"));
+            assert!(!validate_slug("perceuse--sans"));
+            assert!(!validate_slug("Perceuse"));
+            assert!(!validate_slug("échelle"));
+            assert!(!validate_slug("a/b"));
+        }
+    }
+}
+
+/// Languages of translated content
+pub mod locale {
+    /// Normalize a requested language to the subtag translations are stored
+    /// under: "fr-BE" -> "fr". Anything that is not 2-3 ASCII letters is rejected.
+    pub fn normalize_locale(raw: &str) -> Option<String> {
+        let primary = raw.trim().split(['-', '_']).next()?.to_ascii_lowercase();
+        let valid =
+            (2..=3).contains(&primary.len()) && primary.bytes().all(|b| b.is_ascii_lowercase());
+        valid.then_some(primary)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::normalize_locale;
+
+        #[test]
+        fn normalize_locale_keeps_the_primary_subtag() {
+            assert_eq!(normalize_locale("fr").as_deref(), Some("fr"));
+            assert_eq!(normalize_locale("fr-BE").as_deref(), Some("fr"));
+            assert_eq!(normalize_locale("NL_be").as_deref(), Some("nl"));
+            assert_eq!(normalize_locale(" en ").as_deref(), Some("en"));
+        }
+
+        #[test]
+        fn normalize_locale_rejects_junk() {
+            assert_eq!(normalize_locale(""), None);
+            assert_eq!(normalize_locale("f"), None);
+            assert_eq!(normalize_locale("french"), None);
+            assert_eq!(normalize_locale("f1"), None);
+            assert_eq!(normalize_locale("'; DROP TABLE products; --"), None);
         }
     }
 }
