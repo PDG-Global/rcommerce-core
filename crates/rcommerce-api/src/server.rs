@@ -933,7 +933,44 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
         Some(config.payment.airwallex.clone()),
     )
     .with_rate_limiting(config.rate_limiting.clone());
-    Ok(AppState::new(params).await)
+    let mut app_state = AppState::new(params).await;
+    app_state.catalog_search = init_catalog_search(config, &app_state.db)?;
+    Ok(app_state)
+}
+
+/// Elasticsearch catalogue search when configured. A missing index is built in
+/// the background; until then (or if Elasticsearch fails) search falls back to
+/// PostgreSQL full-text search.
+fn init_catalog_search(
+    config: &Config,
+    db: &Database,
+) -> Result<Option<Arc<rcommerce_core::search::ElasticsearchCatalog>>> {
+    if !config.search.engine.eq_ignore_ascii_case("elasticsearch") {
+        return Ok(None);
+    }
+    let search = Arc::new(rcommerce_core::search::ElasticsearchCatalog::new(
+        &config.search,
+        db.pool().clone(),
+    )?);
+    let indexer = search.clone();
+    tokio::spawn(async move {
+        match indexer.is_indexed().await {
+            Ok(true) => info!("Elasticsearch catalogue index ready"),
+            Ok(false) | Err(_) => {
+                let started = std::time::Instant::now();
+                match indexer.reindex_all().await {
+                    Ok(n) => info!(
+                        "Elasticsearch catalogue index built: {} products in {:?}",
+                        n,
+                        started.elapsed()
+                    ),
+                    Err(e) => error!("Elasticsearch catalogue index failed: {}", e),
+                }
+            }
+        }
+    });
+    info!("Catalogue search: Elasticsearch ({})", config.search.index);
+    Ok(Some(search))
 }
 
 /// Build CORS layer from configuration
