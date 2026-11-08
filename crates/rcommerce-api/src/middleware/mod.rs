@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -15,12 +15,13 @@ use tokio::sync::Mutex;
 
 use crate::state::AppState;
 use rcommerce_core::config::{RateLimitConfig, TlsConfig};
-use rcommerce_core::services::AuthService;
+use rcommerce_core::services::{AuthService, ScopeChecker, StaffService};
 
 pub mod api_key_auth;
 pub mod client_ip;
 pub mod login_throttle;
 pub mod scopes;
+pub mod staff_access;
 pub mod wc_auth;
 
 pub use api_key_auth::{
@@ -391,7 +392,12 @@ pub async fn rate_limit_middleware(
     }
 }
 
-/// Admin-only middleware
+/// Admin API middleware
+///
+/// Global admins (the `admin` permission) reach every admin route. Other
+/// accounts need a staff role granting the route (see [`staff_access`]); their
+/// token's own permissions do not count, so a customer's global `read` never
+/// opens an admin route.
 pub async fn admin_middleware(
     State(state): State<AppState>,
     mut request: Request<Body>,
@@ -420,19 +426,46 @@ pub async fn admin_middleware(
         .verify_access_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    // Check for admin permission
-    if !claims.permissions.contains(&"admin".to_string()) {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    let permissions = if claims.permissions.contains(&"admin".to_string()) {
+        claims.permissions
+    } else {
+        // Owned copies: the request itself is not held across the await
+        let (method, path) = (request.method().clone(), request.uri().path().to_owned());
+        staff_permissions(&state, claims.sub, &method, &path).await?
+    };
 
     // Admin handlers read the caller from the request, as behind auth_middleware
     request.extensions_mut().insert(JwtAuth {
         customer_id: claims.sub,
         email: claims.email,
-        permissions: claims.permissions,
+        permissions,
     });
 
     Ok(next.run(request).await)
+}
+
+/// The staff permissions of a caller that is not a global admin, if one of its
+/// roles grants this admin route; 403 otherwise
+async fn staff_permissions(
+    state: &AppState,
+    customer_id: uuid::Uuid,
+    method: &Method,
+    path: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let (resource, action) =
+        staff_access::staff_permission(method, path).ok_or(StatusCode::FORBIDDEN)?;
+    let granted = StaffService::new(state.db.clone())
+        .permissions_for(customer_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to load staff permissions: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let allowed = ScopeChecker::new(&granted).is_ok_and(|checker| checker.can(resource, action));
+    if !allowed {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(granted)
 }
 
 /// Security headers middleware

@@ -1,4 +1,5 @@
 pub mod products;
+pub mod staff;
 
 use crate::state::AppState;
 use axum::{
@@ -117,4 +118,5 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api-keys", get(list_api_keys))
         .route("/admin/orders/:id", patch(set_order_test_flag))
         .merge(products::router())
+        .merge(staff::router())
 }
