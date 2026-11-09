@@ -2181,6 +2181,68 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Customers edit their own name, phone and marketing consent, nothing else
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_customer_updates_own_profile() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let token = app.login(&customer.email, &password).await.unwrap();
+    let url = format!("{}/api/v1/customers/me", app.base_url());
+    let put = |body: serde_json::Value| {
+        app.http_client
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+    };
+
+    let response = put(serde_json::json!({
+        "first_name": " Ann ", "phone": "+32 470 00 00 00", "accepts_marketing": true
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["customer"]["first_name"], "Ann");
+    assert_eq!(body["customer"]["last_name"], customer.last_name.as_str());
+    assert_eq!(body["customer"]["phone"], "+32 470 00 00 00");
+    assert_eq!(body["customer"]["accepts_marketing"], true);
+
+    // An empty phone removes it; the change is stored
+    let response = put(serde_json::json!({ "phone": "" })).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let me: serde_json::Value = app
+        .http_client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(me["customer"]["phone"].is_null());
+    assert_eq!(me["customer"]["first_name"], "Ann");
+
+    // E-mail and tax exemption are not self-service; empty names are refused
+    for body in [
+        serde_json::json!({ "email": "other@example.com" }),
+        serde_json::json!({ "tax_exempt": true }),
+        serde_json::json!({ "last_name": "" }),
+        serde_json::json!({}),
+    ] {
+        let status = put(body.clone()).await.unwrap().status();
+        assert!(status.is_client_error(), "{body} gave {status}");
+    }
+    let response = app
+        .http_client
+        .put(&url)
+        .json(&serde_json::json!({ "first_name": "X" }));
+    assert_eq!(response.send().await.unwrap().status(), 401);
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
