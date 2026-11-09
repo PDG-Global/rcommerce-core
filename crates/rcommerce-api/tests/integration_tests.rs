@@ -2181,6 +2181,73 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Merging a guest cart that holds a product the customer's cart already has adds the
+/// quantities (it used to fail with 500 on the cart's unique product index)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_cart_merge_adds_quantities_of_the_same_product() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let token = app.login(&customer.email, &password).await.unwrap();
+    let shared = app
+        .create_test_product("Merge shared", Decimal::new(1000, 2), 100)
+        .await
+        .unwrap();
+    let guest_only = app
+        .create_test_product("Merge guest only", Decimal::new(250, 2), 100)
+        .await
+        .unwrap();
+
+    // The customer's cart: 2 of the shared product
+    let mine: CartWithItems = app
+        .http_client
+        .get(format!("{}/api/v1/carts/me", app.base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    app.add_item_to_cart(mine.cart.id, shared, 2, &token)
+        .await
+        .unwrap();
+
+    // A guest cart: 3 of the shared product and 1 other
+    let (guest_id, session_token) = app.create_guest_cart().await.unwrap();
+    app.add_item_to_cart(guest_id, shared, 3, &token)
+        .await
+        .unwrap();
+    app.add_item_to_cart(guest_id, guest_only, 1, &token)
+        .await
+        .unwrap();
+
+    let response = app
+        .http_client
+        .post(format!("{}/api/v1/carts/merge", app.base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "session_token": session_token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let merged: CartWithItems = response.json().await.unwrap();
+    assert_eq!(merged.cart.id, mine.cart.id);
+    let quantity = |product| {
+        merged
+            .items
+            .iter()
+            .filter(|i| i.product_id == product)
+            .map(|i| i.quantity)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(quantity(shared), vec![5], "one line, quantities added");
+    assert_eq!(quantity(guest_only), vec![1]);
+    // 5 x 10.00 + 2.50
+    assert_eq!(merged.cart.subtotal, Decimal::new(5250, 2));
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {

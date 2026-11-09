@@ -878,6 +878,30 @@ impl CartService {
     }
 
     /// Merge guest cart into customer cart
+    /// Move one guest line into the customer's cart. The same product (and variant)
+    /// already there gets the quantities added, as `add_item` does: a second row
+    /// would break the cart's unique (product, variant) index.
+    async fn merge_item(&self, cart_id: Uuid, item: CartItem) -> Result<()> {
+        let existing = self
+            .cart_repo
+            .find_item(cart_id, item.product_id, item.variant_id)
+            .await?;
+        if let Some(mut line) = existing {
+            line.quantity += item.quantity;
+            line.calculate_totals();
+            line.updated_at = Utc::now();
+            return self.cart_repo.update_item(&line).await;
+        }
+        let moved = CartItem {
+            id: Uuid::new_v4(),
+            cart_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..item
+        };
+        self.cart_repo.add_item(&moved).await
+    }
+
     pub async fn merge_carts(&self, session_token: &str, customer_id: Uuid) -> Result<Cart> {
         let guest_cart = self.cart_repo.find_active_by_session(session_token).await?;
 
@@ -887,31 +911,8 @@ impl CartService {
             (Some(guest), Some(customer)) => {
                 // Merge items from guest cart into customer cart
                 let guest_items = self.cart_repo.get_items(guest.id).await?;
-
                 for item in guest_items {
-                    // Add item to customer cart
-                    let new_item = CartItem {
-                        id: Uuid::new_v4(),
-                        cart_id: customer.id,
-                        product_id: item.product_id,
-                        variant_id: item.variant_id,
-                        quantity: item.quantity,
-                        unit_price: item.unit_price,
-                        original_price: item.original_price,
-                        subtotal: item.subtotal,
-                        discount_amount: item.discount_amount,
-                        total: item.total,
-                        sku: item.sku,
-                        title: item.title,
-                        variant_title: item.variant_title,
-                        image_url: item.image_url,
-                        requires_shipping: item.requires_shipping,
-                        is_gift_card: item.is_gift_card,
-                        custom_attributes: item.custom_attributes,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                    };
-                    self.cart_repo.add_item(&new_item).await?;
+                    self.merge_item(customer.id, item).await?;
                 }
 
                 // Mark guest cart as converted
