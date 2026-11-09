@@ -1379,6 +1379,7 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
         .merge(crate::routes::coupon_router())
         .merge(crate::routes::subscription_admin_router())
         .merge(crate::routes::dunning_admin_router())
+        .merge(crate::routes::inventory_admin_router())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             admin_middleware,

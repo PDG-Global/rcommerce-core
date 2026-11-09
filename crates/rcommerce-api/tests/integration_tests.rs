@@ -2181,6 +2181,123 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Stock management: receipt, adjustments, refusals, movement history, and
+/// the product total kept equal to the sum of the changes
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_inventory_receipts_adjustments_and_history() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let product = app
+        .create_test_product("Stocked Product", Decimal::new(500, 2), 0)
+        .await
+        .unwrap();
+    let location: Uuid = sqlx::query_scalar(
+        "INSERT INTO inventory_locations (name, code) VALUES ('Depot', $1) RETURNING id",
+    )
+    .bind(format!("D-{}", Uuid::new_v4().simple()))
+    .fetch_one(&app.db_pool)
+    .await
+    .unwrap();
+    let url = |path: &str| format!("{}/api/v1/admin/inventory/{path}", app.base_url());
+    let post = |path: &str, token: &str, body: serde_json::Value| {
+        app.http_client
+            .post(url(path))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+
+    // Customers are refused
+    let receipt = serde_json::json!({
+        "location_id": location, "reference": "DN-1",
+        "lines": [{"product_id": product, "quantity": 40, "cost_per_unit": "2.10"}]
+    });
+    let response = post("receipts", &customer_token, receipt.clone())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    // A receipt creates the level and raises the product total
+    let response = post("receipts", &admin, receipt).await.unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["levels"][0]["available"], 40);
+    let level_id = body["levels"][0]["id"].as_str().unwrap().to_string();
+
+    // Damage removes stock; damage cannot add, and stock never goes below zero
+    let adjust = |quantity: i32, reason: &str| {
+        serde_json::json!({"product_id": product, "location_id": location,
+                           "quantity": quantity, "reason": reason, "notes": "pallet dropped"})
+    };
+    let response = post("adjustments", &admin, adjust(-3, "damage"))
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["level"]["available"], 37, "{body}");
+    let response = post("adjustments", &admin, adjust(3, "damage"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let response = post("adjustments", &admin, adjust(-38, "count"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    // Reorder point makes the level "low"
+    let response = app
+        .http_client
+        .patch(url(&format!("levels/{level_id}")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({"reorder_point": 50, "reorder_quantity": 100}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let low: serde_json::Value = app
+        .http_client
+        .get(url(&format!("levels?location_id={location}&low_only=true")))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(low["pagination"]["total"], 1, "{low}");
+
+    // History: newest first, with reason and author
+    let history: serde_json::Value = app
+        .http_client
+        .get(url(&format!("movements?product_id={product}")))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let movements = history["movements"].as_array().unwrap();
+    assert_eq!(movements.len(), 2, "{history}");
+    assert_eq!(movements[0]["reason"], "damage");
+    assert_eq!(movements[0]["movement_type"], "lost");
+    assert_eq!(movements[1]["reason"], "receipt");
+    assert!(movements[0]["created_by"].is_string());
+
+    // The product total followed every change
+    let total: i32 = sqlx::query_scalar("SELECT inventory_quantity FROM products WHERE id = $1")
+        .bind(product)
+        .fetch_one(&app.db_pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 37);
+
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
