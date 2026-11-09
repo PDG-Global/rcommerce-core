@@ -1505,6 +1505,51 @@ async fn test_admin_can_create_product() {
 
 #[tokio::test]
 #[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_product_cost_price_is_admin_only() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let customer_token = app.login(&customer.email, &password).await.unwrap();
+    let product = app
+        .create_test_product("Costed Product", Decimal::new(1250, 2), 5)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE products SET cost_price = 7.40 WHERE id = $1")
+        .bind(product)
+        .execute(&app.db_pool)
+        .await
+        .unwrap();
+    let url = format!("{}/api/v1/products/{}", app.base_url(), product);
+
+    // Anonymous visitors and customers never see what the store paid
+    for token in [None, Some(&customer_token)] {
+        let mut request = app.http_client.get(&url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let body: serde_json::Value = request.send().await.unwrap().json().await.unwrap();
+        assert_eq!(body["product"]["title"], "Costed Product");
+        assert!(body["product"].get("cost_price").is_none(), "{body}");
+    }
+
+    // Admins still do
+    let body: serde_json::Value = app
+        .http_client
+        .get(&url)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["product"]["cost_price"], "7.40");
+
+    app.cleanup().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
 async fn test_admin_can_manually_fulfill_order_once() {
     let app = TestApp::new().await.expect("Failed to create test app");
     let admin = app.admin_token().await.expect("Failed to create admin");

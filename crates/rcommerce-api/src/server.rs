@@ -939,6 +939,11 @@ async fn create_app_state(config: &Config) -> Result<AppState> {
 /// Build CORS layer from configuration
 fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
     let cors = CorsLayer::new();
+    if !config.enabled {
+        // No allowed origin: browsers refuse every cross-origin request
+        info!("CORS disabled: cross-origin requests are not allowed");
+        return cors;
+    }
 
     // Origins - check if wildcard is used
     let allow_any_origin = config.allowed_origins.contains(&"*".to_string());
@@ -1423,6 +1428,62 @@ mod tests {
             airwallex_api_key: Some("key_selected".to_string()),
             airwallex_webhook_secret: Some("airwallex_whsec_test_selected".to_string()),
         }
+    }
+
+    /// The `access-control-allow-origin` and `-headers` answers to a
+    /// preflight from `origin` for an authenticated POST
+    async fn preflight(config: &CorsConfig, origin: &str) -> (Option<String>, Option<String>) {
+        use tower::Service;
+        let mut app = Router::new()
+            .route("/x", axum::routing::post(|| async { "ok" }))
+            .layer(build_cors_layer(config));
+        let request = axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/x")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization,content-type",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // A Router is always ready, so it can be called directly
+        let response = app.call(request).await.unwrap();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+        };
+        (
+            header("access-control-allow-origin"),
+            header("access-control-allow-headers"),
+        )
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_the_configured_origin_with_a_token() {
+        let config: CorsConfig = serde_json::from_value(serde_json::json!({
+            "allowed_origins": ["https://shop.example.com"]
+        }))
+        .unwrap();
+        let (origin, headers) = preflight(&config, "https://shop.example.com").await;
+        assert_eq!(origin.as_deref(), Some("https://shop.example.com"));
+        assert!(headers.unwrap_or_default().contains("authorization"));
+
+        let (origin, _) = preflight(&config, "https://evil.example.com").await;
+        assert_eq!(origin, None);
+    }
+
+    #[tokio::test]
+    async fn disabled_cors_allows_no_origin() {
+        let config = CorsConfig {
+            enabled: false,
+            ..CorsConfig::default()
+        };
+        let (origin, _) = preflight(&config, "http://localhost:3000").await;
+        assert_eq!(origin, None);
     }
 
     #[tokio::test]
