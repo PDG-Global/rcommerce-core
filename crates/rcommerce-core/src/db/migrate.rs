@@ -214,6 +214,11 @@ impl Migrator {
                 "subscription_order_unique",
                 include_str!("../../migrations/023_subscription_order_unique.sql"),
             ),
+            (
+                29,
+                "auth_sessions",
+                include_str!("../../migrations/029_auth_sessions.sql"),
+            ),
         ];
 
         for (version, name, sql) in migrations {

@@ -3,18 +3,20 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::middleware::ClientIp;
+use crate::middleware::{ClientIp, JwtAuth};
 use crate::state::AppState;
 use rcommerce_core::{
     models::CreateCustomerRequest,
     notification::{Notification, NotificationChannel, NotificationPriority},
+    services::auth_session::{self, RevokeReason, Rotation},
+    services::{JwtClaims, TokenType},
     Error,
 };
 
@@ -137,12 +139,21 @@ pub struct RefreshTokenRequest {
     pub refresh_token: String,
 }
 
-/// Refresh token response
+/// Refresh token response. The presented refresh token is used up: the client keeps
+/// `refresh_token` for the next refresh.
 #[derive(Debug, Serialize)]
 pub struct RefreshTokenResponse {
     pub access_token: String,
+    pub refresh_token: String,
     pub token_type: String,
     pub expires_in: i64,
+}
+
+/// Change password request (signed-in customer)
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
 }
 
 /// Password reset request
@@ -334,16 +345,15 @@ pub async fn login(
         .auth_service
         .generate_access_token(customer.id, &customer.email, &customer.role)
         .map_err(|e| e.into_response())?;
-    let refresh_token = state
-        .auth_service
-        .generate_refresh_token(customer.id, payload.remember_me)
+    let refresh_token = start_session(&state, customer.id, payload.remember_me)
+        .await
         .map_err(|e| e.into_response())?;
 
     Ok(Json(LoginResponse {
         access_token,
         refresh_token,
         token_type: "Bearer".to_string(),
-        expires_in: 24 * 3600, // 24 hours
+        expires_in: state.auth_service.access_token_lifetime_secs(),
         customer: CustomerInfo {
             id: customer.id,
             email: customer.email,
@@ -430,18 +440,62 @@ async fn send_verification_email(
     Ok(())
 }
 
-/// Refresh access token
+/// Open a refresh-token session and return its first refresh token
+async fn start_session(
+    state: &AppState,
+    customer_id: Uuid,
+    remember_me: bool,
+) -> Result<String, Error> {
+    let lifetime = state.auth_service.refresh_lifetime(remember_me);
+    let session = auth_session::start(state.db.pool(), customer_id, lifetime).await?;
+    state
+        .auth_service
+        .generate_refresh_token(customer_id, &session)
+}
+
+/// Decode a refresh token (signature, expiry, type)
+fn refresh_claims(state: &AppState, token: &str) -> Result<JwtClaims, Error> {
+    let claims = state.auth_service.verify_token(token)?;
+    if claims.token_type != TokenType::Refresh {
+        return Err(Error::unauthorized("Invalid token type"));
+    }
+    Ok(claims)
+}
+
+/// Use up a refresh token and return its successor.
+///
+/// Tokens issued before sessions existed carry no session: they are exchanged once for
+/// a session lasting what remained of their own lifetime.
+async fn rotate_refresh_token(state: &AppState, claims: &JwtClaims) -> Result<String, Error> {
+    let pool = state.db.pool();
+    let session = match (claims.sid, claims.jti) {
+        (Some(sid), Some(jti)) => match auth_session::rotate(pool, claims.sub, sid, jti).await? {
+            Rotation::Rotated(session) => session,
+            Rotation::Reused => {
+                tracing::warn!("Refresh token reuse; session {} revoked", sid);
+                return Err(Error::unauthorized(
+                    "Refresh token already used; session ended",
+                ));
+            }
+            Rotation::Ended => return Err(Error::unauthorized("Session has ended")),
+        },
+        _ => {
+            let left = chrono::Duration::seconds(claims.exp - chrono::Utc::now().timestamp());
+            auth_session::start(pool, claims.sub, left).await?
+        }
+    };
+    state
+        .auth_service
+        .generate_refresh_token(claims.sub, &session)
+}
+
+/// Refresh access token. The refresh token is rotated: each one works once, and
+/// presenting a used one ends its session.
 pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshTokenRequest>,
 ) -> Result<Json<RefreshTokenResponse>, Error> {
-    // Verify refresh token
-    let claims = state.auth_service.verify_token(&payload.refresh_token)?;
-
-    // Ensure it's a refresh token
-    if claims.token_type != rcommerce_core::services::TokenType::Refresh {
-        return Err(Error::unauthorized("Invalid token type"));
-    }
+    let claims = refresh_claims(&state, &payload.refresh_token)?;
 
     // Fetch customer to get their current role
     let customer = state
@@ -450,7 +504,7 @@ pub async fn refresh_token(
         .await?
         .ok_or_else(|| Error::unauthorized("Customer not found"))?;
 
-    // Generate new access token with role-based permissions
+    let refresh_token = rotate_refresh_token(&state, &claims).await?;
     let access_token =
         state
             .auth_service
@@ -458,9 +512,106 @@ pub async fn refresh_token(
 
     Ok(Json(RefreshTokenResponse {
         access_token,
+        refresh_token,
         token_type: "Bearer".to_string(),
-        expires_in: 24 * 3600, // 24 hours
+        expires_in: state.auth_service.access_token_lifetime_secs(),
     }))
+}
+
+/// Sign out: end the session of the given refresh token. Access tokens already issued
+/// stay valid until they expire (`security.jwt.expiry_hours`).
+pub async fn logout(
+    State(state): State<AppState>,
+    Json(payload): Json<RefreshTokenRequest>,
+) -> Result<StatusCode, Error> {
+    let claims = refresh_claims(&state, &payload.refresh_token)?;
+    if let Some(sid) = claims.sid {
+        auth_session::revoke(state.db.pool(), claims.sub, sid, RevokeReason::Logout).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Check the signed-in customer's current password under the login throttle, so a
+/// stolen access token cannot be used to guess it
+async fn check_current_password(
+    state: &AppState,
+    ip: IpAddr,
+    customer: &rcommerce_core::models::Customer,
+    password: &str,
+) -> Result<(), Response> {
+    if let Err(retry_after) = state.login_throttle.check_attempt(ip, &customer.email) {
+        return Err(login_throttled(retry_after));
+    }
+    let Some(hash) = customer.password_hash.as_deref() else {
+        let error = Error::validation("No password is set; use password reset");
+        return Err(error.into_response());
+    };
+    let valid = password.len() <= MAX_LOGIN_PASSWORD_BYTES
+        && state
+            .auth_service
+            .verify_password(password, hash)
+            .map_err(|e| e.into_response())?
+            .0;
+    if !valid {
+        return Err(Error::validation("Current password is incorrect").into_response());
+    }
+    state.login_throttle.clear_pair(ip, &customer.email);
+    Ok(())
+}
+
+/// Change the signed-in customer's password. Every session ends; the response carries
+/// fresh tokens for the caller.
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(auth): Extension<JwtAuth>,
+    client_ip: Option<Extension<ClientIp>>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<Json<RefreshTokenResponse>, Response> {
+    let ip = client_ip
+        .map(|ext| ext.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let length = payload.new_password.chars().count();
+    if !(8..=128).contains(&length) {
+        let error = Error::validation("Password must be 8 to 128 characters");
+        return Err(error.into_response());
+    }
+    let customer = state
+        .customer_service
+        .find_by_id(auth.customer_id)
+        .await
+        .map_err(|e| e.into_response())?
+        .ok_or_else(|| Error::unauthorized("Customer not found").into_response())?;
+    check_current_password(&state, ip, &customer, &payload.current_password).await?;
+    replace_password(&state, &customer, &payload.new_password)
+        .await
+        .map(Json)
+        .map_err(|e| e.into_response())
+}
+
+/// Store the new password, end every session and sign the caller in again
+async fn replace_password(
+    state: &AppState,
+    customer: &rcommerce_core::models::Customer,
+    password: &str,
+) -> Result<RefreshTokenResponse, Error> {
+    let hash = state.auth_service.hash_password(password)?;
+    state
+        .customer_service
+        .update_password_hash(customer.id, &hash)
+        .await?;
+    let pool = state.db.pool();
+    auth_session::revoke_all(pool, customer.id, RevokeReason::PasswordChange).await?;
+    let refresh_token = start_session(state, customer.id, false).await?;
+    let access_token =
+        state
+            .auth_service
+            .generate_access_token(customer.id, &customer.email, &customer.role)?;
+    Ok(RefreshTokenResponse {
+        access_token,
+        refresh_token,
+        token_type: "Bearer".to_string(),
+        expires_in: state.auth_service.access_token_lifetime_secs(),
+    })
 }
 
 /// Request password reset
@@ -564,6 +715,10 @@ pub async fn confirm_password_reset(
         .update_password_hash(claims.sub, &password_hash)
         .await?;
 
+    // A reset means the old password may be known to someone else: end every session.
+    let pool = state.db.pool();
+    auth_session::revoke_all(pool, claims.sub, RevokeReason::PasswordChange).await?;
+
     // Imported customers proving email access via password reset are marked verified.
     state
         .customer_service
@@ -642,15 +797,16 @@ pub fn public_router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/register", post(register))
         .route("/auth/refresh", post(refresh_token))
+        .route("/auth/logout", post(logout))
         .route("/auth/password-reset", post(request_password_reset))
         .route("/auth/password-reset/confirm", post(confirm_password_reset))
         .route("/auth/verify-email", post(verify_email))
         .route("/auth/resend-verification", post(resend_verification_email))
 }
 
-/// Protected auth routes (API key required)
+/// Protected auth routes (signed-in customer)
 pub fn protected_router() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/customers/me/password", post(change_password))
 }
 
 #[cfg(test)]
