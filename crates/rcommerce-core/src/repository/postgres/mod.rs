@@ -3,6 +3,7 @@
 pub mod customer_repository;
 pub mod newsletter_repository;
 pub mod product_repository;
+pub mod product_search;
 pub mod review_repository;
 
 pub use customer_repository::PostgresCustomerRepository;

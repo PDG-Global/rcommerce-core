@@ -17,20 +17,47 @@ use rcommerce_core::models::{
 use rcommerce_core::repository::{CategoryRepository, PostgresCategoryRepository};
 use rcommerce_core::services::product_service::ProductList;
 use rcommerce_core::services::{PaginationInfo, PaginationParams};
+use rcommerce_core::{Error, SortDirection, SortParams};
 
-/// List products from database
+/// The order a listing asks for (`None`: newest first)
+fn listing_sort(sort: Option<&str>) -> Result<Option<SortParams>, Error> {
+    let (field, direction) = match sort.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("newest") => return Ok(None),
+        Some("price_asc") => ("price", SortDirection::Asc),
+        Some("price_desc") => ("price", SortDirection::Desc),
+        Some("name_asc") => ("title", SortDirection::Asc),
+        Some("name_desc") => ("title", SortDirection::Desc),
+        Some(_) => {
+            return Err(Error::validation(
+                "sort must be newest, price_asc, price_desc, name_asc or name_desc",
+            ))
+        }
+    };
+    Ok(Some(SortParams {
+        field: field.to_string(),
+        direction,
+    }))
+}
+
+/// List active products: category, search, price range, order, paging
 pub async fn list_products(
     State(state): State<AppState>,
     Query(params): Query<ListProductsParams>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, Error> {
+    let sort = listing_sort(params.sort.as_deref())?;
+    if let (Some(min), Some(max)) = (params.min_price, params.max_price) {
+        if min > max {
+            return Err(Error::validation("min_price is above max_price"));
+        }
+    }
     let category_filter = if let Some(category_slug) = params.category.as_deref() {
         let cat_repo = PostgresCategoryRepository::new(state.db.pool().clone());
         match cat_repo.get_by_slug(category_slug).await {
             Ok(Some(cat)) => Some(cat.id),
-            Ok(None) => return Json(empty_product_list()),
+            Ok(None) => return Ok(Json(empty_product_list())),
             Err(e) => {
                 tracing::error!("Failed to lookup category {}: {}", category_slug, e);
-                return Json(empty_product_list());
+                return Ok(Json(empty_product_list()));
             }
         }
     } else {
@@ -50,23 +77,25 @@ pub async fn list_products(
             .map(str::trim)
             .filter(|q| !q.is_empty())
             .map(|q| q.to_string()),
+        price_min: params.min_price,
+        price_max: params.max_price,
         ..Default::default()
     };
     let product_list = match state
         .product_service
-        .list_products(Some(filter), pagination)
+        .list_products_sorted(Some(filter), pagination, sort)
         .await
     {
         Ok(list) => list,
         Err(e) => {
             tracing::error!("Failed to list products: {}", e);
-            return Json(empty_product_list());
+            return Ok(Json(empty_product_list()));
         }
     };
 
     let cards = ProductCards::load(&state, &product_list.products).await;
     let products = cards.into_cards(product_list.products);
-    Json(product_list_json(products, &product_list.pagination))
+    Ok(Json(product_list_json(products, &product_list.pagination)))
 }
 
 /// Response of a product listing
@@ -221,8 +250,15 @@ fn or_empty<T: Default, E: std::fmt::Display>(result: Result<T, E>, what: &str) 
 #[derive(Debug, Deserialize, Default)]
 pub struct ListProductsParams {
     category: Option<String>,
-    /// Case-insensitive search across product title and description
+    /// Search: every word must appear in the title, description, SKU or a variant
+    /// SKU, ignoring case, accents, spaces and decimal comma vs dot
     q: Option<String>,
+    /// `newest` (default), `price_asc`, `price_desc`, `name_asc` or `name_desc`
+    sort: Option<String>,
+    /// Lowest price, excluding tax
+    min_price: Option<rust_decimal::Decimal>,
+    /// Highest price, excluding tax
+    max_price: Option<rust_decimal::Decimal>,
     /// 1-based page number (default 1)
     page: Option<i64>,
     /// Page size, clamped to 1..=100 (default 20)

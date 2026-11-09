@@ -1,30 +1,20 @@
 use async_trait::async_trait;
-use sqlx::Row;
+use sqlx::{Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
-use super::PostgresDb;
+use super::{product_search, PostgresDb};
 use crate::repository::traits::ProductRepositoryTrait;
 use crate::{
     models::{
         CreateProductRequest, Product, ProductFilter, ProductImage, ProductOption,
         ProductOptionValue, ProductVariant, UpdateProductRequest,
     },
-    Pagination, Result, SortDirection, SortParams,
+    Pagination, Result, SortParams,
 };
 
 #[derive(Clone)]
 pub struct PostgresProductRepository {
     db: PostgresDb,
-}
-
-/// Escape user input for use inside an ILIKE pattern matched with ESCAPE '\'.
-/// Without this, '%' and '_' in the query would act as wildcards and a
-/// backslash could break out of the escaping scheme.
-fn escape_ilike_pattern(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 impl PostgresProductRepository {
@@ -306,114 +296,17 @@ impl ProductRepositoryTrait for PostgresProductRepository {
         pagination: &Pagination,
         sort: Option<&SortParams>,
     ) -> Result<Vec<Product>> {
-        let mut query = String::from("SELECT * FROM products WHERE 1=1");
-        let mut param_count = 0;
-
-        // Track which parameters we need to bind
-        let has_category = filter.category_id.is_some();
-        let has_price_min = filter.price_min.is_some();
-        let has_price_max = filter.price_max.is_some();
-        let has_query = filter
-            .query
-            .as_deref()
-            .map(|q| !q.trim().is_empty())
-            .unwrap_or(false);
-
-        if let Some(status) = filter.status {
-            match status {
-                crate::models::ProductStatus::Active => {
-                    query.push_str(" AND is_active = true");
-                }
-                crate::models::ProductStatus::Draft => {
-                    query.push_str(" AND is_active = false AND published_at IS NULL");
-                }
-                crate::models::ProductStatus::Archived => {}
-            }
-        }
-
-        if has_category {
-            param_count += 1;
-            query.push_str(&format!(
-                " AND id IN (SELECT product_id FROM product_category_relations WHERE category_id = ${})",
-                param_count
-            ));
-        }
-
-        if has_query {
-            param_count += 1;
-            // Escape ILIKE wildcards in the user input so '%' and '_' are
-            // treated literally; ESCAPE '\' handles the backslash itself.
-            query.push_str(&format!(
-                " AND (title ILIKE '%' || ${0} || '%' ESCAPE '\\' OR description ILIKE '%' || ${0} || '%' ESCAPE '\\')",
-                param_count
-            ));
-        }
-
-        if has_price_min {
-            param_count += 1;
-            query.push_str(&format!(" AND price >= ${}", param_count));
-        }
-
-        if has_price_max {
-            param_count += 1;
-            query.push_str(&format!(" AND price <= ${}", param_count));
-        }
-
-        // Add sorting - validate sort field against whitelist
-        if let Some(sort) = sort {
-            let allowed_columns = [
-                "id",
-                "title",
-                "slug",
-                "price",
-                "created_at",
-                "updated_at",
-                "inventory_quantity",
-            ];
-            if !allowed_columns.contains(&sort.field.as_str()) {
-                return Err(crate::Error::validation("Invalid sort field"));
-            }
-            let direction = match sort.direction {
-                SortDirection::Asc => "ASC",
-                SortDirection::Desc => "DESC",
-            };
-            // Use the validated field directly in the query string
-            // This is safe because we've validated it against a whitelist
-            query.push_str(&format!(" ORDER BY {} {}", sort.field, direction));
-        } else {
-            query.push_str(" ORDER BY created_at DESC");
-        }
-
-        // Add pagination
-        let limit_idx = param_count + 1;
-        let offset_idx = param_count + 2;
-        query.push_str(&format!(" LIMIT ${} OFFSET ${}", limit_idx, offset_idx));
-
-        // Build query with explicit binds
-        let mut query_builder = sqlx::query_as::<_, Product>(&query);
-
-        if let Some(category_id) = filter.category_id {
-            query_builder = query_builder.bind(category_id);
-        }
-        if let Some(query_text) = filter
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-        {
-            query_builder = query_builder.bind(escape_ilike_pattern(query_text));
-        }
-        if let Some(price_min) = filter.price_min {
-            query_builder = query_builder.bind(price_min);
-        }
-        if let Some(price_max) = filter.price_max {
-            query_builder = query_builder.bind(price_max);
-        }
-        query_builder = query_builder.bind(pagination.per_page);
-        query_builder = query_builder.bind(pagination.offset());
-
-        let products = query_builder.fetch_all(self.db.pool()).await?;
-
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT * FROM products");
+        product_search::push_filter(&mut qb, filter);
+        product_search::push_order(&mut qb, filter, sort)?;
+        qb.push(" LIMIT ")
+            .push_bind(pagination.per_page)
+            .push(" OFFSET ")
+            .push_bind(pagination.offset());
+        let products = qb
+            .build_query_as::<Product>()
+            .fetch_all(self.db.pool())
+            .await?;
         Ok(products)
     }
 
@@ -421,61 +314,11 @@ impl ProductRepositoryTrait for PostgresProductRepository {
         self.find_by_slug(slug).await
     }
 
+    /// Same conditions as `find_with_filter` (shared builder), so `meta.total` matches
     async fn count_by_filter(&self, filter: &ProductFilter) -> Result<i64> {
-        let mut query = String::from("SELECT COUNT(*) FROM products WHERE 1=1");
-        let mut param_count = 0;
-
-        // Must mirror find_with_filter, otherwise meta.total counts
-        // inactive/draft products that the page query excludes.
-        if let Some(status) = filter.status {
-            match status {
-                crate::models::ProductStatus::Active => {
-                    query.push_str(" AND is_active = true");
-                }
-                crate::models::ProductStatus::Draft => {
-                    query.push_str(" AND is_active = false AND published_at IS NULL");
-                }
-                crate::models::ProductStatus::Archived => {}
-            }
-        }
-
-        if filter.category_id.is_some() {
-            param_count += 1;
-            query.push_str(&format!(
-                " AND id IN (SELECT product_id FROM product_category_relations WHERE category_id = ${})",
-                param_count
-            ));
-        }
-
-        let has_query = filter
-            .query
-            .as_deref()
-            .map(|q| !q.trim().is_empty())
-            .unwrap_or(false);
-        if has_query {
-            param_count += 1;
-            query.push_str(&format!(
-                " AND (title ILIKE '%' || ${0} || '%' ESCAPE '\\' OR description ILIKE '%' || ${0} || '%' ESCAPE '\\')",
-                param_count
-            ));
-        }
-
-        let mut q = sqlx::query(&query);
-        if let Some(category_id) = filter.category_id {
-            q = q.bind(category_id);
-        }
-        if let Some(query_text) = filter
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-        {
-            q = q.bind(escape_ilike_pattern(query_text));
-        }
-
-        let row = q.fetch_one(self.db.pool()).await?;
-
-        let count: i64 = row.get(0);
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM products");
+        product_search::push_filter(&mut qb, filter);
+        let count: i64 = qb.build().fetch_one(self.db.pool()).await?.get(0);
         Ok(count)
     }
 
