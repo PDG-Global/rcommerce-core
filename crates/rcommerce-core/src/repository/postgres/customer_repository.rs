@@ -73,59 +73,55 @@ impl PostgresCustomerRepository {
         Ok(customer)
     }
 
+    /// Update the fields set in `request`; `None` leaves a field unchanged and an empty
+    /// `phone` clears it
     pub async fn update_with_request(
         &self,
         id: Uuid,
         request: UpdateCustomerRequest,
     ) -> Result<Customer> {
-        let mut sets = Vec::new();
-        let mut param_count = 0;
-
-        // Track which fields are present
-        let has_email = request.email.is_some();
-        let has_first_name = request.first_name.is_some();
-        let has_last_name = request.last_name.is_some();
-
-        if has_email {
-            param_count += 1;
-            sets.push(format!("email = ${}", param_count));
-        }
-        if has_first_name {
-            param_count += 1;
-            sets.push(format!("first_name = ${}", param_count));
-        }
-        if has_last_name {
-            param_count += 1;
-            sets.push(format!("last_name = ${}", param_count));
-        }
-
-        if sets.is_empty() {
-            return Err(crate::Error::Validation("No fields to update".to_string()));
-        }
-
-        let id_idx = param_count + 1;
-        let query = format!(
-            "UPDATE customers SET {}, updated_at = NOW() WHERE id = ${} RETURNING *",
-            sets.join(", "),
-            id_idx
-        );
-
-        // Build query with explicit binds
-        let mut query_builder = sqlx::query_as::<_, Customer>(&query);
-
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE customers SET updated_at = NOW()");
+        let mut changed = false;
+        let mut set = |column: &str| {
+            changed = true;
+            format!(", {column} = ")
+        };
         if let Some(email) = request.email {
-            query_builder = query_builder.bind(email);
+            query.push(set("email")).push_bind(email);
         }
         if let Some(first_name) = request.first_name {
-            query_builder = query_builder.bind(first_name);
+            query.push(set("first_name")).push_bind(first_name);
         }
         if let Some(last_name) = request.last_name {
-            query_builder = query_builder.bind(last_name);
+            query.push(set("last_name")).push_bind(last_name);
         }
-        query_builder = query_builder.bind(id);
-
-        let customer = query_builder.fetch_one(self.db.pool()).await?;
-
+        if let Some(phone) = request.phone {
+            query
+                .push(set("phone"))
+                .push("NULLIF(")
+                .push_bind(phone)
+                .push(", '')");
+        }
+        if let Some(accepts_marketing) = request.accepts_marketing {
+            query
+                .push(set("accepts_marketing"))
+                .push_bind(accepts_marketing);
+        }
+        if let Some(tax_exempt) = request.tax_exempt {
+            query.push(set("tax_exempt")).push_bind(tax_exempt);
+        }
+        if !changed {
+            return Err(crate::Error::Validation("No fields to update".to_string()));
+        }
+        query
+            .push(" WHERE id = ")
+            .push_bind(id)
+            .push(" RETURNING *");
+        let customer = query
+            .build_query_as::<Customer>()
+            .fetch_one(self.db.pool())
+            .await?;
         Ok(customer)
     }
 
