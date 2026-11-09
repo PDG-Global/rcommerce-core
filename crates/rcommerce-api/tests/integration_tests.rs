@@ -2181,6 +2181,118 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// POST a JSON body, optionally with a bearer token; returns the status and JSON body
+async fn post_json(
+    app: &TestApp,
+    path: &str,
+    body: serde_json::Value,
+    bearer: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let mut request = app
+        .http_client
+        .post(format!("{}/api/v1{}", app.base_url(), path))
+        .json(&body);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.expect("request failed");
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// Sign in and return (access token, refresh token)
+async fn sign_in(app: &TestApp, email: &str, password: &str) -> (String, String) {
+    let body = serde_json::json!({ "email": email, "password": password });
+    let (status, auth) = post_json(app, "/auth/login", body, None).await;
+    assert_eq!(status, 200, "login failed: {auth}");
+    let field = |name: &str| auth[name].as_str().expect("token").to_string();
+    (field("access_token"), field("refresh_token"))
+}
+
+/// Exchange a refresh token; returns the status and the new refresh token, if any
+async fn refresh(app: &TestApp, token: &str) -> (u16, Option<String>) {
+    let body = serde_json::json!({ "refresh_token": token });
+    let (status, body) = post_json(app, "/auth/refresh", body, None).await;
+    (status, body["refresh_token"].as_str().map(str::to_string))
+}
+
+/// Refresh tokens work once; replaying one ends the session; logout ends it too
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_refresh_tokens_rotate_and_sessions_end() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+
+    let (_, first) = sign_in(&app, &customer.email, &password).await;
+    let (status, second) = refresh(&app, &first).await;
+    assert_eq!(status, 200);
+    let second = second.expect("rotated refresh token");
+    assert_ne!(second, first);
+
+    // Replaying the used token ends the session, so its successor stops working too
+    assert_eq!(refresh(&app, &first).await.0, 401);
+    assert_eq!(refresh(&app, &second).await.0, 401);
+
+    // Logout ends only that session
+    let (_, kept) = sign_in(&app, &customer.email, &password).await;
+    let (_, ended) = sign_in(&app, &customer.email, &password).await;
+    let body = serde_json::json!({ "refresh_token": ended });
+    assert_eq!(post_json(&app, "/auth/logout", body, None).await.0, 204);
+    assert_eq!(refresh(&app, &ended).await.0, 401);
+    let (status, kept) = refresh(&app, &kept).await;
+    assert_eq!(status, 200);
+
+    // An access token is not a refresh token
+    let (access, _) = sign_in(&app, &customer.email, &password).await;
+    assert_eq!(refresh(&app, &access).await.0, 401);
+    drop(kept);
+    app.cleanup().await.ok();
+}
+
+/// Changing or resetting the password ends every session
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_password_change_and_reset_end_sessions() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let (access, other_device) = sign_in(&app, &customer.email, &password).await;
+
+    // The current password is required
+    let wrong = serde_json::json!({ "current_password": "nope-nope-nope", "new_password": "N3w-password!" });
+    let (status, _) = post_json(&app, "/customers/me/password", wrong, Some(&access)).await;
+    assert!(
+        (400..500).contains(&status) && status != 401,
+        "status {status}"
+    );
+    let anonymous =
+        serde_json::json!({ "current_password": password, "new_password": "N3w-password!" });
+    let (status, _) = post_json(&app, "/customers/me/password", anonymous.clone(), None).await;
+    assert_eq!(status, 401);
+
+    let (status, fresh) = post_json(&app, "/customers/me/password", anonymous, Some(&access)).await;
+    assert_eq!(status, 200, "change failed: {fresh}");
+    assert_eq!(refresh(&app, &other_device).await.0, 401);
+    let fresh = fresh["refresh_token"].as_str().unwrap().to_string();
+    let (status, fresh) = refresh(&app, &fresh).await;
+    assert_eq!(status, 200);
+    let body = serde_json::json!({ "email": customer.email, "password": password });
+    assert_eq!(post_json(&app, "/auth/login", body, None).await.0, 401);
+
+    // A password reset ends the sessions opened since
+    let token = app
+        .app_state
+        .auth_service
+        .generate_password_reset_token(customer.id, &customer.email)
+        .unwrap();
+    let body = serde_json::json!({ "token": token, "password": "Reset-password-2!" });
+    let (status, _) = post_json(&app, "/auth/password-reset/confirm", body, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(refresh(&app, &fresh.unwrap()).await.0, 401);
+    sign_in(&app, &customer.email, "Reset-password-2!").await;
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {

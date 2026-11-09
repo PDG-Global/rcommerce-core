@@ -1,5 +1,6 @@
 pub mod api_key_scopes;
 pub mod auth_service;
+pub mod auth_session;
 pub mod bundle_service;
 pub(crate) mod cart_mutation;
 pub mod cart_service;

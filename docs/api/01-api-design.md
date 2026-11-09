@@ -86,8 +86,42 @@ Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
 ```
 
 **Token expiration:**
-- Access token: 24 hours (configurable via `security.jwt.expiry_hours`)
-- Refresh token: 7 days (configurable)
+- Access token: 24 hours (configurable via `security.jwt.expiry_hours`); `expires_in`
+  reports the configured lifetime in seconds
+- Refresh token: 7 days (`security.jwt.refresh_expiry_hours`), 30 days with
+  `"remember_me": true`
+
+**Sessions and refresh rotation:** each login opens a session (`auth_sessions`).
+A refresh token works once: `POST /api/v1/auth/refresh` returns a new
+`refresh_token` with the new access token, and the client must keep the new one.
+Presenting a refresh token that was already used ends its session, so a copied
+token and the original both stop working (`401`). Clients must therefore not
+refresh twice in parallel with the same token. Rotation does not extend the
+session: it ends at the time fixed at login.
+
+```bash
+POST /api/v1/auth/refresh
+{ "refresh_token": "..." }
+```
+```json
+{ "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 86400 }
+```
+
+- `POST /api/v1/auth/logout` with `{ "refresh_token": "..." }` ends that session
+  (`204`).
+- `POST /api/v1/customers/me/password` (JWT) with
+  `{ "current_password": "...", "new_password": "..." }` changes the password
+  (8 to 128 characters). A wrong current password is a validation error (not
+  `401`), counted by the login throttle. Every session of the account ends and
+  the response carries fresh tokens, in the refresh response's shape.
+- A password reset (`POST /api/v1/auth/password-reset/confirm`) also ends every
+  session.
+- Access tokens are not looked up per request: one already issued stays valid
+  until it expires, even after logout. Keep `security.jwt.expiry_hours` short
+  (for example 1) when sign-out must take effect quickly; apps refresh in the
+  background.
+- Refresh tokens issued before sessions existed are accepted once and exchanged
+  for a session that ends when the old token would have expired.
 
 **Token types:** only access tokens authenticate API requests. Refresh tokens are
 accepted by `POST /api/v1/auth/refresh` only, and password-reset and e-mail
@@ -224,7 +258,8 @@ admin > write > read
 |--------|------|-------------|
 | POST | `/api/v1/auth/login` | User login |
 | POST | `/api/v1/auth/register` | User registration |
-| POST | `/api/v1/auth/refresh` | Refresh access token |
+| POST | `/api/v1/auth/refresh` | Refresh access token (rotates the refresh token) |
+| POST | `/api/v1/auth/logout` | End the session of a refresh token |
 | POST | `/api/v1/carts/guest` | Create guest cart |
 | * | `/api/v1/carts/:id` and item/coupon subroutes | Guest UUID access, or matching owner JWT for customer carts |
 | POST | `/api/v1/checkout/*` | Guest or matching cart-owner JWT |
@@ -237,6 +272,7 @@ and checkout operation. Guest cart UUIDs are bearer capabilities.
 | Method | Path | Auth Type | Description |
 |--------|------|-----------|-------------|
 | GET | `/api/v1/carts/me` | JWT | Get customer cart |
+| POST | `/api/v1/customers/me/password` | JWT | Change password; ends every session |
 | POST | `/api/v1/carts/merge` | JWT | Merge guest cart |
 | GET | `/api/v1/customers` | JWT | List customers |
 | GET/POST | `/api/v1/orders` | JWT | List or directly create orders |

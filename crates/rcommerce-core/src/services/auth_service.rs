@@ -194,6 +194,8 @@ impl AuthService {
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
             aud: "rcommerce-api".to_string(),
+            sid: None,
+            jti: None,
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -203,27 +205,39 @@ impl AuthService {
             .map_err(|e| Error::internal(format!("Failed to generate JWT: {}", e)))
     }
 
-    /// Generate JWT refresh token
-    pub fn generate_refresh_token(&self, customer_id: Uuid, remember_me: bool) -> Result<String> {
-        let expiry_hours = if remember_me {
-            24 * 30 // 30 days
-        } else {
-            self.config.security.jwt.refresh_expiry_hours as i64
-        };
-        let expiration = Utc::now()
-            .checked_add_signed(Duration::hours(expiry_hours))
-            .expect("valid timestamp")
-            .timestamp();
+    /// Lifetime of an access token, in seconds (the `expires_in` of auth responses)
+    pub fn access_token_lifetime_secs(&self) -> i64 {
+        self.config.security.jwt.expiry_hours as i64 * 3600
+    }
 
+    /// How long a refresh-token session lasts: 30 days with "remember me", otherwise
+    /// `security.jwt.refresh_expiry_hours`
+    pub fn refresh_lifetime(&self, remember_me: bool) -> Duration {
+        if remember_me {
+            Duration::days(30)
+        } else {
+            Duration::hours(self.config.security.jwt.refresh_expiry_hours as i64)
+        }
+    }
+
+    /// Generate the JWT refresh token for one session token (see `auth_session`). It
+    /// expires with its session.
+    pub fn generate_refresh_token(
+        &self,
+        customer_id: Uuid,
+        session: &super::auth_session::SessionToken,
+    ) -> Result<String> {
         let claims = JwtClaims {
             sub: customer_id,
             email: String::new(), // Refresh tokens don't need email
             token_type: TokenType::Refresh,
             permissions: vec!["refresh".to_string()],
-            exp: expiration,
+            exp: session.expires_at.timestamp(),
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
             aud: "rcommerce-api".to_string(),
+            sid: Some(session.session_id),
+            jti: Some(session.token_id),
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -289,6 +303,8 @@ impl AuthService {
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
             aud: "rcommerce-api".to_string(),
+            sid: None,
+            jti: None,
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -329,6 +345,8 @@ impl AuthService {
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
             aud: "rcommerce-api".to_string(),
+            sid: None,
+            jti: None,
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -407,6 +425,12 @@ pub struct JwtClaims {
     pub iat: i64,    // Issued at
     pub iss: String, // Issuer
     pub aud: String, // Audience
+    /// Refresh tokens only: the session the token belongs to
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
+    /// Refresh tokens only: the token's id inside its session
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -448,7 +472,15 @@ mod tests {
             .unwrap();
         assert_eq!(auth.verify_access_token(&access).unwrap().sub, id);
 
-        let refresh = auth.generate_refresh_token(id, true).unwrap();
+        let session = super::super::auth_session::SessionToken {
+            session_id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            expires_at: Utc::now() + Duration::days(1),
+        };
+        let refresh = auth.generate_refresh_token(id, &session).unwrap();
+        let claims = auth.verify_token(&refresh).unwrap();
+        assert_eq!(claims.sid, Some(session.session_id));
+        assert_eq!(claims.jti, Some(session.token_id));
         let reset = auth
             .generate_password_reset_token(id, "a@example.com")
             .unwrap();
