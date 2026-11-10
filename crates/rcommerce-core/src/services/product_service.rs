@@ -69,11 +69,22 @@ impl ProductService {
         filter: Option<ProductFilter>,
         pagination: PaginationParams,
     ) -> Result<ProductList> {
+        self.list_products_sorted(filter, pagination, None).await
+    }
+
+    /// A page of products in the given order (newest first when `None`; a search puts
+    /// the exact SKU match first either way)
+    pub async fn list_products_sorted(
+        &self,
+        filter: Option<ProductFilter>,
+        pagination: PaginationParams,
+        sort: Option<crate::models::SortParams>,
+    ) -> Result<ProductList> {
         let filter = filter.unwrap_or_default();
-        let sort = crate::models::SortParams {
+        let sort = sort.unwrap_or(crate::models::SortParams {
             field: "created_at".to_string(),
             direction: crate::models::SortDirection::Desc,
-        };
+        });
 
         let pagination = crate::models::Pagination {
             page: pagination.page,

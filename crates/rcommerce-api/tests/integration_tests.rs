@@ -2233,6 +2233,111 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Titles (and SKUs) of a product listing
+async fn listing(app: &TestApp, query: &str) -> (u16, Vec<String>, i64) {
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/products?{query}", app.base_url()))
+        .send()
+        .await
+        .expect("listing request");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let titles = body["products"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|p| p["title"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (status, titles, body["meta"]["total"].as_i64().unwrap_or(-1))
+}
+
+/// Search finds references and other spellings of units and accents; listings sort
+/// and filter by price, and the total follows the filters
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_catalogue_search_sort_and_price_filters() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    // A word no other test uses, so only these products match
+    let marker: String = Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .take(8)
+        .collect::<String>()
+        + "zq";
+    let products = [
+        (
+            "Ciment Portland 25 kg",
+            "7.95",
+            Some(format!("{}-0005", marker.to_uppercase())),
+        ),
+        ("Fil inox 1,2 mm", "3.10", None),
+        ("Bloc béton creux", "1.29", None),
+        ("Brouette acier", "64.00", None),
+    ];
+    for (title, price, sku) in &products {
+        let id = app
+            .create_test_product(&format!("{marker} {title}"), price.parse().unwrap(), 5)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE products SET sku = $2 WHERE id = $1")
+            .bind(id)
+            .bind(sku)
+            .execute(&app.db_pool)
+            .await
+            .unwrap();
+    }
+    let name = |i: usize| format!("{marker} {}", products[i].0);
+
+    // Units without a space, decimal dot for a comma, no accent, a SKU in lower case
+    assert_eq!(
+        listing(&app, &format!("q={marker}+25kg")).await.1,
+        vec![name(0)]
+    );
+    assert_eq!(
+        listing(&app, &format!("q={marker}+1.2mm")).await.1,
+        vec![name(1)]
+    );
+    assert_eq!(
+        listing(&app, &format!("q={marker}+beton")).await.1,
+        vec![name(2)]
+    );
+    assert_eq!(
+        listing(&app, &format!("q={marker}-0005")).await.1,
+        vec![name(0)]
+    );
+    // Every word must match, in any order
+    assert_eq!(
+        listing(&app, &format!("q=acier+{marker}")).await.1,
+        vec![name(3)]
+    );
+    assert!(listing(&app, &format!("q={marker}+nothing"))
+        .await
+        .1
+        .is_empty());
+
+    let (_, cheap_first, total) = listing(&app, &format!("q={marker}&sort=price_asc")).await;
+    assert_eq!(cheap_first, vec![name(2), name(1), name(0), name(3)]);
+    assert_eq!(total, 4);
+    let (_, dear_first, _) = listing(&app, &format!("q={marker}&sort=price_desc")).await;
+    assert_eq!(dear_first.first(), Some(&name(3)));
+    let (_, ranged, total) = listing(
+        &app,
+        &format!("q={marker}&min_price=2&max_price=8&sort=price_asc"),
+    )
+    .await;
+    assert_eq!(ranged, vec![name(1), name(0)]);
+    assert_eq!(total, 2, "the total follows the price filter");
+
+    assert_eq!(listing(&app, "sort=cheapest").await.0, 400);
+    assert_eq!(listing(&app, "min_price=9&max_price=2").await.0, 400);
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {

@@ -243,7 +243,7 @@ and checkout operation. Guest cart UUIDs are bearer capabilities.
 | POST | `/api/v1/orders/:id/fulfillments` | Admin JWT | Manually fulfill an entire order |
 | * | `/api/v1/payments/*` | JWT | Payment operations (refunds additionally require admin) |
 | * | `/api/v1/payment-methods/*` | JWT | Saved payment methods |
-| GET | `/api/v1/products` | API Key | List products |
+| GET | `/api/v1/products` | API Key | List products (search, sort, price range: see 07-catalogue-listing.md) |
 | POST | `/api/v1/products` | API Key | Create product |
 
 ### Middleware Implementation
