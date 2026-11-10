@@ -1202,16 +1202,18 @@ fn schedule_limiter_cleanup(limiter: RateLimiter) {
     }
 }
 
-/// Periodically clean the AppState-owned login throttle and auth limiter.
+/// Periodically clean the AppState-owned login throttle and endpoint limiters.
 fn spawn_state_cleanup(app_state: &AppState) {
     let login_throttle = app_state.login_throttle.clone();
     let auth_limiter = app_state.auth_rate_limiter.clone();
+    let contact_limiter = app_state.contact_rate_limiter.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
         loop {
             interval.tick().await;
             login_throttle.cleanup();
             auth_limiter.cleanup().await;
+            contact_limiter.cleanup().await;
         }
     });
 }
@@ -1326,7 +1328,7 @@ pub fn api_routes(app_state: AppState) -> Router<AppState> {
             "/webhooks/:gateway_id",
             post(crate::routes::payment::handle_webhook),
         )
-        // Contact form is public (validated by form fields)
+        // Contact form is public; input is validated before sending email
         .route("/contact", post(crate::routes::contact::submit_contact))
         // Newsletter signup is public and idempotent
         .merge(crate::routes::newsletter_router())

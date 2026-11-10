@@ -170,6 +170,43 @@ pub async fn list_orders(
 
     match result {
         Ok(orders) => {
+            let order_ids: Vec<Uuid> = orders.iter().map(|order| order.id).collect();
+            let mut items_by_order: std::collections::HashMap<Uuid, Vec<OrderItemResponse>> =
+                std::collections::HashMap::new();
+            if !order_ids.is_empty() {
+                let items = match sqlx::query_as::<_, rcommerce_core::models::OrderItem>(
+                    "SELECT * FROM order_items WHERE order_id = ANY($1)",
+                )
+                .bind(&order_ids)
+                .fetch_all(state.db.pool())
+                .await
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        tracing::error!("Failed to load items for order list: {}", e);
+                        return Json(serde_json::json!({
+                            "orders": [],
+                            "meta": { "total": 0, "page": 1, "per_page": 50 }
+                        }));
+                    }
+                };
+                for item in items {
+                    items_by_order
+                        .entry(item.order_id)
+                        .or_default()
+                        .push(OrderItemResponse {
+                            id: item.id,
+                            product_id: item.product_id,
+                            variant_id: item.variant_id,
+                            name: item.title,
+                            sku: item.sku,
+                            quantity: item.quantity,
+                            price: item.price,
+                            total: item.total,
+                        });
+                }
+            }
+
             let order_responses: Vec<OrderResponse> = orders
                 .into_iter()
                 .map(|o| OrderResponse {
@@ -187,7 +224,7 @@ pub async fn list_orders(
                     discount_total: o.discount_total,
                     coupon_code: o.coupon_code.clone(),
                     total: o.total,
-                    items: vec![], // Will be populated separately
+                    items: items_by_order.remove(&o.id).unwrap_or_default(),
                     payments: vec![],
                     billing_address: o.billing_address.clone(),
                     shipping_address: o.shipping_address.clone(),

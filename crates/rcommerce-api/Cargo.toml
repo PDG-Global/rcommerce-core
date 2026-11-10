@@ -78,6 +78,7 @@ rand = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+lettre = { workspace = true }
 
 # PDF generation (using HTML print-to-PDF approach instead)
 

@@ -1623,6 +1623,58 @@ async fn test_admin_can_manually_fulfill_order_once() {
     app.cleanup().await.ok();
 }
 
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_order_list_includes_items() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let admin = app.admin_token().await.expect("Failed to create admin");
+    let product_id = app
+        .create_test_product("Order List Test Wheel", Decimal::from(30), 10)
+        .await
+        .unwrap();
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_email, status, payment_status, fulfillment_status, subtotal, total) VALUES ($1, $2, 'buyer@example.com', 'confirmed', 'paid', 'pending', 60, 60)",
+    )
+    .bind(order_id)
+    .bind(format!("TEST-LIST-{order_id}"))
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO order_items (id, order_id, product_id, title, quantity, price, total) VALUES ($1, $2, $3, 'Test wheel', 2, 30, 60)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(order_id)
+    .bind(product_id)
+    .execute(&app.db_pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .http_client
+        .get(format!("{}/api/v1/orders", app.base_url()))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let order = body["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|order| order["id"] == order_id.to_string())
+        .expect("Created order missing from list");
+    assert_eq!(order["items"].as_array().unwrap().len(), 1);
+    assert_eq!(order["items"][0]["name"], "Test wheel");
+    assert_eq!(order["items"][0]["quantity"], 2);
+    assert_eq!(order["items"][0]["total"], "60.00");
+
+    app.cleanup().await.ok();
+}
+
 async fn assert_cart_not_found(response: reqwest::Response) {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();

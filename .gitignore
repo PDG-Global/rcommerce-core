@@ -1,5 +1,6 @@
 # Rust
 target/
+Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -74,7 +75,7 @@ docs-website/venv/
 # Next.js build output
 frontend/.next/
 
-# Public repo keeps Cargo.lock for reproducible builds
-# Cargo.lock is intentionally tracked here
+# Public repo keeps the root Cargo.lock for reproducible builds
+!/Cargo.lock
 # Local cargo config (machine-specific targets/linkers) stays untracked
 .cargo/

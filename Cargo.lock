@@ -3833,6 +3833,7 @@ dependencies = [
  "hmac",
  "hyper",
  "ipnet",
+ "lettre",
  "mockall",
  "once_cell",
  "rand 0.8.6",

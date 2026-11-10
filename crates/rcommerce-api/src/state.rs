@@ -148,6 +148,8 @@ pub struct AppState {
     pub db: Database,
     pub redis: Option<RedisPool>,
     pub auth_rate_limiter: AuthRateLimiter,
+    /// Contact-form submissions per client IP, independent of auth limits.
+    pub contact_rate_limiter: AuthRateLimiter,
     /// Trusted-proxy-aware client IP resolver (rate limiting, login
     /// throttling, API-key audit).
     pub client_ip_resolver: ClientIpResolver,
@@ -179,6 +181,8 @@ impl AppState {
 
         // Create auth rate limiter (5 attempts per minute per IP)
         let auth_rate_limiter = AuthRateLimiter::new(5, 60, rate_limiting.max_tracked_ips.max(1));
+        let contact_rate_limiter =
+            AuthRateLimiter::new(5, 60 * 60, rate_limiting.max_tracked_ips.max(1));
 
         // Trusted-proxy-aware client IP resolution. Server startup validates
         // the configured CIDRs before AppState is built; this fallback only
@@ -313,6 +317,7 @@ impl AppState {
             db: params.db,
             redis: params.redis,
             auth_rate_limiter,
+            contact_rate_limiter,
             client_ip_resolver,
             login_throttle,
             dummy_password_hash,
