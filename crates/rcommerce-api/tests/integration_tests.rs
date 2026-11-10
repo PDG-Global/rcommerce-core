@@ -2233,6 +2233,39 @@ async fn test_concurrent_cancellations_cancel_an_order_once() {
     app.cleanup().await.ok();
 }
 
+/// Sign-ups racing for one e-mail: one account is created, the others are
+/// refused as a client error (no server error)
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_simultaneous_registrations_of_one_email() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let email = format!("race_{}@example.com", Uuid::new_v4());
+    let register = || {
+        app.http_client
+            .post(format!("{}/api/v1/auth/register", app.base_url()))
+            .json(&serde_json::json!({
+                "email": email, "password": "RacePassword123!",
+                "first_name": "Race", "last_name": "Test"
+            }))
+            .send()
+    };
+    let (a, b, c, d) = tokio::join!(register(), register(), register(), register());
+    let statuses: Vec<u16> = [a, b, c, d]
+        .into_iter()
+        .map(|r| r.expect("Failed to register").status().as_u16())
+        .collect();
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 201).count(),
+        1,
+        "{statuses:?}"
+    );
+    assert!(
+        statuses.iter().all(|s| *s == 201 || *s == 400),
+        "{statuses:?}"
+    );
+    app.cleanup().await.ok();
+}
+
 /// Helper macro for running tests with reporting
 #[macro_export]
 macro_rules! test_with_report {
