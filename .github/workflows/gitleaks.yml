@@ -1,0 +1,26 @@
+name: gitleaks
+
+# A secret scan on every PR and push to main. Runs with `pull_request`
+# (never `pull_request_target`), so PRs from outside forks execute with
+# no secrets. No GITLEAKS_LICENSE: the CLI is invoked directly rather
+# than via gitleaks-action, whose org license gate we don't need.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: >-
+          docker run --rm -v "$PWD:/repo"
+          zricethezav/gitleaks:v8.24.3
+          git --redact --log-opts="--all" /repo
