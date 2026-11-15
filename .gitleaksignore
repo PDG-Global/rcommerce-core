@@ -1,0 +1,33 @@
+# False positives verified by hand on 2026-11-15 (PR #42): test fixtures,
+# doc placeholders ("YOUR_CUSTOMER_JWT"), format-check strings and
+# sample PEMs in tests. No live credentials. One fingerprint per line.
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/api_key_auth.rs:jwt:424
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/api_key_auth.rs:jwt:436
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/scopes.rs:generic-api-key:151
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/scopes.rs:jwt:155
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/tests/e2e_test_suite.rs:generic-api-key:700
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-cli/src/main.rs:generic-api-key:3003
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-core/src/payment/gateways/alipay.rs:private-key:464
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-core/src/payment/gateways/alipay_agnostic.rs:private-key:588
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-core/tests/payment_integration_tests.rs:private-key:15
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-core/tests/wechatpay_integration_tests.rs:private-key:18
+73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-core/tests/wechatpay_integration_tests.rs:private-key:224
+73fb885df29093a6108e52e933916afd94f480b6:docs/api/01-api-design.md:generic-api-key:65
+73fb885df29093a6108e52e933916afd94f480b6:docs/api/01-api-design.md:generic-api-key:66
+73fb885df29093a6108e52e933916afd94f480b6:docs/api/03-cart-api.md:generic-api-key:327
+73fb885df29093a6108e52e933916afd94f480b6:docs/api/03-cart-api.md:generic-api-key:73
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:229
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:241
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:267
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:305
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:319
+73fb885df29093a6108e52e933916afd94f480b6:docs/deployment/payment-testing.md:curl-auth-header:326
+73fb885df29093a6108e52e933916afd94f480b6:docs/development/cli-reference.md:generic-api-key:301
+73fb885df29093a6108e52e933916afd94f480b6:docs/development/developer-guide.md:curl-auth-header:337
+73fb885df29093a6108e52e933916afd94f480b6:docs/development/developer-guide.md:curl-auth-header:350
+73fb885df29093a6108e52e933916afd94f480b6:docs/migration-guides/02-woocommerce.md:curl-auth-user:35
+73fb885df29093a6108e52e933916afd94f480b6:docs/migration-guides/02-woocommerce.md:curl-auth-user:39
+73fb885df29093a6108e52e933916afd94f480b6:docs/migration-guides/02-woocommerce.md:curl-auth-user:43
+73fb885df29093a6108e52e933916afd94f480b6:docs/migration-guides/02-woocommerce.md:curl-auth-user:47
+73fb885df29093a6108e52e933916afd94f480b6:docs/project/DEMONSTRATION.md:curl-auth-header:79
+fe91cab30417fd7f8025c9fda84ae420501dc3a2:docs/deployment/payment-testing.md:curl-auth-header:327
