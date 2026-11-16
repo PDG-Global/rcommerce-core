@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+          # The GH_TOKEN step after this needs no persisted git credentials.
+          persist-credentials: false
       - name: Extract the tag's changelog section
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
