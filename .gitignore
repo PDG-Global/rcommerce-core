@@ -79,3 +79,5 @@ frontend/.next/
 !/Cargo.lock
 # Local cargo config (machine-specific targets/linkers) stays untracked
 .cargo/
+# Local test-run reports (never publish)
+test-reports/
