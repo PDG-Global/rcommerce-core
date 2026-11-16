@@ -1,6 +1,13 @@
 # False positives verified by hand on 2026-11-15 (PR #42): test fixtures,
 # doc placeholders ("YOUR_CUSTOMER_JWT"), format-check strings and
 # sample PEMs in tests. No live credentials. One fingerprint per line.
+#
+# Re-verified 2026-11-16 for the gitleaks v8.24.3 -> v8.30.1 pin bump (aligning
+# with the private rcommerce repo's scan): both versions were run over the full
+# history (--all) with this list removed, and each produced exactly these 30
+# fingerprints -- identical sets, no format change, so no entry needed rewriting.
+# The bump and this re-verification land in one commit on purpose: a pin moving
+# without its list is how an ignore file silently stops matching.
 73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/api_key_auth.rs:jwt:424
 73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/api_key_auth.rs:jwt:436
 73fb885df29093a6108e52e933916afd94f480b6:crates/rcommerce-api/src/middleware/scopes.rs:generic-api-key:151
