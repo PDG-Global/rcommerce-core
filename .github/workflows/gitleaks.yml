@@ -20,7 +20,13 @@ jobs:
         with:
           fetch-depth: 0
       - name: gitleaks
+        # Pin is deliberate: the fingerprint format is part of the gate's contract, and
+        # .gitleaksignore was written against this version. Bump the pin and re-verify
+        # the list in the SAME commit -- never one without the other. Aligned with the
+        # private rcommerce repo's scan (v8.30.1) on 2026-11-16: both versions were run
+        # over this repo's full history and produced the identical 30 fingerprints, so
+        # the list needed no rewrite. See the header of .gitleaksignore.
         run: >-
           docker run --rm -v "$PWD:/repo"
-          zricethezav/gitleaks:v8.24.3
+          zricethezav/gitleaks:v8.30.1
           git --redact --log-opts="--all" /repo
