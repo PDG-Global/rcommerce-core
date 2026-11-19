@@ -82,3 +82,6 @@ libc = "0.2"
 
 # Markdown rendering for help
 comrak = "0.26"
+[dev-dependencies]
+# E2E tests mount the real API routers in-process
+axum = { workspace = true }

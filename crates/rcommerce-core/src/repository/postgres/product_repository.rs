@@ -6,11 +6,13 @@ use super::PostgresDb;
 use crate::repository::traits::ProductRepositoryTrait;
 use crate::{
     models::{
-        CreateProductRequest, Product, ProductFilter, ProductImage, ProductOption,
-        ProductOptionValue, ProductVariant, UpdateProductRequest,
+        CreateProductRequest, CreateVariantRequest, Product, ProductFilter, ProductImage,
+        ProductOption, ProductOptionValue, ProductVariant, UpdateProductRequest,
     },
-    Pagination, Result, SortDirection, SortParams,
+    Error, Pagination, Result, SortDirection, SortParams,
 };
+use rust_decimal::Decimal;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone)]
 pub struct PostgresProductRepository {
@@ -25,6 +27,99 @@ fn escape_ilike_pattern(input: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Trim a name/value, refuse empty, and cap its length in characters (the DB
+/// columns are VARCHAR, so an over-long value would otherwise be silently
+/// truncated by Postgres). Returns the cleaned string.
+fn trimmed_capped(input: &str, max_chars: usize, field: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::validation(format!("{field} cannot be empty")));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(Error::validation(format!(
+            "{field} must be at most {max_chars} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// A variant price is money: exact decimal, non-negative, and no more precision
+/// than the DECIMAL(20,2) column stores (otherwise Postgres would round it).
+fn validate_price(price: Decimal) -> Result<()> {
+    if price < Decimal::new(0, 0) {
+        return Err(Error::validation("Price cannot be negative"));
+    }
+    if price.scale() > 2 {
+        return Err(Error::validation(
+            "Price must have at most 2 decimal places",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a GTIN pass-through: if present it must be 8–14 ASCII digits.
+fn validate_gtin(gtin: &Option<String>) -> Result<Option<String>> {
+    match gtin {
+        None => Ok(None),
+        Some(g) => {
+            let g = g.trim();
+            if g.is_empty() {
+                return Ok(None);
+            }
+            if !(8..=14).contains(&g.len()) || !g.chars().all(|c| c.is_ascii_digit()) {
+                return Err(Error::validation("GTIN must be 8–14 digits"));
+            }
+            Ok(Some(g.to_string()))
+        }
+    }
+}
+
+/// Refuse a variant whose set of (option, value) pairs duplicates another
+/// variant of the same product. Runs inside the caller's transaction so the
+/// check and the insert commit (or roll back) together. A combination is the
+/// SET of (option_id, value) pairs, independent of insertion order.
+async fn assert_combination_unique(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    product_id: Uuid,
+    variant_id: Uuid,
+) -> Result<()> {
+    let mine =
+        sqlx::query("SELECT option_id, value FROM product_option_values WHERE variant_id = $1")
+            .bind(variant_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    let my_set: BTreeSet<(Uuid, String)> = mine
+        .iter()
+        .map(|r| (r.get::<Uuid, _>("option_id"), r.get::<String, _>("value")))
+        .collect();
+
+    let others = sqlx::query(
+        "SELECT pov.variant_id, pov.option_id, pov.value \
+         FROM product_option_values pov \
+         JOIN product_variants pv ON pv.id = pov.variant_id \
+         WHERE pv.product_id = $1 AND pov.variant_id <> $2",
+    )
+    .bind(product_id)
+    .bind(variant_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut by_variant: HashMap<Uuid, BTreeSet<(Uuid, String)>> = HashMap::new();
+    for r in &others {
+        by_variant
+            .entry(r.get::<Uuid, _>("variant_id"))
+            .or_default()
+            .insert((r.get::<Uuid, _>("option_id"), r.get::<String, _>("value")));
+    }
+    for (other_id, set) in by_variant {
+        if set == my_set {
+            return Err(Error::validation(format!(
+                "Duplicate option combination: variant {other_id} already has this exact set of option values"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl PostgresProductRepository {
@@ -259,6 +354,245 @@ impl PostgresProductRepository {
                 (option, values)
             })
             .collect())
+    }
+
+    /// Refuse unless the product exists (variants/options hang off a product).
+    async fn ensure_product_exists(&self, product_id: Uuid) -> Result<()> {
+        let found: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM products WHERE id = $1")
+            .bind(product_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+        match found {
+            Some(_) => Ok(()),
+            None => Err(Error::not_found("Product not found")),
+        }
+    }
+
+    /// Create a product option (e.g. "Size", "Color"). Shared by the CLI and any
+    /// later admin-API route; validation lives here, not in the caller.
+    pub async fn create_option(
+        &self,
+        product_id: Uuid,
+        name: &str,
+        position: i32,
+    ) -> Result<ProductOption> {
+        self.ensure_product_exists(product_id).await?;
+        let name = trimmed_capped(name, 100, "Option name")?;
+
+        let mut tx = self.db.pool().begin().await?;
+        let existing: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM product_options WHERE product_id = $1 AND lower(name) = lower($2)",
+        )
+        .bind(product_id)
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            return Err(Error::validation(format!(
+                "Option '{name}' already exists for this product"
+            )));
+        }
+        let option = sqlx::query_as::<_, ProductOption>(
+            "INSERT INTO product_options (product_id, name, position) VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(product_id)
+        .bind(&name)
+        .bind(position)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(option)
+    }
+
+    /// Create a product variant. Wires up `CreateVariantRequest` (previously dead
+    /// code). Price/title/SKU/GTIN/inventory are validated here; one transaction.
+    pub async fn create_variant(&self, request: CreateVariantRequest) -> Result<ProductVariant> {
+        self.ensure_product_exists(request.product_id).await?;
+        let title = trimmed_capped(&request.title, 255, "Variant title")?;
+        validate_price(request.price)?;
+        let sku = match &request.sku {
+            Some(s) => Some(trimmed_capped(s, 100, "SKU")?),
+            None => None,
+        };
+        let gtin = validate_gtin(&request.gtin)?;
+        if request.inventory_quantity < 0 {
+            return Err(Error::validation("Inventory quantity cannot be negative"));
+        }
+
+        let mut tx = self.db.pool().begin().await?;
+        let variant = sqlx::query_as::<_, ProductVariant>(
+            "INSERT INTO product_variants ( \
+                product_id, title, sku, price, compare_at_price, cost_price, currency, \
+                inventory_quantity, inventory_policy, weight, weight_unit, requires_shipping, \
+                is_active, gtin \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+        )
+        .bind(request.product_id)
+        .bind(&title)
+        .bind(&sku)
+        .bind(request.price)
+        .bind(request.compare_at_price)
+        .bind(request.cost_price)
+        .bind(request.currency)
+        .bind(request.inventory_quantity)
+        .bind(request.inventory_policy)
+        .bind(request.weight)
+        .bind(request.weight_unit)
+        .bind(request.requires_shipping)
+        .bind(request.is_active)
+        .bind(&gtin)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(variant)
+    }
+
+    /// Attach one option value to a variant. Validates that BOTH the option and
+    /// the variant belong to the same product (a foreign option/variant is
+    /// refused), that the variant has no value for that option yet, and that the
+    /// resulting combination stays unique within the product. One transaction.
+    pub async fn create_option_value(
+        &self,
+        product_id: Uuid,
+        option_id: Uuid,
+        variant_id: Uuid,
+        value: &str,
+    ) -> Result<ProductOptionValue> {
+        let value = trimmed_capped(value, 100, "Option value")?;
+
+        let mut tx = self.db.pool().begin().await?;
+        let option: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM product_options WHERE id = $1 AND product_id = $2")
+                .bind(option_id)
+                .bind(product_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if option.is_none() {
+            return Err(Error::validation("Option does not belong to this product"));
+        }
+        let variant: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM product_variants WHERE id = $1 AND product_id = $2")
+                .bind(variant_id)
+                .bind(product_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if variant.is_none() {
+            return Err(Error::validation("Variant does not belong to this product"));
+        }
+        let duplicate: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM product_option_values WHERE option_id = $1 AND variant_id = $2",
+        )
+        .bind(option_id)
+        .bind(variant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if duplicate.is_some() {
+            return Err(Error::validation(
+                "This variant already has a value for that option",
+            ));
+        }
+        let option_value = sqlx::query_as::<_, ProductOptionValue>(
+            "INSERT INTO product_option_values (option_id, variant_id, value) VALUES ($1,$2,$3) RETURNING *",
+        )
+        .bind(option_id)
+        .bind(variant_id)
+        .bind(&value)
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_combination_unique(&mut tx, product_id, variant_id).await?;
+        tx.commit().await?;
+        Ok(option_value)
+    }
+
+    /// Create a variant together with its option values in ONE transaction, so a
+    /// failure leaves no partial options behind. `option_values` are
+    /// (option_name, value) pairs; each option must already exist on the product
+    /// (create it with `create_option`). This is the path that makes a variable
+    /// product's variant selectable in the storefront and addable to cart.
+    pub async fn create_variant_with_options(
+        &self,
+        request: CreateVariantRequest,
+        option_values: &[(String, String)],
+    ) -> Result<(ProductVariant, Vec<ProductOptionValue>)> {
+        self.ensure_product_exists(request.product_id).await?;
+        let title = trimmed_capped(&request.title, 255, "Variant title")?;
+        validate_price(request.price)?;
+        let sku = match &request.sku {
+            Some(s) => Some(trimmed_capped(s, 100, "SKU")?),
+            None => None,
+        };
+        let gtin = validate_gtin(&request.gtin)?;
+        if request.inventory_quantity < 0 {
+            return Err(Error::validation("Inventory quantity cannot be negative"));
+        }
+        if option_values.is_empty() {
+            return Err(Error::validation(
+                "A variant must have at least one option value",
+            ));
+        }
+
+        let mut tx = self.db.pool().begin().await?;
+        let variant = sqlx::query_as::<_, ProductVariant>(
+            "INSERT INTO product_variants ( \
+                product_id, title, sku, price, compare_at_price, cost_price, currency, \
+                inventory_quantity, inventory_policy, weight, weight_unit, requires_shipping, \
+                is_active, gtin \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+        )
+        .bind(request.product_id)
+        .bind(&title)
+        .bind(&sku)
+        .bind(request.price)
+        .bind(request.compare_at_price)
+        .bind(request.cost_price)
+        .bind(request.currency)
+        .bind(request.inventory_quantity)
+        .bind(request.inventory_policy)
+        .bind(request.weight)
+        .bind(request.weight_unit)
+        .bind(request.requires_shipping)
+        .bind(request.is_active)
+        .bind(&gtin)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let mut created = Vec::new();
+        let mut seen_options: BTreeSet<Uuid> = BTreeSet::new();
+        for (option_name, value) in option_values {
+            let option_name = trimmed_capped(option_name, 100, "Option name")?;
+            let value = trimmed_capped(value, 100, "Option value")?;
+            let option: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM product_options WHERE product_id = $1 AND lower(name) = lower($2)",
+            )
+            .bind(request.product_id)
+            .bind(&option_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let option_id = option
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "Option '{option_name}' does not exist for this product; create it first"
+                    ))
+                })?
+                .0;
+            if !seen_options.insert(option_id) {
+                return Err(Error::validation(format!(
+                    "Option '{option_name}' listed more than once for this variant"
+                )));
+            }
+            let option_value = sqlx::query_as::<_, ProductOptionValue>(
+                "INSERT INTO product_option_values (option_id, variant_id, value) VALUES ($1,$2,$3) RETURNING *",
+            )
+            .bind(option_id)
+            .bind(variant.id)
+            .bind(&value)
+            .fetch_one(&mut *tx)
+            .await?;
+            created.push(option_value);
+        }
+        assert_combination_unique(&mut tx, request.product_id, variant.id).await?;
+        tx.commit().await?;
+        Ok((variant, created))
     }
 
     /// First image (lowest position) of several products, in one query
@@ -620,5 +954,370 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Variant / option creation (issue #48): shared validated, transactional
+    // create functions used by the CLI and any later admin-API route.
+    // -------------------------------------------------------------------------
+
+    fn variant_request(product_id: Uuid, title: &str, price: Decimal) -> CreateVariantRequest {
+        CreateVariantRequest {
+            product_id,
+            title: title.to_string(),
+            sku: None,
+            gtin: None,
+            price,
+            compare_at_price: None,
+            cost_price: None,
+            currency: crate::models::Currency::USD,
+            inventory_quantity: 0,
+            inventory_policy: crate::models::InventoryPolicy::Deny,
+            weight: None,
+            weight_unit: None,
+            requires_shipping: true,
+            is_active: true,
+        }
+    }
+
+    async fn cleanup_products(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        sqlx::query("DELETE FROM products WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn count_option_values(pool: &sqlx::PgPool, product_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_option_values pov \
+             JOIN product_options po ON po.id = pov.option_id WHERE po.product_id = $1",
+        )
+        .bind(product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn variant_with_options_happy_path() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Variable tee").await;
+
+        let size = repo.create_option(pid, "Size", 0).await.unwrap();
+        repo.create_option(pid, "Color", 1).await.unwrap();
+        assert_eq!(size.name, "Size");
+
+        let (v1, values1) = repo
+            .create_variant_with_options(
+                variant_request(pid, "M / Red", Decimal::new(1999, 2)),
+                &[("Size".into(), "M".into()), ("Color".into(), "Red".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(values1.len(), 2);
+        assert_eq!(v1.price, Decimal::new(1999, 2));
+
+        let (v2, _) = repo
+            .create_variant_with_options(
+                variant_request(pid, "L / Blue", Decimal::new(2499, 2)),
+                &[("Size".into(), "L".into()), ("Color".into(), "Blue".into())],
+            )
+            .await
+            .unwrap();
+
+        // The storefront reads exactly this: options with per-variant values.
+        let options = repo.find_options(pid).await.unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].0.name, "Size");
+        let size_values: Vec<(&str, Uuid)> = options[0]
+            .1
+            .iter()
+            .map(|v| (v.value.as_str(), v.variant_id))
+            .collect();
+        assert!(size_values.contains(&("M", v1.id)));
+        assert!(size_values.contains(&("L", v2.id)));
+        assert_eq!(repo.find_variants(pid).await.unwrap().len(), 2);
+
+        cleanup_products(&pool, &[pid]).await;
+    }
+
+    /// Acceptance test (ii): an option value from another product is refused at
+    /// create, whether the foreign object is the option or the variant.
+    #[tokio::test]
+    async fn foreign_option_or_variant_is_refused_at_create() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let a = insert_product(&pool, "Product A").await;
+        let b = insert_product(&pool, "Product B").await;
+
+        let size_a = repo.create_option(a, "Size", 0).await.unwrap();
+        let size_b = repo.create_option(b, "Size", 0).await.unwrap();
+        let (va, _) = repo
+            .create_variant_with_options(
+                variant_request(a, "A-M", Decimal::new(1000, 2)),
+                &[("Size".into(), "M".into())],
+            )
+            .await
+            .unwrap();
+        let vb = repo
+            .create_variant(variant_request(b, "B-M", Decimal::new(100, 2)))
+            .await
+            .unwrap();
+
+        // A's option attached to B's variant (product_id = B): refused.
+        let err = repo
+            .create_option_value(b, size_a.id, vb.id, "M")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Option does not belong to this product"));
+
+        // B's option attached to A's variant (product_id = A): refused.
+        let err = repo
+            .create_option_value(a, size_b.id, va.id, "L")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Option does not belong to this product"));
+
+        // A's own option but B's variant, claimed under product A: refused.
+        let err = repo
+            .create_option_value(a, size_a.id, vb.id, "L")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Variant does not belong to this product"));
+
+        // Nothing was persisted for B's variant, and A keeps only its own value.
+        let b_values: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_option_values WHERE variant_id = $1")
+                .bind(vb.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(b_values, 0);
+        assert_eq!(count_option_values(&pool, a).await, 1);
+
+        cleanup_products(&pool, &[a, b]).await;
+    }
+
+    /// Acceptance test (iii): each option-value combination appears once per
+    /// product, independent of the order the pairs are given in.
+    #[tokio::test]
+    async fn duplicate_combination_is_refused() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Dup combos").await;
+        repo.create_option(pid, "Size", 0).await.unwrap();
+        repo.create_option(pid, "Color", 1).await.unwrap();
+
+        repo.create_variant_with_options(
+            variant_request(pid, "M / Red", Decimal::new(1999, 2)),
+            &[("Size".into(), "M".into()), ("Color".into(), "Red".into())],
+        )
+        .await
+        .unwrap();
+
+        // Same set, reversed order: still a duplicate, and the failed create
+        // leaves no second variant behind.
+        let err = repo
+            .create_variant_with_options(
+                variant_request(pid, "M / Red again", Decimal::new(1999, 2)),
+                &[("Color".into(), "Red".into()), ("Size".into(), "M".into())],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate option combination"));
+        assert_eq!(repo.find_variants(pid).await.unwrap().len(), 1);
+
+        // Same refusal when the combination is completed one value at a time.
+        let (v2, _) = repo
+            .create_variant_with_options(
+                variant_request(pid, "L / Red", Decimal::new(1999, 2)),
+                &[("Size".into(), "L".into())],
+            )
+            .await
+            .unwrap();
+        let options = repo.find_options(pid).await.unwrap();
+        let color_id = options[1].0.id;
+        repo.create_option_value(pid, color_id, v2.id, "Red")
+            .await
+            .unwrap();
+        // v2 is now L/Red; trying to make a third variant L/Red via the
+        // incremental path must fail on the completing value.
+        let (v3, _) = repo
+            .create_variant_with_options(
+                variant_request(pid, "L / Red copy", Decimal::new(1999, 2)),
+                &[("Size".into(), "L".into())],
+            )
+            .await
+            .unwrap();
+        let err = repo
+            .create_option_value(pid, color_id, v3.id, "Red")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate option combination"));
+        // The refused value was rolled back; v3 keeps only its Size value.
+        let v3_values: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_option_values WHERE variant_id = $1")
+                .bind(v3.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(v3_values, 1);
+
+        cleanup_products(&pool, &[pid]).await;
+    }
+
+    /// One transaction per product: a failed variant create leaves no partial
+    /// variant or option-value rows behind.
+    #[tokio::test]
+    async fn failed_variant_leaves_no_partial_rows() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Atomicity").await;
+        repo.create_option(pid, "Size", 0).await.unwrap();
+
+        // First pair valid, second names an option that does not exist.
+        let err = repo
+            .create_variant_with_options(
+                variant_request(pid, "Partial", Decimal::new(1000, 2)),
+                &[("Size".into(), "M".into()), ("Nope".into(), "X".into())],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist for this product"));
+        assert!(repo.find_variants(pid).await.unwrap().is_empty());
+        assert_eq!(count_option_values(&pool, pid).await, 0);
+
+        // A duplicate combination discovered after the inserts also rolls the
+        // whole variant back.
+        repo.create_variant_with_options(
+            variant_request(pid, "M", Decimal::new(1000, 2)),
+            &[("Size".into(), "M".into())],
+        )
+        .await
+        .unwrap();
+        let err = repo
+            .create_variant_with_options(
+                variant_request(pid, "M again", Decimal::new(1000, 2)),
+                &[("Size".into(), "M".into())],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate option combination"));
+        assert_eq!(repo.find_variants(pid).await.unwrap().len(), 1);
+        assert_eq!(count_option_values(&pool, pid).await, 1);
+
+        cleanup_products(&pool, &[pid]).await;
+    }
+
+    #[tokio::test]
+    async fn creation_validation_rejects_bad_input() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Validation").await;
+
+        // Option names: trimmed, non-empty, length-capped, unique per product
+        // (case-insensitive).
+        assert!(repo.create_option(pid, "   ", 0).await.is_err());
+        assert!(repo.create_option(pid, &"x".repeat(101), 0).await.is_err());
+        let size = repo.create_option(pid, "  Size  ", 0).await.unwrap();
+        assert_eq!(size.name, "Size");
+        let err = repo.create_option(pid, "size", 1).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+
+        // Variant price: exact decimal, non-negative, at most 2 decimal places.
+        assert!(repo
+            .create_variant(variant_request(pid, "Neg", Decimal::new(-1, 2)))
+            .await
+            .is_err());
+        assert!(repo
+            .create_variant(variant_request(pid, "Prec", Decimal::new(1999, 3)))
+            .await
+            .is_err());
+        // Title: trimmed, non-empty, capped. Inventory: non-negative.
+        assert!(repo
+            .create_variant(variant_request(pid, "   ", Decimal::new(100, 2)))
+            .await
+            .is_err());
+        assert!(repo
+            .create_variant(variant_request(pid, &"t".repeat(256), Decimal::new(100, 2)))
+            .await
+            .is_err());
+        let mut neg_stock = variant_request(pid, "Stock", Decimal::new(100, 2));
+        neg_stock.inventory_quantity = -1;
+        assert!(repo.create_variant(neg_stock).await.is_err());
+
+        // A variant needs at least one option value, and one value per option.
+        assert!(repo
+            .create_variant_with_options(
+                variant_request(pid, "No options", Decimal::new(100, 2)),
+                &[]
+            )
+            .await
+            .is_err());
+        let err = repo
+            .create_variant_with_options(
+                variant_request(pid, "Twice", Decimal::new(100, 2)),
+                &[("Size".into(), "M".into()), ("Size".into(), "L".into())],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"));
+
+        // Values are trimmed and capped; one value per (option, variant).
+        let (v, values) = repo
+            .create_variant_with_options(
+                variant_request(pid, "M", Decimal::new(100, 2)),
+                &[("Size".into(), "  M  ".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(values[0].value, "M");
+        let err = repo
+            .create_option_value(pid, size.id, v.id, "L")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a value"));
+        assert!(repo
+            .create_option_value(pid, size.id, v.id, &"v".repeat(101))
+            .await
+            .is_err());
+
+        // Missing product is a not-found, not a panic or a silent insert.
+        let missing = Uuid::new_v4();
+        assert!(repo.create_option(missing, "Size", 0).await.is_err());
+        assert!(repo
+            .create_variant(variant_request(missing, "X", Decimal::new(100, 2)))
+            .await
+            .is_err());
+
+        cleanup_products(&pool, &[pid]).await;
     }
 }

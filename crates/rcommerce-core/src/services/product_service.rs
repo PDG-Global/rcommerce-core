@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        CreateProductRequest, Product, ProductFilter, ProductImage, ProductOption,
-        ProductOptionValue, ProductVariant, UpdateProductRequest,
+        CreateProductRequest, CreateVariantRequest, Product, ProductFilter, ProductImage,
+        ProductOption, ProductOptionValue, ProductVariant, UpdateProductRequest,
     },
     repository::traits::ProductRepositoryTrait,
     repository::ProductRepository,
@@ -44,6 +44,50 @@ impl ProductService {
         let product = self.repository.create_with_request(request).await?;
 
         Ok(product)
+    }
+
+    /// Create a product option (e.g. "Size"). Validation + persistence live in
+    /// the repository so the CLI and any admin-API route share the same checks.
+    pub async fn create_option(
+        &self,
+        product_id: Uuid,
+        name: &str,
+        position: i32,
+    ) -> Result<ProductOption> {
+        self.repository
+            .create_option(product_id, name, position)
+            .await
+    }
+
+    /// Create a product variant (validated, transactional).
+    pub async fn create_variant(&self, request: CreateVariantRequest) -> Result<ProductVariant> {
+        self.repository.create_variant(request).await
+    }
+
+    /// Attach an option value to a variant, validating option+variant belong to
+    /// the product and the combination stays unique.
+    pub async fn create_option_value(
+        &self,
+        product_id: Uuid,
+        option_id: Uuid,
+        variant_id: Uuid,
+        value: &str,
+    ) -> Result<ProductOptionValue> {
+        self.repository
+            .create_option_value(product_id, option_id, variant_id, value)
+            .await
+    }
+
+    /// Create a variant with its option values in one transaction (the path that
+    /// makes a variable product's variant selectable and addable to cart).
+    pub async fn create_variant_with_options(
+        &self,
+        request: CreateVariantRequest,
+        option_values: &[(String, String)],
+    ) -> Result<(ProductVariant, Vec<ProductOptionValue>)> {
+        self.repository
+            .create_variant_with_options(request, option_values)
+            .await
     }
 
     /// Get product by ID with variants and images
