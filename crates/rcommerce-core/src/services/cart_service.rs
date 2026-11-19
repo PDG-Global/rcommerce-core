@@ -157,6 +157,132 @@ impl CartService {
         Ok(CartWithItems { cart, items })
     }
 
+    /// Reprice every sellable cart line from CURRENT server-stored values
+    /// (issue #49): per-pack price = stored unit price × effective pack size
+    /// (variant's pack_size when set, else the product's; NULL inherits).
+    /// Returns item_id -> effective pack size for the order-item snapshot.
+    ///
+    /// Never charge a different total silently: if any line's per-pack price
+    /// differs from what the cart shows, the cart is refreshed to the current
+    /// prices and a "prices changed" validation error is returned so the
+    /// customer confirms the new total before paying. Bundle parents reprice
+    /// at the bundle's stored price (pack size 1); $0 bundle component lines
+    /// are untouched.
+    pub async fn reprice_from_current_prices(
+        &self,
+        cart_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, i32>> {
+        let items = self.cart_repo.get_items(cart_id).await?;
+        let Some(db) = &self.db else {
+            // Mock-repository mode has no product store to reprice from;
+            // legacy behavior (prices as added, pack size 1).
+            return Ok(items.into_iter().map(|i| (i.id, 1)).collect());
+        };
+
+        let sellable: Vec<&CartItem> = items
+            .iter()
+            .filter(|i| {
+                !i.custom_attributes
+                    .as_ref()
+                    .and_then(|a| a.get("is_bundle_component"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .collect();
+        let product_ids: Vec<Uuid> = sellable.iter().map(|i| i.product_id).collect();
+        let variant_ids: Vec<Uuid> = sellable.iter().filter_map(|i| i.variant_id).collect();
+
+        // One query per table, not per line.
+        let product_rows: Vec<(Uuid, Decimal, i32, String)> = sqlx::query_as(
+            "SELECT id, price, pack_size, product_type::text FROM products WHERE id = ANY($1)",
+        )
+        .bind(&product_ids)
+        .fetch_all(db.pool())
+        .await?;
+        let products: std::collections::HashMap<Uuid, (Decimal, i32, String)> = product_rows
+            .into_iter()
+            .map(|(id, price, pack, kind)| (id, (price, pack, kind)))
+            .collect();
+        let variant_rows: Vec<(Uuid, Uuid, Decimal, Option<i32>)> = sqlx::query_as(
+            "SELECT id, product_id, price, pack_size FROM product_variants WHERE id = ANY($1)",
+        )
+        .bind(&variant_ids)
+        .fetch_all(db.pool())
+        .await?;
+        let variants: std::collections::HashMap<Uuid, (Uuid, Decimal, Option<i32>)> = variant_rows
+            .into_iter()
+            .map(|(id, pid, price, pack)| (id, (pid, price, pack)))
+            .collect();
+
+        let mut pack_sizes = std::collections::HashMap::new();
+        let mut changed = false;
+        for item in &items {
+            if item
+                .custom_attributes
+                .as_ref()
+                .and_then(|a| a.get("is_bundle_component"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                pack_sizes.insert(item.id, 1);
+                continue;
+            }
+            let (product_price, product_pack, kind) = products
+                .get(&item.product_id)
+                .ok_or_else(|| Error::not_found("Product not found"))?;
+            let is_bundle_parent = item
+                .custom_attributes
+                .as_ref()
+                .and_then(|a| a.get("is_bundle_parent"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || kind == "bundle";
+            let (unit_price, pack_size) = if is_bundle_parent {
+                (*product_price, 1)
+            } else if let Some(variant_id) = item.variant_id {
+                let (variant_product_id, variant_price, variant_pack) =
+                    variants
+                        .get(&variant_id)
+                        .ok_or_else(|| Error::not_found("Product variant not found"))?;
+                if *variant_product_id != item.product_id {
+                    return Err(Error::not_found("Product variant not found"));
+                }
+                (
+                    *variant_price,
+                    crate::models::effective_pack_size(*product_pack, *variant_pack),
+                )
+            } else {
+                (*product_price, *product_pack)
+            };
+            let per_pack_price = unit_price * Decimal::from(pack_size);
+            if per_pack_price != item.unit_price {
+                changed = true;
+                // Refresh the line subtotal too: cart recalculation sums the
+                // stored subtotals, it does not re-multiply unit_price.
+                let line_subtotal = per_pack_price * Decimal::from(item.quantity);
+                sqlx::query(
+                    "UPDATE cart_items SET unit_price = $1, subtotal = $2, updated_at = NOW() WHERE id = $3",
+                )
+                .bind(per_pack_price)
+                .bind(line_subtotal)
+                .bind(item.id)
+                .execute(db.pool())
+                .await?;
+            }
+            pack_sizes.insert(item.id, pack_size);
+        }
+
+        if changed {
+            self.recalculate_cart(cart_id).await?;
+            return Err(Error::validation(
+                "Prices have changed since items were added to your cart. \
+                 Your cart has been updated with the current prices — \
+                 please review the new total and check out again.",
+            ));
+        }
+        Ok(pack_sizes)
+    }
+
     /// Get product weights for cart items (product_id -> weight in kg)
     pub async fn get_product_weights(
         &self,
@@ -982,6 +1108,9 @@ pub struct ProductDetails {
     pub image_url: Option<String>,
     pub requires_shipping: bool,
     pub is_gift_card: bool,
+    /// Effective pack size (units per pack) for this line. `unit_price` is
+    /// already per-pack; stock checks convert packs to units with this.
+    pub pack_size: i32,
 }
 
 /// Bundle component details for cart

@@ -489,19 +489,33 @@ pub async fn create_order(
                 }
             };
 
-        if inventory_qty < item.quantity {
+        // Pack-size pricing (issue #49): quantity counts packs, stock is in
+        // units. This legacy admin path prices at the product level (variant
+        // support here is a pre-existing gap); the pack multiplier still applies.
+        let pack_size = product.pack_size;
+        let requested_units = i64::from(item.quantity)
+            .checked_mul(i64::from(pack_size))
+            .and_then(|u| i32::try_from(u).ok())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Quantity is too large"})),
+                )
+            })?;
+        if inventory_qty < requested_units {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": format!(
                         "Insufficient inventory for product {}. Available: {}, Requested: {}",
-                        product.title, inventory_qty, item.quantity
+                        product.title, inventory_qty, requested_units
                     )
                 })),
             ));
         }
 
-        let item_subtotal = product.price * Decimal::from(item.quantity);
+        let per_pack_price = product.price * Decimal::from(pack_size);
+        let item_subtotal = per_pack_price * Decimal::from(item.quantity);
         subtotal += item_subtotal;
 
         // Build taxable item for tax calculation
@@ -509,7 +523,7 @@ pub async fn create_order(
             id: Uuid::new_v4(),
             product_id: product.id,
             quantity: item.quantity,
-            unit_price: product.price,
+            unit_price: per_pack_price,
             total_price: item_subtotal,
             tax_category_id: None, // TODO: Get from product
             is_digital: false,     // TODO: Get from product
@@ -517,7 +531,7 @@ pub async fn create_order(
             sku: product.sku.clone(),
         });
 
-        order_items.push((product, item.quantity, item_subtotal));
+        order_items.push((product, item.quantity, item_subtotal, pack_size));
     }
 
     // Calculate tax using TaxService if shipping address is provided
@@ -568,7 +582,7 @@ pub async fn create_order(
         // Calculate shipping cost
         let package = rcommerce_core::shipping::Package {
             weight: Decimal::from_str_exact("0.5").unwrap()
-                * Decimal::from(order_items.iter().map(|(_, qty, _)| qty).sum::<i32>()),
+                * Decimal::from(order_items.iter().map(|(_, qty, _, _)| qty).sum::<i32>()),
             weight_unit: "kg".to_string(),
             length: Some(Decimal::from(30)),
             width: Some(Decimal::from(20)),
@@ -680,17 +694,19 @@ pub async fn create_order(
     };
 
     // Create order items and update inventory
-    for (product, quantity, item_total) in order_items {
+    for (product, quantity, item_total, pack_size) in order_items {
         let item_id = Uuid::new_v4();
+        let per_pack_price = product.price * Decimal::from(pack_size);
+        let units = quantity.saturating_mul(pack_size);
 
         if let Err(e) = sqlx::query(
             r#"
             INSERT INTO order_items (
                 id, order_id, product_id, variant_id,
                 quantity, price, total,
-                sku, title, variant_title, requires_shipping
+                sku, title, variant_title, requires_shipping, pack_size
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11)
             "#,
         )
         .bind(item_id)
@@ -698,22 +714,23 @@ pub async fn create_order(
         .bind(product.id)
         .bind(None::<Uuid>) // variant_id
         .bind(quantity)
-        .bind(product.price)
+        .bind(per_pack_price)
         .bind(item_total)
         .bind(&product.sku)
         .bind(&product.title)
         .bind(None::<String>) // variant_title
+        .bind(pack_size)
         .execute(state.db.pool())
         .await
         {
             tracing::error!("Failed to create order item: {}", e);
         }
 
-        // Update inventory on product
+        // Update inventory on product (units, not packs)
         if let Err(e) = sqlx::query(
             "UPDATE products SET inventory_quantity = inventory_quantity - $1, updated_at = NOW() WHERE id = $2"
         )
-        .bind(quantity)
+        .bind(units)
         .bind(product.id)
         .execute(state.db.pool())
         .await {

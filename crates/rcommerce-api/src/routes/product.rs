@@ -299,6 +299,7 @@ pub async fn get_product(
         "compare_at_price": p.compare_at_price,
                 "cost_price": p.cost_price,
                 "currency": p.currency,
+                "pack_size": p.pack_size,
                 "product_type": format!("{:?}", p.product_type).to_lowercase(),
                 "inventory_quantity": inventory_quantity,
                 "inventory_policy": p.inventory_policy,
@@ -320,6 +321,7 @@ pub async fn get_product(
                     "sku": v.sku,
                     "gtin": v.gtin,
                     "price": v.price,
+                    "pack_size": v.pack_size,
                     "inventory_quantity": v.inventory_quantity
                 })).collect::<Vec<_>>(),
                 "images": product_detail.images.into_iter().map(|i| serde_json::json!({

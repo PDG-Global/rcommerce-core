@@ -117,7 +117,14 @@ pub fn invoice_data_from_order(
         .iter()
         .filter(|i| i.is_bundle_component != Some(true))
         .map(|i| InvoiceItem {
-            name: i.name.clone(),
+            // Pack info comes from the order item's pack_size SNAPSHOT, so an
+            // invoice reprinted after a pack-size edit still shows what was
+            // actually ordered (issue #49). unit_price is already per-pack.
+            name: if i.pack_size > 1 {
+                format!("{} (pack of {})", i.name, i.pack_size)
+            } else {
+                i.name.clone()
+            },
             variant_title: i.variant_name.clone(),
             sku: i.sku.clone(),
             quantity: i.quantity,
@@ -480,6 +487,7 @@ mod tests {
                     weight: None,
                     weight_unit: None,
                     is_bundle_component: Some(component),
+                    pack_size: 1,
                     metadata: serde_json::json!({}),
                     created_at: Utc::now(),
                 }

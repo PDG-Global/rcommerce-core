@@ -73,6 +73,9 @@ pub struct OrderItem {
     /// $0 fulfillment line of a bundle parent; hidden from customer/admin
     /// displays (stock reservation only)
     pub is_bundle_component: Option<bool>,
+    /// Snapshot of the effective pack size at order time (units per pack).
+    /// Refund restock and invoices use this, never current product values.
+    pub pack_size: i32,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
@@ -137,6 +140,9 @@ pub struct CreateOrderItem {
     pub price: Decimal,
     pub tax_amount: Decimal,
     pub skip_inventory_reservation: bool,
+    /// Effective pack size (units per pack) for this line; quantity counts
+    /// packs, inventory reservation converts to units (quantity * pack_size).
+    pub pack_size: i32,
 }
 
 impl CreateOrderItem {
@@ -154,6 +160,7 @@ impl CreateOrderItem {
             price,
             tax_amount,
             skip_inventory_reservation: false,
+            pack_size: 1,
         }
     }
 }

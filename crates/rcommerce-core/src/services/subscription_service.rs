@@ -695,6 +695,10 @@ impl SubscriptionService<crate::repository::PostgresSubscriptionRepository> {
                     price: unit_price,
                     tax_amount: Decimal::ZERO,
                     skip_inventory_reservation: false,
+                    // Pack size > 1 is refused on subscription products in the
+                    // shared repo layer (renewals have no pack snapshot), so
+                    // renewal lines are always single-unit.
+                    pack_size: 1,
                 }],
                 currency: subscription.currency.to_string(),
                 subtotal: line_subtotal,

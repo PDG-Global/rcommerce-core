@@ -137,6 +137,13 @@ pub struct OrderItem {
     // Bundle product fields
     pub bundle_parent_id: Option<Uuid>,
     pub is_bundle_component: Option<bool>,
+    /// Snapshot of the effective pack size (units per pack) at order time.
+    #[serde(default = "default_order_item_pack_size")]
+    pub pack_size: i32,
+}
+
+fn default_order_item_pack_size() -> i32 {
+    1
 }
 
 /// Order fulfillment
