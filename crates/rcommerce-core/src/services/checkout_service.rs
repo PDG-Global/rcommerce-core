@@ -314,10 +314,7 @@ impl CheckoutService {
         };
 
         // Calculate tax (bundle components are not taxed independently)
-        let tax_items: Vec<&CartItem> = items
-            .iter()
-            .filter(|i| !self.is_bundle_component(i))
-            .collect();
+        let tax_items: Vec<&CartItem> = items.iter().filter(|i| !is_bundle_component(i)).collect();
         let tax_result = self
             .calculate_tax(
                 &tax_items,
@@ -427,10 +424,7 @@ impl CheckoutService {
 
         // Get item tax (recalculate to ensure consistency; bundle components
         // are not taxed independently)
-        let tax_items: Vec<&CartItem> = items
-            .iter()
-            .filter(|i| !self.is_bundle_component(i))
-            .collect();
+        let tax_items: Vec<&CartItem> = items.iter().filter(|i| !is_bundle_component(i)).collect();
         let tax_result = self
             .calculate_tax(
                 &tax_items,
@@ -557,10 +551,7 @@ impl CheckoutService {
 
         // Calculate final tax (bundle components are not taxed independently;
         // tax is applied to the bundle parent line only).
-        let tax_items: Vec<&CartItem> = items
-            .iter()
-            .filter(|i| !self.is_bundle_component(i))
-            .collect();
+        let tax_items: Vec<&CartItem> = items.iter().filter(|i| !is_bundle_component(i)).collect();
         let tax_result = self
             .calculate_tax(
                 &tax_items,
@@ -608,7 +599,7 @@ impl CheckoutService {
             // must be the same product.
             let distinct: Vec<Uuid> = items
                 .iter()
-                .filter(|i| !self.is_bundle_component(i))
+                .filter(|i| !is_bundle_component(i))
                 .map(|i| i.product_id)
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
@@ -622,7 +613,7 @@ impl CheckoutService {
             subscription_quantity = Some(
                 items
                     .iter()
-                    .filter(|i| !self.is_bundle_component(i))
+                    .filter(|i| !is_bundle_component(i))
                     .map(|i| i.quantity)
                     .sum(),
             );
@@ -643,60 +634,9 @@ impl CheckoutService {
         let tax_total = tax_result.total_tax;
         let total = cart.subtotal - discount_total + shipping_total + tax_total;
 
-        // Create order items. Bundle parents carry the bundle price but do not
-        // reserve inventory; component lines are $0 fulfillment rows that reserve
-        // the underlying product stock.
-        let mut order_items: Vec<CreateOrderItem> = Vec::new();
-        for item in &items {
-            if self.is_bundle_component(item) {
-                // Component line: $0 price, reserve component stock.
-                order_items.push(CreateOrderItem {
-                    product_id: item.product_id,
-                    variant_id: item.variant_id,
-                    quantity: item.quantity,
-                    price: Decimal::ZERO,
-                    tax_amount: Decimal::ZERO,
-                    skip_inventory_reservation: false,
-                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
-                });
-            } else if self.is_bundle_parent(item) {
-                // Bundle parent line: carries the bundle price, no inventory reservation.
-                let item_tax = tax_result
-                    .calculation
-                    .line_items
-                    .iter()
-                    .find(|li| li.item_id == item.id)
-                    .map(|li| li.tax_amount)
-                    .unwrap_or_default();
-                order_items.push(CreateOrderItem {
-                    product_id: item.product_id,
-                    variant_id: item.variant_id,
-                    quantity: item.quantity,
-                    price: item.unit_price,
-                    tax_amount: item_tax,
-                    skip_inventory_reservation: true,
-                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
-                });
-            } else {
-                // Regular line item.
-                let item_tax = tax_result
-                    .calculation
-                    .line_items
-                    .iter()
-                    .find(|li| li.item_id == item.id)
-                    .map(|li| li.tax_amount)
-                    .unwrap_or_default();
-                order_items.push(CreateOrderItem {
-                    product_id: item.product_id,
-                    variant_id: item.variant_id,
-                    quantity: item.quantity,
-                    price: item.unit_price,
-                    tax_amount: item_tax,
-                    skip_inventory_reservation: false,
-                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
-                });
-            }
-        }
+        // Create order items from the repriced cart. Fails closed if any line
+        // is missing from the reprice map (cart changed mid-checkout).
+        let order_items = build_order_items(&items, &tax_result, &line_pack_sizes)?;
 
         // Persist the cart's coupon on the order (usage itself is only
         // recorded at payment confirmation — see OrderService).
@@ -1414,7 +1354,7 @@ impl CheckoutService {
         // (component quantity x component weight) so packs rate on real weight.
         let missing_weight: Vec<uuid::Uuid> = items
             .iter()
-            .filter(|item| !self.is_bundle_component(item))
+            .filter(|item| !is_bundle_component(item))
             .filter(|item| {
                 item.variant_id
                     .and_then(|id| variant_weights.get(&id))
@@ -1434,7 +1374,7 @@ impl CheckoutService {
 
         let total_weight: Decimal = items
             .iter()
-            .filter(|item| !self.is_bundle_component(item))
+            .filter(|item| !is_bundle_component(item))
             .map(|item| {
                 let weight_per_item =
                     Self::resolve_item_weight(&variant_weights, &weights, &derived_weights, item);
@@ -1502,24 +1442,98 @@ impl CheckoutService {
         let result = self.tax_service.validate_vat_id(vat_id).await?;
         Ok(result.is_valid)
     }
+}
 
-    /// Check if a cart item is a bundle component
-    fn is_bundle_component(&self, item: &CartItem) -> bool {
-        item.custom_attributes
-            .as_ref()
-            .and_then(|attrs| attrs.get("is_bundle_component"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
+/// Check if a cart item is a bundle component
+fn is_bundle_component(item: &CartItem) -> bool {
+    item.custom_attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get("is_bundle_component"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
-    /// Check if a cart item is a bundle parent
-    fn is_bundle_parent(&self, item: &CartItem) -> bool {
-        item.custom_attributes
-            .as_ref()
-            .and_then(|attrs| attrs.get("is_bundle_parent"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+/// Check if a cart item is a bundle parent
+fn is_bundle_parent(item: &CartItem) -> bool {
+    item.custom_attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get("is_bundle_parent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Build order lines from the repriced cart. Bundle parents carry the bundle
+/// price but do not reserve inventory; component lines are $0 fulfillment
+/// rows that reserve the underlying product stock.
+///
+/// Every line MUST have an entry in `line_pack_sizes` (produced by
+/// `reprice_from_current_prices` moments earlier). A missing entry means the
+/// cart changed between repricing and order build — e.g. a line added in
+/// another tab. Fail closed: defaulting to 1 would store a per-pack price
+/// with a pack snapshot of 1, under-restocking refunds and misstating
+/// invoices. Pure function (no I/O) so the fail-closed path is unit-testable.
+fn build_order_items(
+    items: &[CartItem],
+    tax_result: &TaxCalculationWithShipping,
+    line_pack_sizes: &std::collections::HashMap<Uuid, i32>,
+) -> Result<Vec<CreateOrderItem>> {
+    let mut order_items: Vec<CreateOrderItem> = Vec::new();
+    for item in items {
+        let pack_size = *line_pack_sizes.get(&item.id).ok_or_else(|| {
+            Error::validation(
+                "Your cart changed while checking out. Please review your cart and try again.",
+            )
+        })?;
+        if is_bundle_component(item) {
+            // Component line: $0 price, reserve component stock.
+            order_items.push(CreateOrderItem {
+                product_id: item.product_id,
+                variant_id: item.variant_id,
+                quantity: item.quantity,
+                price: Decimal::ZERO,
+                tax_amount: Decimal::ZERO,
+                skip_inventory_reservation: false,
+                pack_size,
+            });
+        } else if is_bundle_parent(item) {
+            // Bundle parent line: carries the bundle price, no inventory reservation.
+            let item_tax = tax_result
+                .calculation
+                .line_items
+                .iter()
+                .find(|li| li.item_id == item.id)
+                .map(|li| li.tax_amount)
+                .unwrap_or_default();
+            order_items.push(CreateOrderItem {
+                product_id: item.product_id,
+                variant_id: item.variant_id,
+                quantity: item.quantity,
+                price: item.unit_price,
+                tax_amount: item_tax,
+                skip_inventory_reservation: true,
+                pack_size,
+            });
+        } else {
+            // Regular line item.
+            let item_tax = tax_result
+                .calculation
+                .line_items
+                .iter()
+                .find(|li| li.item_id == item.id)
+                .map(|li| li.tax_amount)
+                .unwrap_or_default();
+            order_items.push(CreateOrderItem {
+                product_id: item.product_id,
+                variant_id: item.variant_id,
+                quantity: item.quantity,
+                price: item.unit_price,
+                tax_amount: item_tax,
+                skip_inventory_reservation: false,
+                pack_size,
+            });
+        }
     }
+    Ok(order_items)
 }
 
 /// Match a client-submitted shipping rate against a fresh server-side quote.
@@ -2152,6 +2166,105 @@ mod tests {
             subscription: None,
             payment_consent_id: None,
         }
+    }
+
+    /// A plain cart line for the pure order-build tests.
+    fn order_build_item(
+        quantity: i32,
+        unit_price: Decimal,
+        attrs: Option<serde_json::Value>,
+    ) -> CartItem {
+        CartItem {
+            id: Uuid::new_v4(),
+            cart_id: Uuid::new_v4(),
+            product_id: Uuid::new_v4(),
+            variant_id: None,
+            quantity,
+            unit_price,
+            original_price: unit_price,
+            subtotal: unit_price * Decimal::from(quantity),
+            discount_amount: Decimal::ZERO,
+            total: unit_price * Decimal::from(quantity),
+            sku: None,
+            title: "Order build item".to_string(),
+            variant_title: None,
+            image_url: None,
+            requires_shipping: true,
+            is_gift_card: false,
+            custom_attributes: attrs,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn empty_tax_result() -> TaxCalculationWithShipping {
+        TaxCalculationWithShipping {
+            item_tax: Decimal::ZERO,
+            shipping_tax: Decimal::ZERO,
+            total_tax: Decimal::ZERO,
+            calculation: TaxCalculation::new(),
+        }
+    }
+
+    #[test]
+    fn order_build_fails_closed_for_a_line_added_after_repricing() {
+        // The reprice map covers only the first line; the second is the
+        // "added in another tab between repricing and order build" case.
+        // Defaulting its pack size to 1 would store a per-pack price with a
+        // snapshot of 1 — under-restocking refunds and misstating invoices.
+        let repriced = order_build_item(2, dec!(15.00), None);
+        let mut map = std::collections::HashMap::new();
+        map.insert(repriced.id, 6);
+
+        for attrs in [
+            None,
+            Some(serde_json::json!({ "is_bundle_component": true })),
+            Some(serde_json::json!({ "is_bundle_parent": true })),
+        ] {
+            let added_later = order_build_item(1, dec!(10.00), attrs);
+            let err =
+                build_order_items(&[repriced.clone(), added_later], &empty_tax_result(), &map)
+                    .expect_err("a line missing from the reprice map must fail closed");
+            assert!(
+                err.to_string().contains("cart changed"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_build_uses_the_repriced_pack_snapshot() {
+        let regular = order_build_item(2, dec!(15.00), None);
+        let parent = order_build_item(
+            1,
+            dec!(50.00),
+            Some(serde_json::json!({ "is_bundle_parent": true })),
+        );
+        let component = order_build_item(
+            2,
+            dec!(0.00),
+            Some(serde_json::json!({ "is_bundle_component": true })),
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert(regular.id, 6);
+        map.insert(parent.id, 1);
+        map.insert(component.id, 1);
+
+        let built = build_order_items(
+            &[regular.clone(), parent.clone(), component.clone()],
+            &empty_tax_result(),
+            &map,
+        )
+        .unwrap();
+
+        assert_eq!(built[0].pack_size, 6);
+        assert_eq!(built[0].price, dec!(15.00));
+        assert!(!built[0].skip_inventory_reservation);
+        assert_eq!(built[1].pack_size, 1);
+        assert!(built[1].skip_inventory_reservation); // bundle parent: priced, no stock
+        assert_eq!(built[2].pack_size, 1);
+        assert_eq!(built[2].price, Decimal::ZERO); // component: $0 fulfillment row
+        assert!(!built[2].skip_inventory_reservation);
     }
 
     /// Pack-pricing checkout harness (issue #49): a $2.50/unit product sold in
