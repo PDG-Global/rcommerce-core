@@ -47,14 +47,28 @@ fn trimmed_capped(input: &str, max_chars: usize, field: &str) -> Result<String> 
 
 /// A variant price is money: exact decimal, non-negative, and no more precision
 /// than the DECIMAL(20,2) column stores (otherwise Postgres would round it).
-fn validate_price(price: Decimal) -> Result<()> {
+fn validate_price(price: Decimal, field: &str) -> Result<()> {
     if price < Decimal::new(0, 0) {
-        return Err(Error::validation("Price cannot be negative"));
+        return Err(Error::validation(format!("{field} cannot be negative")));
     }
     if price.scale() > 2 {
-        return Err(Error::validation(
-            "Price must have at most 2 decimal places",
-        ));
+        return Err(Error::validation(format!(
+            "{field} must have at most 2 decimal places"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate every money field of a variant request the same way: the price and,
+/// when present, compare-at and cost prices (a later admin-API caller can set
+/// them even though the CLI passes None).
+fn validate_variant_prices(request: &CreateVariantRequest) -> Result<()> {
+    validate_price(request.price, "Price")?;
+    if let Some(compare_at) = request.compare_at_price {
+        validate_price(compare_at, "Compare-at price")?;
+    }
+    if let Some(cost) = request.cost_price {
+        validate_price(cost, "Cost price")?;
     }
     Ok(())
 }
@@ -73,6 +87,27 @@ fn validate_gtin(gtin: &Option<String>) -> Result<Option<String>> {
             }
             Ok(Some(g.to_string()))
         }
+    }
+}
+
+/// Lock the product row inside the create transaction and prove it exists.
+/// The uniqueness checks below read-then-insert under READ COMMITTED, so
+/// without this lock two concurrent creates on the same product could both
+/// pass and leave duplicate options/combinations behind. FOR UPDATE
+/// serializes them: the second transaction waits, then sees the first's
+/// committed rows. Runs inside the caller's transaction so the lock is held
+/// until commit/rollback.
+async fn lock_product(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    product_id: Uuid,
+) -> Result<()> {
+    let found: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM products WHERE id = $1 FOR UPDATE")
+        .bind(product_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(Error::not_found("Product not found")),
     }
 }
 
@@ -356,18 +391,6 @@ impl PostgresProductRepository {
             .collect())
     }
 
-    /// Refuse unless the product exists (variants/options hang off a product).
-    async fn ensure_product_exists(&self, product_id: Uuid) -> Result<()> {
-        let found: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM products WHERE id = $1")
-            .bind(product_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-        match found {
-            Some(_) => Ok(()),
-            None => Err(Error::not_found("Product not found")),
-        }
-    }
-
     /// Create a product option (e.g. "Size", "Color"). Shared by the CLI and any
     /// later admin-API route; validation lives here, not in the caller.
     pub async fn create_option(
@@ -376,10 +399,10 @@ impl PostgresProductRepository {
         name: &str,
         position: i32,
     ) -> Result<ProductOption> {
-        self.ensure_product_exists(product_id).await?;
         let name = trimmed_capped(name, 100, "Option name")?;
 
         let mut tx = self.db.pool().begin().await?;
+        lock_product(&mut tx, product_id).await?;
         let existing: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM product_options WHERE product_id = $1 AND lower(name) = lower($2)",
         )
@@ -407,9 +430,8 @@ impl PostgresProductRepository {
     /// Create a product variant. Wires up `CreateVariantRequest` (previously dead
     /// code). Price/title/SKU/GTIN/inventory are validated here; one transaction.
     pub async fn create_variant(&self, request: CreateVariantRequest) -> Result<ProductVariant> {
-        self.ensure_product_exists(request.product_id).await?;
         let title = trimmed_capped(&request.title, 255, "Variant title")?;
-        validate_price(request.price)?;
+        validate_variant_prices(&request)?;
         let sku = match &request.sku {
             Some(s) => Some(trimmed_capped(s, 100, "SKU")?),
             None => None,
@@ -420,6 +442,7 @@ impl PostgresProductRepository {
         }
 
         let mut tx = self.db.pool().begin().await?;
+        lock_product(&mut tx, request.product_id).await?;
         let variant = sqlx::query_as::<_, ProductVariant>(
             "INSERT INTO product_variants ( \
                 product_id, title, sku, price, compare_at_price, cost_price, currency, \
@@ -451,6 +474,13 @@ impl PostgresProductRepository {
     /// the variant belong to the same product (a foreign option/variant is
     /// refused), that the variant has no value for that option yet, and that the
     /// resulting combination stays unique within the product. One transaction.
+    ///
+    /// Note: uniqueness is checked against the variant's CURRENT (possibly
+    /// partial) set of values, so building a multi-option variant one value at
+    /// a time can be refused when its partial set equals another variant's
+    /// full set (e.g. `{Size=M}` against an existing one-option variant).
+    /// Create multi-option variants with `create_variant_with_options`, which
+    /// checks the complete set once, atomically.
     pub async fn create_option_value(
         &self,
         product_id: Uuid,
@@ -461,6 +491,7 @@ impl PostgresProductRepository {
         let value = trimmed_capped(value, 100, "Option value")?;
 
         let mut tx = self.db.pool().begin().await?;
+        lock_product(&mut tx, product_id).await?;
         let option: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM product_options WHERE id = $1 AND product_id = $2")
                 .bind(option_id)
@@ -514,9 +545,8 @@ impl PostgresProductRepository {
         request: CreateVariantRequest,
         option_values: &[(String, String)],
     ) -> Result<(ProductVariant, Vec<ProductOptionValue>)> {
-        self.ensure_product_exists(request.product_id).await?;
         let title = trimmed_capped(&request.title, 255, "Variant title")?;
-        validate_price(request.price)?;
+        validate_variant_prices(&request)?;
         let sku = match &request.sku {
             Some(s) => Some(trimmed_capped(s, 100, "SKU")?),
             None => None,
@@ -532,6 +562,7 @@ impl PostgresProductRepository {
         }
 
         let mut tx = self.db.pool().begin().await?;
+        lock_product(&mut tx, request.product_id).await?;
         let variant = sqlx::query_as::<_, ProductVariant>(
             "INSERT INTO product_variants ( \
                 product_id, title, sku, price, compare_at_price, cost_price, currency, \
@@ -1186,6 +1217,49 @@ mod tests {
         cleanup_products(&pool, &[pid]).await;
     }
 
+    /// The product row is locked FOR UPDATE inside each create transaction, so
+    /// two concurrent creates of the SAME combination cannot both pass the
+    /// read-then-insert uniqueness check: exactly one succeeds.
+    #[tokio::test]
+    async fn concurrent_duplicate_creates_exactly_one_wins() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Concurrent dup").await;
+        repo.create_option(pid, "Size", 0).await.unwrap();
+
+        let pairs = [("Size".to_string(), "M".to_string())];
+        let repo2 = repo.clone();
+        let (r1, r2) = tokio::join!(
+            repo.create_variant_with_options(
+                variant_request(pid, "M first", Decimal::new(1000, 2)),
+                &pairs
+            ),
+            repo2.create_variant_with_options(
+                variant_request(pid, "M second", Decimal::new(1000, 2)),
+                &pairs
+            ),
+        );
+        let winners = u8::from(r1.is_ok()) + u8::from(r2.is_ok());
+        assert_eq!(
+            winners, 1,
+            "exactly one concurrent create must succeed: {r1:?} / {r2:?}"
+        );
+        let loser = if r1.is_err() {
+            r1.unwrap_err()
+        } else {
+            r2.unwrap_err()
+        };
+        assert!(loser.to_string().contains("Duplicate option combination"));
+        assert_eq!(repo.find_variants(pid).await.unwrap().len(), 1);
+        assert_eq!(count_option_values(&pool, pid).await, 1);
+
+        cleanup_products(&pool, &[pid]).await;
+    }
+
     /// One transaction per product: a failed variant create leaves no partial
     /// variant or option-value rows behind.
     #[tokio::test]
@@ -1259,6 +1333,19 @@ mod tests {
             .is_err());
         assert!(repo
             .create_variant(variant_request(pid, "Prec", Decimal::new(1999, 3)))
+            .await
+            .is_err());
+        // compare-at and cost prices get the same money validation when set.
+        let mut bad_compare = variant_request(pid, "Compare", Decimal::new(100, 2));
+        bad_compare.compare_at_price = Some(Decimal::new(-1, 2));
+        assert!(repo.create_variant(bad_compare).await.is_err());
+        let mut bad_cost = variant_request(pid, "Cost", Decimal::new(100, 2));
+        bad_cost.cost_price = Some(Decimal::new(1999, 3));
+        assert!(repo.create_variant(bad_cost).await.is_err());
+        let mut bad_compare_with_options = variant_request(pid, "Compare2", Decimal::new(100, 2));
+        bad_compare_with_options.compare_at_price = Some(Decimal::new(1999, 3));
+        assert!(repo
+            .create_variant_with_options(bad_compare_with_options, &[("Size".into(), "M".into())])
             .await
             .is_err());
         // Title: trimmed, non-empty, capped. Inventory: non-negative.
