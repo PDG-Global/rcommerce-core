@@ -204,6 +204,52 @@ pub enum ProductCommands {
         #[arg(help = "Product ID")]
         id: String,
     },
+
+    /// Add an option (e.g. "Size") to a product
+    AddOption {
+        #[arg(help = "Product ID")]
+        id: String,
+
+        #[arg(long, help = "Option name, e.g. Size")]
+        name: String,
+
+        #[arg(long, default_value_t = 0, help = "Display position (lower first)")]
+        position: i32,
+    },
+
+    /// Add a variant with its option values in one transaction
+    AddVariant {
+        #[arg(help = "Product ID")]
+        id: String,
+
+        #[arg(long, help = "Variant title, e.g. Small / Red")]
+        title: String,
+
+        #[arg(long, help = "Variant price (exact decimal, e.g. 19.99)")]
+        price: String,
+
+        #[arg(long, default_value = "USD", help = "Currency code")]
+        currency: String,
+
+        #[arg(long, help = "SKU (optional)")]
+        sku: Option<String>,
+
+        #[arg(long, default_value_t = 0, help = "Inventory quantity")]
+        inventory: i32,
+
+        #[arg(
+            long = "option",
+            value_name = "NAME=VALUE",
+            help = "Option value pair, repeatable, e.g. --option Size=M --option Color=Red"
+        )]
+        options: Vec<String>,
+    },
+
+    /// List a product's variants with their option values
+    Variants {
+        #[arg(help = "Product ID")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -702,6 +748,91 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                ProductCommands::AddOption { id, name, position } => {
+                    match add_product_option(&pool, &id, &name, position).await {
+                        Ok(option) => {
+                            println!("{}", "✅ Option created".green().bold());
+                            println!("  ID:       {}", option.id);
+                            println!("  Name:     {}", option.name);
+                            println!("  Position: {}", option.position);
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("❌ Failed to create option: {}", e).red());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ProductCommands::AddVariant {
+                    id,
+                    title,
+                    price,
+                    currency,
+                    sku,
+                    inventory,
+                    options,
+                } => {
+                    match add_product_variant(
+                        &pool,
+                        VariantCliArgs {
+                            id: &id,
+                            title: &title,
+                            price: &price,
+                            currency: &currency,
+                            sku: sku.as_deref(),
+                            inventory,
+                            option_args: &options,
+                        },
+                    )
+                    .await
+                    {
+                        Ok((variant, pairs)) => {
+                            println!("{}", "✅ Variant created".green().bold());
+                            println!("  ID:      {}", variant.id);
+                            println!("  Title:   {}", variant.title);
+                            println!("  Price:   {} {}", variant.price, variant.currency);
+                            println!(
+                                "  Options: {}",
+                                pairs
+                                    .iter()
+                                    .map(|(n, v)| format!("{}={}", n, v))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("❌ Failed to create variant: {}", e).red());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ProductCommands::Variants { id } => match list_product_variants(&pool, &id).await {
+                    Ok(variants) => {
+                        if variants.is_empty() {
+                            println!("{}", "No variants for this product".yellow());
+                        } else {
+                            println!("{}", "Variants".bold().underline());
+                            for (v, pairs) in &variants {
+                                let opts = if pairs.is_empty() {
+                                    "(no option values)".to_string()
+                                } else {
+                                    pairs
+                                        .iter()
+                                        .map(|(n, val)| format!("{}={}", n, val))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                println!(
+                                    "  {}  {}  {} {}  stock:{}  {}",
+                                    v.id, v.title, v.price, v.currency, v.inventory_quantity, opts
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("❌ Failed to list variants: {}", e).red());
+                        std::process::exit(1);
+                    }
+                },
             }
         }
 
@@ -2165,6 +2296,129 @@ async fn delete_product(pool: &sqlx::PgPool, id: &str) -> Result<bool> {
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Parse a CLI product ID argument into a UUID.
+fn parse_product_id(id: &str) -> Result<Uuid> {
+    Uuid::parse_str(id)
+        .map_err(|e| rcommerce_core::Error::validation(format!("Invalid product ID: {}", e)))
+}
+
+/// The shared product repository: CLI variant/option creation goes through the
+/// same validated, transactional functions a later admin-API route would use.
+fn product_repository(pool: &sqlx::PgPool) -> rcommerce_core::repository::ProductRepository {
+    rcommerce_core::repository::ProductRepository::new(rcommerce_core::Database::new(pool.clone()))
+}
+
+/// Add an option to a product (shared repository validation).
+async fn add_product_option(
+    pool: &sqlx::PgPool,
+    id: &str,
+    name: &str,
+    position: i32,
+) -> Result<rcommerce_core::models::ProductOption> {
+    let product_id = parse_product_id(id)?;
+    product_repository(pool)
+        .create_option(product_id, name, position)
+        .await
+}
+
+/// Raw `product add-variant` flag values.
+struct VariantCliArgs<'a> {
+    id: &'a str,
+    title: &'a str,
+    price: &'a str,
+    currency: &'a str,
+    sku: Option<&'a str>,
+    inventory: i32,
+    option_args: &'a [String],
+}
+
+/// Add a variant together with its option values in ONE transaction.
+/// `option_args` are NAME=VALUE pairs; the options must already exist on the
+/// product (create them with `product add-option`). Returns the variant and
+/// the persisted (option name, value) pairs for display.
+async fn add_product_variant(
+    pool: &sqlx::PgPool,
+    args: VariantCliArgs<'_>,
+) -> Result<(
+    rcommerce_core::models::ProductVariant,
+    Vec<(String, String)>,
+)> {
+    use rcommerce_core::models::{CreateVariantRequest, InventoryPolicy};
+
+    let product_id = parse_product_id(args.id)?;
+    let price: rust_decimal::Decimal = args.price.parse().map_err(|_| {
+        rcommerce_core::Error::validation(format!("Invalid price: '{}'", args.price))
+    })?;
+    let currency: Currency = args
+        .currency
+        .parse()
+        .map_err(rcommerce_core::Error::validation)?;
+
+    let mut pairs = Vec::new();
+    for arg in args.option_args {
+        let (name, value) = arg.split_once('=').ok_or_else(|| {
+            rcommerce_core::Error::validation(format!("--option expects NAME=VALUE, got '{}'", arg))
+        })?;
+        pairs.push((name.trim().to_string(), value.trim().to_string()));
+    }
+
+    let request = CreateVariantRequest {
+        product_id,
+        title: args.title.to_string(),
+        sku: args.sku.map(|s| s.to_string()),
+        gtin: None,
+        price,
+        compare_at_price: None,
+        cost_price: None,
+        currency,
+        inventory_quantity: args.inventory,
+        inventory_policy: InventoryPolicy::Deny,
+        weight: None,
+        weight_unit: None,
+        requires_shipping: true,
+        is_active: true,
+    };
+    let (variant, _values) = product_repository(pool)
+        .create_variant_with_options(request, &pairs)
+        .await?;
+    Ok((variant, pairs))
+}
+
+/// List a product's variants, each with its (option name, value) pairs.
+async fn list_product_variants(
+    pool: &sqlx::PgPool,
+    id: &str,
+) -> Result<
+    Vec<(
+        rcommerce_core::models::ProductVariant,
+        Vec<(String, String)>,
+    )>,
+> {
+    let product_id = parse_product_id(id)?;
+    if get_product(pool, id).await?.is_none() {
+        return Err(rcommerce_core::Error::not_found(format!(
+            "Product '{}' not found",
+            id
+        )));
+    }
+    let repo = product_repository(pool);
+    let variants = repo.find_variants(product_id).await?;
+    let options = repo.find_options(product_id).await?;
+    let mut out = Vec::new();
+    for v in variants {
+        let mut pairs = Vec::new();
+        for (option, values) in &options {
+            for val in values {
+                if val.variant_id == v.id {
+                    pairs.push((option.name.clone(), val.value.clone()));
+                }
+            }
+        }
+        out.push((v, pairs));
+    }
+    Ok(out)
 }
 
 // Order CLI functions
