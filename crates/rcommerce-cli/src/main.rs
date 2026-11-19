@@ -243,12 +243,28 @@ pub enum ProductCommands {
             help = "Option value pair, repeatable, e.g. --option Size=M --option Color=Red"
         )]
         options: Vec<String>,
+
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            help = "Units per pack (1-1000); omit to inherit the product's pack size"
+        )]
+        pack_size: Option<i32>,
     },
 
     /// List a product's variants with their option values
     Variants {
         #[arg(help = "Product ID")]
         id: String,
+    },
+
+    /// Set a product's pack size (units per pack; quantity counts packs)
+    SetPackSize {
+        #[arg(help = "Product ID")]
+        id: String,
+
+        #[arg(help = "Units per pack (1-1000)", allow_hyphen_values = true)]
+        pack_size: i32,
     },
 }
 
@@ -770,6 +786,7 @@ async fn main() -> Result<()> {
                     sku,
                     inventory,
                     options,
+                    pack_size,
                 } => {
                     match add_product_variant(
                         &pool,
@@ -781,6 +798,7 @@ async fn main() -> Result<()> {
                             sku: sku.as_deref(),
                             inventory,
                             option_args: &options,
+                            pack_size,
                         },
                     )
                     .await
@@ -790,6 +808,13 @@ async fn main() -> Result<()> {
                             println!("  ID:      {}", variant.id);
                             println!("  Title:   {}", variant.title);
                             println!("  Price:   {} {}", variant.price, variant.currency);
+                            println!(
+                                "  Pack:    {}",
+                                variant
+                                    .pack_size
+                                    .map(|p| format!("{} units per pack", p))
+                                    .unwrap_or_else(|| "inherits product".to_string())
+                            );
                             println!(
                                 "  Options: {}",
                                 pairs
@@ -822,8 +847,16 @@ async fn main() -> Result<()> {
                                         .join(", ")
                                 };
                                 println!(
-                                    "  {}  {}  {} {}  stock:{}  {}",
-                                    v.id, v.title, v.price, v.currency, v.inventory_quantity, opts
+                                    "  {}  {}  {} {}  stock:{}  pack:{}  {}",
+                                    v.id,
+                                    v.title,
+                                    v.price,
+                                    v.currency,
+                                    v.inventory_quantity,
+                                    v.pack_size
+                                        .map(|p| p.to_string())
+                                        .unwrap_or_else(|| "inherit".to_string()),
+                                    opts
                                 );
                             }
                         }
@@ -833,6 +866,29 @@ async fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 },
+                ProductCommands::SetPackSize { id, pack_size } => {
+                    let product_id = match parse_product_id(&id) {
+                        Ok(pid) => pid,
+                        Err(e) => {
+                            eprintln!("{}", format!("❌ {}", e).red());
+                            std::process::exit(1);
+                        }
+                    };
+                    match product_repository(&pool)
+                        .set_product_pack_size(product_id, pack_size)
+                        .await
+                    {
+                        Ok(product) => {
+                            println!("{}", "✅ Pack size updated".green().bold());
+                            println!("  Product:  {}", product.title);
+                            println!("  Pack size: {} units per pack", product.pack_size);
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("❌ Failed to set pack size: {}", e).red());
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
         }
 
@@ -2332,6 +2388,7 @@ struct VariantCliArgs<'a> {
     sku: Option<&'a str>,
     inventory: i32,
     option_args: &'a [String],
+    pack_size: Option<i32>,
 }
 
 /// Add a variant together with its option values in ONE transaction.
@@ -2379,6 +2436,7 @@ async fn add_product_variant(
         weight_unit: None,
         requires_shipping: true,
         is_active: true,
+        pack_size: args.pack_size,
     };
     let (variant, _values) = product_repository(pool)
         .create_variant_with_options(request, &pairs)

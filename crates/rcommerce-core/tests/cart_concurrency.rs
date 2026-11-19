@@ -53,6 +53,7 @@ fn product_details(price: Decimal) -> ProductDetails {
         image_url: None,
         requires_shipping: true,
         is_gift_card: false,
+        pack_size: 1,
     }
 }
 

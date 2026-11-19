@@ -261,8 +261,10 @@ pub async fn add_item_to_cart(
         ));
     }
 
-    // Determine the entity (product or variant) being added and validate stock
-    let (target_product_id, _target_variant_id, _available_quantity) =
+    // Determine the entity (product or variant) being added and validate stock.
+    // Pack-size pricing (issue #49): quantity counts PACKS; the effective pack
+    // size is the variant's when set, otherwise the product's (NULL inherits).
+    let (target_product_id, _target_variant_id, _available_quantity, pack_size) =
         if let Some(variant_id) = request.variant_id {
             let variant = product_detail
                 .variants
@@ -273,12 +275,17 @@ pub async fn add_item_to_cart(
                 request.product_id,
                 Some(variant_id),
                 variant.inventory_quantity,
+                rcommerce_core::models::effective_pack_size(
+                    product_detail.product.pack_size,
+                    variant.pack_size,
+                ),
             )
         } else {
             (
                 request.product_id,
                 None,
                 product_detail.product.inventory_quantity,
+                product_detail.product.pack_size,
             )
         };
 
@@ -318,7 +325,13 @@ pub async fn add_item_to_cart(
         )));
     }
 
-    if requested_total > total_available {
+    // Stock is counted in UNITS: convert the requested packs to units with
+    // checked arithmetic (the authoritative check repeats inside the atomic
+    // cart mutation; this pre-check only gives a friendlier early error).
+    let requested_units = i64::from(requested_total)
+        .checked_mul(i64::from(pack_size))
+        .ok_or_else(|| Error::validation("Quantity is too large"))?;
+    if requested_units > i64::from(total_available) {
         return Err(Error::validation(format!(
             "Only {} units of '{}' are available",
             total_available, product_detail.product.title
@@ -335,23 +348,28 @@ pub async fn add_item_to_cart(
             .ok_or_else(|| Error::not_found("Product variant not found"))?;
 
         ProductDetails {
-            unit_price: variant.price,
-            original_price: variant.compare_at_price.unwrap_or(variant.price),
+            // Per-PACK price: the server-stored unit price times the effective
+            // pack size. Client-sent price/pack_size fields never reach here.
+            unit_price: variant.price * rust_decimal::Decimal::from(pack_size),
+            original_price: variant.compare_at_price.unwrap_or(variant.price)
+                * rust_decimal::Decimal::from(pack_size),
             sku: variant.sku.clone(),
             title: product_detail.product.title.clone(),
             variant_title: Some(variant.title.clone()),
             image_url: product_detail.images.first().map(|i| i.src.clone()),
             requires_shipping: variant.requires_shipping,
             is_gift_card: false,
+            pack_size,
         }
     } else {
         // Use product-level details
         ProductDetails {
-            unit_price: product_detail.product.price,
+            unit_price: product_detail.product.price * rust_decimal::Decimal::from(pack_size),
             original_price: product_detail
                 .product
                 .compare_at_price
-                .unwrap_or(product_detail.product.price),
+                .unwrap_or(product_detail.product.price)
+                * rust_decimal::Decimal::from(pack_size),
             sku: product_detail.product.sku.clone(),
             title: product_detail.product.title.clone(),
             variant_title: None,
@@ -359,6 +377,7 @@ pub async fn add_item_to_cart(
             requires_shipping: product_detail.product.requires_shipping,
             is_gift_card: product_detail.product.product_type
                 == rcommerce_core::models::ProductType::Digital,
+            pack_size,
         }
     };
 

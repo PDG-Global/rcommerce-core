@@ -100,6 +100,23 @@ pub struct Product {
     // Bundle product fields
     pub bundle_pricing_strategy: Option<BundlePricingStrategy>,
     pub bundle_discount_percentage: Option<Decimal>,
+    /// Units per pack (1..=1000). `quantity` in carts/orders counts packs;
+    /// line total = price * pack_size * quantity. Default 1 = single units.
+    #[serde(default = "default_pack_size")]
+    pub pack_size: i32,
+}
+
+fn default_pack_size() -> i32 {
+    1
+}
+
+/// Maximum allowed pack size (server-enforced on every write path).
+pub const MAX_PACK_SIZE: i32 = 1000;
+
+/// Effective pack size for a cart/order line: the variant's value when set,
+/// otherwise the product's. NULL variant pack_size means "inherit".
+pub fn effective_pack_size(product_pack_size: i32, variant_pack_size: Option<i32>) -> i32 {
+    variant_pack_size.unwrap_or(product_pack_size)
 }
 
 /// Product variant
@@ -123,6 +140,10 @@ pub struct ProductVariant {
     #[serde(default)]
     #[sqlx(default)]
     pub gtin: Option<String>,
+    /// Units per pack; NULL inherits the product's pack_size.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub pack_size: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -294,6 +315,10 @@ pub struct CreateProductRequest {
     pub bundle_pricing_strategy: Option<BundlePricingStrategy>,
     pub bundle_discount_percentage: Option<Decimal>,
     pub bundle_components: Option<Vec<CreateBundleComponentRequest>>,
+
+    /// Units per pack (1..=1000); None = 1. Refused > 1 on bundle and subscription products.
+    #[serde(default)]
+    pub pack_size: Option<i32>,
 }
 
 /// Update product request
@@ -363,6 +388,10 @@ pub struct UpdateProductRequest {
     // Bundle product fields
     pub bundle_pricing_strategy: Option<Option<BundlePricingStrategy>>,
     pub bundle_discount_percentage: Option<Option<Decimal>>,
+
+    /// Units per pack (1..=1000); None = leave unchanged. Refused > 1 on bundles and subscriptions.
+    #[serde(default)]
+    pub pack_size: Option<i32>,
 }
 
 /// Create attribute request (for variable products)
@@ -431,6 +460,10 @@ pub struct CreateVariantRequest {
     pub requires_shipping: bool,
 
     pub is_active: bool,
+
+    /// Units per pack; None inherits the product's pack_size. 1..=1000 when set.
+    #[serde(default)]
+    pub pack_size: Option<i32>,
 }
 
 /// Create bundle component request

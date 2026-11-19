@@ -64,6 +64,7 @@ impl PostgresCartMutation {
             input.product_id,
             input.variant_id,
             requested,
+            product_details.pack_size,
             &product_details.title,
         )
         .await?;
@@ -162,6 +163,7 @@ impl PostgresCartMutation {
                 component.product_id,
                 None,
                 requested,
+                1,
                 &component.title,
             )
             .await?;
@@ -306,11 +308,14 @@ impl PostgresCartMutation {
                     let requested = multiplier.checked_mul(input.quantity).ok_or_else(|| {
                         Error::validation("Bundle component quantity is too large")
                     })?;
+                    // Bundle components reserve stock in units of the component
+                    // product; pack multipliers apply to standalone lines only.
                     ensure_stock(
                         &mut tx,
                         child.product_id,
                         child.variant_id,
                         requested,
+                        1,
                         &child.title,
                     )
                     .await?;
@@ -324,11 +329,15 @@ impl PostgresCartMutation {
                 }
             }
         } else if input.quantity > 0 {
+            // Regular line: quantity counts packs; convert inside this same
+            // locked transaction using the CURRENT stored pack size.
+            let pack_size = line_pack_size(&mut tx, item.product_id, item.variant_id).await?;
             ensure_stock(
                 &mut tx,
                 item.product_id,
                 item.variant_id,
                 input.quantity,
+                pack_size,
                 &item.title,
             )
             .await?;
@@ -558,8 +567,15 @@ async fn ensure_stock(
     product_id: Uuid,
     variant_id: Option<Uuid>,
     requested: i32,
+    pack_size: i32,
     title: &str,
 ) -> Result<()> {
+    // Pack -> unit conversion happens HERE, inside the locked cart transaction
+    // that also reads stock and mutates the cart — never as a separate
+    // read-then-write. Checked i64 arithmetic refuses overflow.
+    let requested_units = i64::from(requested)
+        .checked_mul(i64::from(pack_size))
+        .ok_or_else(|| Error::validation("Quantity is too large"))?;
     let available: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(available_quantity), 0) FROM inventory_levels WHERE product_id = $1 AND variant_id IS NOT DISTINCT FROM $2",
     )
@@ -567,7 +583,7 @@ async fn ensure_stock(
     .bind(variant_id)
     .fetch_one(&mut **tx)
     .await?;
-    if i64::from(requested) > available {
+    if requested_units > available {
         return Err(Error::validation(format!(
             "Only {} units of '{}' are available",
             available.max(0),
@@ -575,6 +591,34 @@ async fn ensure_stock(
         )));
     }
     Ok(())
+}
+
+/// Effective pack size for a cart line, read inside the caller's transaction:
+/// the variant's pack_size when set, otherwise the product's (NULL inherits).
+async fn line_pack_size(
+    tx: &mut Transaction<'_, Postgres>,
+    product_id: Uuid,
+    variant_id: Option<Uuid>,
+) -> Result<i32> {
+    let product_pack: i32 = sqlx::query_scalar("SELECT pack_size FROM products WHERE id = $1")
+        .bind(product_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| Error::not_found("Product not found"))?;
+    match variant_id {
+        None => Ok(product_pack),
+        Some(vid) => {
+            let variant_pack: Option<i32> = sqlx::query_scalar(
+                "SELECT pack_size FROM product_variants WHERE id = $1 AND product_id = $2",
+            )
+            .bind(vid)
+            .bind(product_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| Error::not_found("Product variant not found"))?;
+            Ok(variant_pack.unwrap_or(product_pack))
+        }
+    }
 }
 
 fn ensure_regular(item: &CartItem) -> Result<()> {

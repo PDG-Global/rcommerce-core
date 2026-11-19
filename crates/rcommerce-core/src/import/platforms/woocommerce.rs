@@ -768,6 +768,7 @@ impl PlatformImporter for WooCommerceImporter {
                                 download_expiry_days: None,
                                 bundle_pricing_strategy: None,
                                 bundle_discount_percentage: None,
+                                pack_size: None,
                             };
 
                             match repo
@@ -883,6 +884,7 @@ impl PlatformImporter for WooCommerceImporter {
                             bundle_discount_percentage: None,
                             attributes: None,
                             bundle_components: None,
+                            pack_size: None,
                         };
 
                         match repo.create_with_request(create_request).await {

@@ -238,6 +238,7 @@ impl DigitalProductService {
                 // Bundle product fields
                 bundle_parent_id: row.try_get("bundle_parent_id").ok(),
                 is_bundle_component: row.try_get("is_bundle_component").ok(),
+                pack_size: row.try_get("pack_size").unwrap_or(1),
             };
 
             let product = Product {
@@ -281,6 +282,7 @@ impl DigitalProductService {
                 bundle_pricing_strategy: row.try_get("bundle_pricing_strategy")?,
                 bundle_discount_percentage: row.try_get("bundle_discount_percentage")?,
                 gtin: row.try_get("p_gtin")?,
+                pack_size: row.try_get("pack_size").unwrap_or(1),
             };
 
             results.push((download, order_item, product));

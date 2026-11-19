@@ -318,6 +318,7 @@ mod tests {
             weight: Some(dec!(0.5)),
             weight_unit: None,
             is_bundle_component: None,
+            pack_size: 1,
             metadata: serde_json::json!({}),
             created_at: Utc::now(),
         }];

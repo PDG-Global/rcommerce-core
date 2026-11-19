@@ -7,7 +7,8 @@ use crate::repository::traits::ProductRepositoryTrait;
 use crate::{
     models::{
         CreateProductRequest, CreateVariantRequest, Product, ProductFilter, ProductImage,
-        ProductOption, ProductOptionValue, ProductVariant, UpdateProductRequest,
+        ProductOption, ProductOptionValue, ProductType, ProductVariant, UpdateProductRequest,
+        MAX_PACK_SIZE,
     },
     Error, Pagination, Result, SortDirection, SortParams,
 };
@@ -88,6 +89,45 @@ fn validate_gtin(gtin: &Option<String>) -> Result<Option<String>> {
             Ok(Some(g.to_string()))
         }
     }
+}
+
+/// Pack size is a positive integer with a server-enforced cap. None means
+/// "default" (1 for products, inherit for variants) and is always allowed.
+fn validate_pack_size(pack_size: Option<i32>) -> Result<()> {
+    if let Some(p) = pack_size {
+        if !(1..=MAX_PACK_SIZE).contains(&p) {
+            return Err(Error::validation(format!(
+                "Pack size must be between 1 and {MAX_PACK_SIZE}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Bundles are priced as a whole; a pack multiplier on a bundle would
+/// double-count its components. Subscription renewals bill a fixed cycle
+/// amount and reserve stock without a pack snapshot, so packs on subscription
+/// products would under-reserve every renewal — refused until that path has
+/// its own design. Enforced here in the shared layer so every caller (CLI
+/// today, admin API later) gets the same rule.
+fn validate_product_pack_size(pack_size: Option<i32>, product_type: ProductType) -> Result<()> {
+    validate_pack_size(pack_size)?;
+    if pack_size.unwrap_or(1) > 1 {
+        match product_type {
+            ProductType::Bundle => {
+                return Err(Error::validation(
+                    "Pack size greater than 1 is not supported on bundle products",
+                ));
+            }
+            ProductType::Subscription => {
+                return Err(Error::validation(
+                    "Pack size greater than 1 is not supported on subscription products",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Lock the product row inside the create transaction and prove it exists.
@@ -173,15 +213,16 @@ impl PostgresProductRepository {
     }
 
     pub async fn create_with_request(&self, request: CreateProductRequest) -> Result<Product> {
+        validate_product_pack_size(request.pack_size, request.product_type)?;
         let product = sqlx::query_as::<_, Product>(
             r#"
             INSERT INTO products (
                 title, slug, description, sku, price, compare_at_price, cost_price,
                 currency, inventory_quantity, inventory_policy, inventory_management,
                 continues_selling_when_out_of_stock, weight, weight_unit, requires_shipping,
-                is_active, is_featured, seo_title, seo_description, gtin
+                is_active, is_featured, seo_title, seo_description, gtin, pack_size
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, COALESCE($21, 1))
             RETURNING *
             "#
         )
@@ -205,6 +246,7 @@ impl PostgresProductRepository {
         .bind(request.seo_title)
         .bind(request.seo_description)
         .bind(request.gtin)
+        .bind(request.pack_size)
         .fetch_one(self.db.pool())
         .await?;
 
@@ -231,6 +273,23 @@ impl PostgresProductRepository {
         let has_weight_unit = request.weight_unit.is_some();
         let has_inventory_quantity = request.inventory_quantity.is_some();
         let has_gtin = request.gtin.is_some();
+        let has_pack_size = request.pack_size.is_some();
+
+        if has_pack_size {
+            // Bundle refusal applies to the type the product WILL have: the
+            // requested new type when given, otherwise the stored one.
+            let target_type = match request.product_type {
+                Some(t) => t,
+                None => sqlx::query_scalar::<_, ProductType>(
+                    "SELECT product_type FROM products WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| Error::not_found("Product not found"))?,
+            };
+            validate_product_pack_size(request.pack_size, target_type)?;
+        }
 
         if has_title {
             param_count += 1;
@@ -275,6 +334,10 @@ impl PostgresProductRepository {
         if has_inventory_quantity {
             param_count += 1;
             sets.push(format!("inventory_quantity = ${}", param_count));
+        }
+        if has_pack_size {
+            param_count += 1;
+            sets.push(format!("pack_size = ${}", param_count));
         }
 
         if sets.is_empty() {
@@ -323,6 +386,9 @@ impl PostgresProductRepository {
         }
         if let Some(inventory_quantity) = request.inventory_quantity {
             query_builder = query_builder.bind(inventory_quantity);
+        }
+        if let Some(pack_size) = request.pack_size {
+            query_builder = query_builder.bind(pack_size);
         }
         query_builder = query_builder.bind(id);
 
@@ -440,6 +506,7 @@ impl PostgresProductRepository {
         if request.inventory_quantity < 0 {
             return Err(Error::validation("Inventory quantity cannot be negative"));
         }
+        validate_pack_size(request.pack_size)?;
 
         let mut tx = self.db.pool().begin().await?;
         lock_product(&mut tx, request.product_id).await?;
@@ -447,8 +514,8 @@ impl PostgresProductRepository {
             "INSERT INTO product_variants ( \
                 product_id, title, sku, price, compare_at_price, cost_price, currency, \
                 inventory_quantity, inventory_policy, weight, weight_unit, requires_shipping, \
-                is_active, gtin \
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+                is_active, gtin, pack_size \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *",
         )
         .bind(request.product_id)
         .bind(&title)
@@ -464,6 +531,7 @@ impl PostgresProductRepository {
         .bind(request.requires_shipping)
         .bind(request.is_active)
         .bind(&gtin)
+        .bind(request.pack_size)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -555,6 +623,7 @@ impl PostgresProductRepository {
         if request.inventory_quantity < 0 {
             return Err(Error::validation("Inventory quantity cannot be negative"));
         }
+        validate_pack_size(request.pack_size)?;
         if option_values.is_empty() {
             return Err(Error::validation(
                 "A variant must have at least one option value",
@@ -567,8 +636,8 @@ impl PostgresProductRepository {
             "INSERT INTO product_variants ( \
                 product_id, title, sku, price, compare_at_price, cost_price, currency, \
                 inventory_quantity, inventory_policy, weight, weight_unit, requires_shipping, \
-                is_active, gtin \
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+                is_active, gtin, pack_size \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *",
         )
         .bind(request.product_id)
         .bind(&title)
@@ -584,6 +653,7 @@ impl PostgresProductRepository {
         .bind(request.requires_shipping)
         .bind(request.is_active)
         .bind(&gtin)
+        .bind(request.pack_size)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -624,6 +694,32 @@ impl PostgresProductRepository {
         assert_combination_unique(&mut tx, request.product_id, variant.id).await?;
         tx.commit().await?;
         Ok((variant, created))
+    }
+
+    /// Set a product's pack size (units per pack). Validated in the shared
+    /// layer: 1..=MAX_PACK_SIZE, refused > 1 on bundle products. One
+    /// transaction with the product row locked, same pattern as the other
+    /// write paths, so a future admin-API route reuses this unchanged.
+    pub async fn set_product_pack_size(&self, product_id: Uuid, pack_size: i32) -> Result<Product> {
+        validate_pack_size(Some(pack_size))?;
+
+        let mut tx = self.db.pool().begin().await?;
+        lock_product(&mut tx, product_id).await?;
+        let product_type: ProductType =
+            sqlx::query_scalar("SELECT product_type FROM products WHERE id = $1")
+                .bind(product_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        validate_product_pack_size(Some(pack_size), product_type)?;
+        let product = sqlx::query_as::<_, Product>(
+            "UPDATE products SET pack_size = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+        )
+        .bind(pack_size)
+        .bind(product_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(product)
     }
 
     /// First image (lowest position) of several products, in one query
@@ -1008,6 +1104,7 @@ mod tests {
             weight_unit: None,
             requires_shipping: true,
             is_active: true,
+            pack_size: None,
         }
     }
 
@@ -1404,6 +1501,245 @@ mod tests {
             .create_variant(variant_request(missing, "X", Decimal::new(100, 2)))
             .await
             .is_err());
+
+        cleanup_products(&pool, &[pid]).await;
+    }
+
+    fn pack_product_request(
+        title: &str,
+        slug: &str,
+        product_type: crate::models::ProductType,
+        pack_size: Option<i32>,
+    ) -> CreateProductRequest {
+        CreateProductRequest {
+            title: title.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            sku: None,
+            product_type,
+            price: Decimal::new(250, 2),
+            compare_at_price: None,
+            cost_price: None,
+            currency: crate::models::Currency::USD,
+            inventory_quantity: 0,
+            inventory_policy: crate::models::InventoryPolicy::Deny,
+            inventory_management: false,
+            continues_selling_when_out_of_stock: false,
+            weight: None,
+            weight_unit: None,
+            requires_shipping: true,
+            is_active: true,
+            is_featured: false,
+            seo_title: None,
+            seo_description: None,
+            gtin: None,
+            subscription_interval: None,
+            subscription_interval_count: None,
+            subscription_trial_days: None,
+            subscription_setup_fee: None,
+            subscription_min_cycles: None,
+            subscription_max_cycles: None,
+            attributes: None,
+            file_url: None,
+            file_size: None,
+            file_hash: None,
+            download_limit: None,
+            license_key_enabled: None,
+            download_expiry_days: None,
+            bundle_pricing_strategy: None,
+            bundle_discount_percentage: None,
+            bundle_components: None,
+            pack_size,
+        }
+    }
+
+    fn empty_update_request(pack_size: Option<i32>) -> UpdateProductRequest {
+        UpdateProductRequest {
+            title: None,
+            slug: None,
+            description: None,
+            sku: None,
+            price: None,
+            compare_at_price: None,
+            cost_price: None,
+            currency: None,
+            inventory_quantity: None,
+            inventory_policy: None,
+            inventory_management: None,
+            continues_selling_when_out_of_stock: None,
+            weight: None,
+            weight_unit: None,
+            requires_shipping: None,
+            is_active: None,
+            is_featured: None,
+            seo_title: None,
+            seo_description: None,
+            gtin: None,
+            product_type: None,
+            subscription_interval: None,
+            subscription_interval_count: None,
+            subscription_trial_days: None,
+            subscription_setup_fee: None,
+            subscription_min_cycles: None,
+            subscription_max_cycles: None,
+            file_url: None,
+            file_size: None,
+            file_hash: None,
+            download_limit: None,
+            license_key_enabled: None,
+            download_expiry_days: None,
+            bundle_pricing_strategy: None,
+            bundle_discount_percentage: None,
+            pack_size,
+        }
+    }
+
+    /// Issue #49: pack size is a positive capped integer on every write path,
+    /// and > 1 is refused on bundle products in the SHARED layer.
+    #[tokio::test]
+    async fn pack_size_validation_and_bundle_refusal() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Pack validation").await;
+
+        for bad in [0, -1, 1001] {
+            let err = repo.set_product_pack_size(pid, bad).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Pack size must be between 1 and 1000"),
+                "unexpected error for {bad}: {err}"
+            );
+            let err = repo
+                .create_with_request(pack_product_request(
+                    "Bad pack",
+                    &format!("bad-pack-{}-{bad}", Uuid::new_v4()),
+                    crate::models::ProductType::Simple,
+                    Some(bad),
+                ))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Pack size must be between"));
+        }
+        assert_eq!(
+            repo.set_product_pack_size(pid, 6).await.unwrap().pack_size,
+            6
+        );
+        assert_eq!(
+            repo.set_product_pack_size(pid, 1000)
+                .await
+                .unwrap()
+                .pack_size,
+            1000
+        );
+
+        // Variant write path validates too.
+        let mut bad_variant = variant_request(pid, "Bad pack variant", Decimal::new(100, 2));
+        bad_variant.pack_size = Some(1001);
+        repo.create_option(pid, "Size", 0).await.unwrap();
+        assert!(repo
+            .create_variant_with_options(bad_variant, &[("Size".to_string(), "M".to_string())])
+            .await
+            .is_err());
+
+        // Bundle refusal: create, update and set paths all refuse > 1.
+        let bundle = repo
+            .create_with_request(pack_product_request(
+                "Pack bundle",
+                &format!("pack-bundle-{}", Uuid::new_v4()),
+                crate::models::ProductType::Bundle,
+                Some(2),
+            ))
+            .await
+            .unwrap_err();
+        assert!(bundle.to_string().contains("not supported on bundle"));
+        let bundle_id = insert_product(&pool, "Existing bundle").await;
+        sqlx::query("UPDATE products SET product_type = 'bundle' WHERE id = $1")
+            .bind(bundle_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = repo.set_product_pack_size(bundle_id, 2).await.unwrap_err();
+        assert!(err.to_string().contains("not supported on bundle"));
+        let err = repo
+            .update_with_request(bundle_id, empty_update_request(Some(2)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not supported on bundle"));
+        // pack_size 1 on a bundle is fine (no multiplier).
+        assert_eq!(
+            repo.set_product_pack_size(bundle_id, 1)
+                .await
+                .unwrap()
+                .pack_size,
+            1
+        );
+
+        // Subscription products are excluded too: renewals bill a fixed cycle
+        // amount and would under-reserve stock without a pack snapshot.
+        let sub_id = insert_product(&pool, "Existing subscription").await;
+        sqlx::query("UPDATE products SET product_type = 'subscription' WHERE id = $1")
+            .bind(sub_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = repo.set_product_pack_size(sub_id, 2).await.unwrap_err();
+        assert!(err.to_string().contains("not supported on subscription"));
+
+        cleanup_products(&pool, &[pid, bundle_id, sub_id]).await;
+    }
+
+    /// Issue #49: a variant's NULL pack_size inherits the product's value;
+    /// an explicit value overrides it. Effective = COALESCE(variant, product).
+    #[tokio::test]
+    async fn variant_pack_size_null_inherits_product() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresProductRepository::new(crate::repository::postgres::PostgresDb::new(
+            pool.clone(),
+        ));
+        let pid = insert_product(&pool, "Pack inheritance").await;
+        repo.set_product_pack_size(pid, 6).await.unwrap();
+        repo.create_option(pid, "Size", 0).await.unwrap();
+
+        let mut inheriting = variant_request(pid, "Inherits", Decimal::new(250, 2));
+        inheriting.pack_size = None;
+        let (v_inherit, _) = repo
+            .create_variant_with_options(inheriting, &[("Size".to_string(), "M".to_string())])
+            .await
+            .unwrap();
+        let mut overriding = variant_request(pid, "Overrides", Decimal::new(250, 2));
+        overriding.pack_size = Some(2);
+        let (v_override, _) = repo
+            .create_variant_with_options(overriding, &[("Size".to_string(), "L".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(v_inherit.pack_size, None);
+        assert_eq!(v_override.pack_size, Some(2));
+        assert_eq!(
+            crate::models::effective_pack_size(6, v_inherit.pack_size),
+            6
+        );
+        assert_eq!(
+            crate::models::effective_pack_size(6, v_override.pack_size),
+            2
+        );
+
+        // The same rule expressed in SQL (what the pricing paths rely on).
+        let effective: Vec<i32> = sqlx::query_scalar(
+            "SELECT COALESCE(v.pack_size, p.pack_size) FROM product_variants v \
+             JOIN products p ON p.id = v.product_id WHERE v.product_id = $1 ORDER BY v.created_at",
+        )
+        .bind(pid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(effective, vec![6, 2]);
 
         cleanup_products(&pool, &[pid]).await;
     }

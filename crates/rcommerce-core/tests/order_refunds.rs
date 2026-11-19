@@ -297,3 +297,109 @@ async fn stored_gateway_and_cumulative_refunds_control_finalization() {
         .await
         .unwrap();
 }
+
+/// Issue #49: refund restock uses the order item's pack_size SNAPSHOT, not the
+/// current product value. Order 2 packs of 6, edit the product to packs of 12,
+/// refund — exactly 2 × 6 = 12 units come back, not 24.
+#[tokio::test]
+async fn refund_restocks_pack_units_from_order_item_snapshot() {
+    let Some((pool, service, _selected)) = setup().await else {
+        return;
+    };
+    let order_id = Uuid::new_v4();
+    let payment_id = Uuid::new_v4();
+    let product_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO products (id, title, slug, price, inventory_quantity, pack_size) \
+         VALUES ($1, 'Pack Refund', $2, 2.50, 0, 6)",
+    )
+    .bind(product_id)
+    .bind(format!("pack-refund-{product_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO orders (id, order_number, customer_email, currency, subtotal, total, status, payment_status, fulfillment_status) \
+         VALUES ($1, $2, 'packrefund@example.com', 'USD', 30, 30, 'confirmed', 'paid', 'pending')",
+    )
+    .bind(order_id)
+    .bind(format!("PACKREFUND-{order_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO order_items (order_id, product_id, title, quantity, price, total, pack_size) \
+         VALUES ($1, $2, 'Pack Refund', 2, 15, 30, 6)",
+    )
+    .bind(order_id)
+    .bind(product_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payments (id, order_id, amount, currency, status, gateway, gateway_payment_id) \
+         VALUES ($1, $2, 30, 'USD', 'paid', 'secondary', 'intent_pack_secondary')",
+    )
+    .bind(payment_id)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Merchant edits the pack size AFTER the order was placed.
+    sqlx::query("UPDATE products SET pack_size = 12 WHERE id = $1")
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let refunded = service
+        .refund_order(order_id, None, "pack snapshot restock".to_string())
+        .await
+        .unwrap();
+    assert_eq!(refunded.status, OrderStatus::Refunded);
+
+    // Restock must use the snapshot (6), not the current value (12).
+    let inventory: i32 =
+        sqlx::query_scalar("SELECT inventory_quantity FROM products WHERE id = $1")
+            .bind(product_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(inventory, 12, "2 packs × snapshot 6 units = 12 units back");
+    let available: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(available_quantity), 0) FROM inventory_levels WHERE product_id = $1",
+    )
+    .bind(product_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(available, 12);
+    let snapshot: i32 = sqlx::query_scalar("SELECT pack_size FROM order_items WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(snapshot, 6, "the order item snapshot must not drift");
+
+    sqlx::query("DELETE FROM orders WHERE id = $1")
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stock_movements WHERE product_id = $1")
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM inventory_levels WHERE product_id = $1")
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM products WHERE id = $1")
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

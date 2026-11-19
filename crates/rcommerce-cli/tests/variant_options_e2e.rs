@@ -577,3 +577,294 @@ async fn cli_created_variable_product_is_selectable_and_adds_at_server_price() {
         .unwrap();
     let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
 }
+
+/// Issue #49 E2E: pack pricing is computed server-side at cart-add (client
+/// price/pack_size ignored), stock is checked in UNITS inside the atomic cart
+/// mutation, variant NULL pack_size inherits the product's, and the CLI
+/// validates pack size on every write path.
+#[tokio::test]
+async fn pack_size_pricing_is_server_side_and_stock_is_in_units() {
+    let url = test_database_url();
+    let pool = match PgPool::connect(&url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("Skipping pack-size E2E: cannot connect to {url}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = rcommerce_core::ensure_test_migrations(&pool).await {
+        eprintln!("Skipping pack-size E2E: migration failed: {e}");
+        return;
+    }
+    let state = build_app_state(pool.clone()).await.unwrap();
+    let addr = serve(app_router(state)).await;
+    let base = format!("http://{addr}");
+    let http = client();
+    let config_path = write_cli_config(&url).unwrap();
+
+    // $2.50 per unit, sold in packs of 6, 12 UNITS in stock (= 2 packs).
+    let product = seed_product(&pool, "E2E Pack Tea", "simple").await;
+    let pid = product.to_string();
+    sqlx::query("UPDATE products SET price = 2.50 WHERE id = $1")
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let location = Uuid::new_v4();
+    sqlx::query("INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Pack E2E', $2)")
+        .bind(location)
+        .bind(format!("PACKE2E-{}", &location.to_string()[..8]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO inventory_levels (product_id, variant_id, location_id, available_quantity) \
+         VALUES ($1, NULL, $2, 12)",
+    )
+    .bind(product)
+    .bind(location)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // --- CLI pack-size validation + set ------------------------------------
+    for bad in ["0", "-1", "1001"] {
+        let out = run_cli_expect_err(&config_path, &["product", "set-pack-size", &pid, bad]);
+        assert!(
+            out.contains("Pack size must be between 1 and 1000"),
+            "out: {out}"
+        );
+    }
+    let out = run_cli(&config_path, &["product", "set-pack-size", &pid, "6"]);
+    assert!(out.contains("6 units per pack"), "out: {out}");
+
+    // Product detail exposes the pack size for storefront labelling.
+    let detail: serde_json::Value = http
+        .get(format!("{base}/products/{pid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["product"]["pack_size"], 6);
+
+    // --- tampered cart-add: server math wins --------------------------------
+    let cart: serde_json::Value = http
+        .post(format!("{base}/carts/guest"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cart_id = cart["cart"]["id"].as_str().unwrap().to_string();
+
+    let resp = http
+        .post(format!("{base}/carts/{cart_id}/items"))
+        .json(&serde_json::json!({
+            "product_id": product,
+            "quantity": 2,
+            "price": "0.01",
+            "pack_size": 999
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "add failed: {}",
+        resp.text().await.unwrap()
+    );
+    let item: serde_json::Value = resp.json().await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let unit_price: Decimal = item["unit_price"].as_str().unwrap().parse().unwrap();
+    let subtotal: Decimal = item["subtotal"].as_str().unwrap().parse().unwrap();
+    assert_eq!(unit_price, Decimal::new(1500, 2), "2.50 unit × 6 pack");
+    assert_eq!(subtotal, Decimal::new(3000, 2), "× 2 packs");
+    assert_eq!(item["quantity"], 2);
+
+    // --- stock is in UNITS: a third pack (18 units) is refused --------------
+    let resp = http
+        .post(format!("{base}/carts/{cart_id}/items"))
+        .json(&serde_json::json!({ "product_id": product, "quantity": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Only 12 units"),
+        "body: {body}"
+    );
+
+    // Quantity update converts too (3 packs = 18 units > 12).
+    let resp = http
+        .put(format!("{base}/carts/{cart_id}/items/{item_id}"))
+        .json(&serde_json::json!({ "quantity": 3 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Only 12 units"));
+
+    // Large quantity is refused, never wraps (checked arithmetic).
+    let resp = http
+        .post(format!("{base}/carts/{cart_id}/items"))
+        .json(&serde_json::json!({ "product_id": product, "quantity": i32::MAX }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // --- variant NULL inherits; explicit value overrides ---------------------
+    run_cli(
+        &config_path,
+        &["product", "add-option", &pid, "--name", "Size"],
+    );
+    run_cli(
+        &config_path,
+        &[
+            "product",
+            "add-variant",
+            &pid,
+            "--title",
+            "Inherits",
+            "--price",
+            "2.50",
+            "--option",
+            "Size=M",
+        ],
+    );
+    let out = run_cli_expect_err(
+        &config_path,
+        &[
+            "product",
+            "add-variant",
+            &pid,
+            "--title",
+            "Bad pack",
+            "--price",
+            "2.50",
+            "--option",
+            "Size=L",
+            "--pack-size",
+            "1001",
+        ],
+    );
+    assert!(
+        out.contains("Pack size must be between 1 and 1000"),
+        "out: {out}"
+    );
+    run_cli(
+        &config_path,
+        &[
+            "product",
+            "add-variant",
+            &pid,
+            "--title",
+            "Overrides",
+            "--price",
+            "2.50",
+            "--option",
+            "Size=L",
+            "--pack-size",
+            "2",
+        ],
+    );
+    let v_inherit = variant_id_by_title(&pool, product, "Inherits").await;
+    let v_override = variant_id_by_title(&pool, product, "Overrides").await;
+    let loc_inherit = seed_variant_stock(&pool, product, v_inherit, 12).await;
+    let loc_override = seed_variant_stock(&pool, product, v_override, 12).await;
+
+    let detail: serde_json::Value = http
+        .get(format!("{base}/products/{pid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let variants = detail["product"]["variants"].as_array().unwrap();
+    let api_inherit = variants
+        .iter()
+        .find(|v| v["id"] == v_inherit.to_string())
+        .unwrap();
+    let api_override = variants
+        .iter()
+        .find(|v| v["id"] == v_override.to_string())
+        .unwrap();
+    assert!(
+        api_inherit["pack_size"].is_null(),
+        "NULL = inherit: {detail}"
+    );
+    assert_eq!(api_override["pack_size"], 2);
+
+    // Inheriting variant: 2.50 × 6 = 15.00 per pack.
+    let resp = http
+        .post(format!("{base}/carts/{cart_id}/items"))
+        .json(&serde_json::json!({ "product_id": product, "variant_id": v_inherit, "quantity": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "add failed: {}",
+        resp.text().await.unwrap()
+    );
+    let item: serde_json::Value = resp.json().await.unwrap();
+    let unit_price: Decimal = item["unit_price"].as_str().unwrap().parse().unwrap();
+    assert_eq!(unit_price, Decimal::new(1500, 2));
+
+    // Overriding variant: 2.50 × 2 = 5.00 per pack.
+    let resp = http
+        .post(format!("{base}/carts/{cart_id}/items"))
+        .json(
+            &serde_json::json!({ "product_id": product, "variant_id": v_override, "quantity": 1 }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "add failed: {}",
+        resp.text().await.unwrap()
+    );
+    let item: serde_json::Value = resp.json().await.unwrap();
+    let unit_price: Decimal = item["unit_price"].as_str().unwrap().parse().unwrap();
+    assert_eq!(unit_price, Decimal::new(500, 2));
+
+    // --- cleanup -------------------------------------------------------------
+    sqlx::query("DELETE FROM carts WHERE id = $1")
+        .bind(Uuid::parse_str(&cart_id).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM inventory_levels WHERE product_id = $1")
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM inventory_locations WHERE id = ANY($1)")
+        .bind([location, loc_inherit, loc_override].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM products WHERE id = $1")
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
+}

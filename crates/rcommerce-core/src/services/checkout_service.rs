@@ -545,6 +545,16 @@ impl CheckoutService {
         // Validate cart one final time
         self.validate_cart(&cart, &items).await?;
 
+        // Reprice every line from current server-stored values (issue #49):
+        // unit price × effective pack size. If anything differs from what the
+        // cart showed, this refreshes the cart and refuses with a "prices
+        // changed" error so the customer confirms — never a silent re-total.
+        // The returned map carries each line's pack size for the order snapshot.
+        let line_pack_sizes = self
+            .cart_service
+            .reprice_from_current_prices(request.cart_id)
+            .await?;
+
         // Calculate final tax (bundle components are not taxed independently;
         // tax is applied to the bundle parent line only).
         let tax_items: Vec<&CartItem> = items
@@ -647,6 +657,7 @@ impl CheckoutService {
                     price: Decimal::ZERO,
                     tax_amount: Decimal::ZERO,
                     skip_inventory_reservation: false,
+                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
                 });
             } else if self.is_bundle_parent(item) {
                 // Bundle parent line: carries the bundle price, no inventory reservation.
@@ -664,6 +675,7 @@ impl CheckoutService {
                     price: item.unit_price,
                     tax_amount: item_tax,
                     skip_inventory_reservation: true,
+                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
                 });
             } else {
                 // Regular line item.
@@ -681,6 +693,7 @@ impl CheckoutService {
                     price: item.unit_price,
                     tax_amount: item_tax,
                     skip_inventory_reservation: false,
+                    pack_size: line_pack_sizes.get(&item.id).copied().unwrap_or(1),
                 });
             }
         }
@@ -2007,11 +2020,14 @@ mod tests {
         let coupon_repo: Arc<dyn CouponRepository> =
             Arc::new(PgCouponRepository::new(pool.clone()));
         let coupon_service = Arc::new(CouponService::new(coupon_repo.clone(), cart_repo.clone()));
-        let cart_service = Arc::new(CartService::new(
-            cart_repo.clone(),
-            coupon_repo.clone(),
-            coupon_service.clone(),
-        ));
+        let cart_service = Arc::new(
+            CartService::new(
+                cart_repo.clone(),
+                coupon_repo.clone(),
+                coupon_service.clone(),
+            )
+            .with_database(db.clone()),
+        );
         let cart = cart_service
             .get_or_create_cart(
                 crate::models::CartIdentifier::Session(format!("sess_{}", Uuid::new_v4())),
@@ -2037,6 +2053,7 @@ mod tests {
                     image_url: None,
                     requires_shipping: true,
                     is_gift_card: false,
+                    pack_size: 1,
                 },
             )
             .await
@@ -2135,6 +2152,287 @@ mod tests {
             subscription: None,
             payment_consent_id: None,
         }
+    }
+
+    /// Pack-pricing checkout harness (issue #49): a $2.50/unit product sold in
+    /// packs of 6, 12 units in stock, cart holding 2 packs at the server-
+    /// computed per-pack price of $15.00.
+    async fn pack_checkout_setup() -> Option<(
+        Arc<ControllableGateway>,
+        CheckoutService,
+        CheckoutTestContext,
+    )> {
+        use crate::repository::{CartRepository, CouponRepository};
+        use crate::repository::{Database, PgCartRepository, PgCouponRepository};
+
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping pack checkout tests: cannot connect to {url}: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = crate::ensure_test_migrations(&pool).await {
+            eprintln!("Skipping pack checkout tests: migration failed: {e}");
+            return None;
+        }
+        let db = Database::new(pool.clone());
+
+        let product_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO products (id, title, slug, price, pack_size) \
+             VALUES ($1, 'Pack Tea', $2, 2.50, 6)",
+        )
+        .bind(product_id)
+        .bind(format!("pack-tea-{}", product_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tax_zones (name, code, country_code, zone_type) \
+             VALUES ('Default HK', 'HK', 'HK', 'country') ON CONFLICT (code) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (location_id, owns_location) = {
+            let existing: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM inventory_locations WHERE is_active = true ORDER BY created_at LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            match existing {
+                Some(id) => (id, false),
+                None => {
+                    let id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO inventory_locations (id, name, code) VALUES ($1, 'Pack WH', $2)",
+                    )
+                    .bind(id)
+                    .bind(format!("PACK-{}", &id.to_string()[..8]))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    (id, true)
+                }
+            }
+        };
+        // 12 UNITS in stock = exactly 2 packs of 6.
+        sqlx::query(
+            "INSERT INTO inventory_levels (product_id, location_id, available_quantity) \
+             VALUES ($1, $2, 12)",
+        )
+        .bind(product_id)
+        .bind(location_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cart_repo: Arc<dyn CartRepository> = Arc::new(PgCartRepository::new(pool.clone()));
+        let coupon_repo: Arc<dyn CouponRepository> =
+            Arc::new(PgCouponRepository::new(pool.clone()));
+        let coupon_service = Arc::new(CouponService::new(coupon_repo.clone(), cart_repo.clone()));
+        let cart_service = Arc::new(
+            CartService::new(
+                cart_repo.clone(),
+                coupon_repo.clone(),
+                coupon_service.clone(),
+            )
+            .with_database(db.clone()),
+        );
+        let cart = cart_service
+            .get_or_create_cart(
+                crate::models::CartIdentifier::Session(format!("sess_{}", Uuid::new_v4())),
+                "USD",
+            )
+            .await
+            .unwrap();
+        cart_service
+            .add_item(
+                cart.id,
+                crate::models::AddToCartInput {
+                    product_id,
+                    variant_id: None,
+                    quantity: 2,
+                    custom_attributes: None,
+                },
+                ProductDetails {
+                    unit_price: dec!(15.00),
+                    original_price: dec!(15.00),
+                    sku: None,
+                    title: "Pack Tea".to_string(),
+                    variant_title: None,
+                    image_url: None,
+                    requires_shipping: true,
+                    is_gift_card: false,
+                    pack_size: 6,
+                },
+            )
+            .await
+            .unwrap();
+
+        let gateway = Arc::new(ControllableGateway::default());
+        let inventory_service =
+            crate::inventory::InventoryService::new(db.clone(), Default::default());
+        let order_service = Arc::new(
+            OrderService::new(
+                db.clone(),
+                Box::new(crate::payment::gateways::MockPaymentGateway::new()),
+                inventory_service,
+                OrderEventDispatcher::new(),
+            )
+            .with_store_code(None),
+        );
+        let tax_service = Arc::new(crate::tax::DefaultTaxService::new(pool.clone()));
+        let mut factory = ShippingProviderFactory::new();
+        factory.register(Box::new(crate::shipping::carriers::ManualProvider::new()));
+        let service = CheckoutService::new(
+            cart_service,
+            tax_service,
+            order_service,
+            gateway.clone(),
+            Arc::new(factory),
+            CheckoutConfig::default(),
+        );
+
+        Some((
+            gateway,
+            service,
+            CheckoutTestContext {
+                pool,
+                cart_id: cart.id,
+                product_id,
+                location_id,
+                owns_location,
+            },
+        ))
+    }
+
+    /// Server-side pack math at checkout: line price = unit × pack, quantity
+    /// counts packs, stock reserves in UNITS, and the order item snapshots the
+    /// pack size (issue #49).
+    #[tokio::test]
+    async fn pack_checkout_computes_server_side_and_snapshots() {
+        let Some((gateway, service, ctx)) = pack_checkout_setup().await else {
+            return;
+        };
+        gateway.set_status(crate::payment::PaymentStatus::Pending);
+
+        let result = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("pack checkout must succeed");
+        let order_id = result.order.order.id;
+
+        let (qty, price, pack): (i32, Decimal, i32) = sqlx::query_as(
+            "SELECT quantity, price, pack_size FROM order_items WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        assert_eq!(qty, 2, "quantity counts packs");
+        assert_eq!(price, dec!(15.00), "line price = 2.50 unit × 6 pack");
+        assert_eq!(pack, 6, "order item snapshots the effective pack size");
+        assert_eq!(result.order.order.subtotal, dec!(30.00));
+
+        // 2 packs × 6 = 12 UNITS reserved (reservation commits at payment).
+        let reserved_units: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(quantity), 0) FROM stock_reservations \
+             WHERE product_id = $1 AND status = 'active'",
+        )
+        .bind(ctx.product_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        assert_eq!(reserved_units, 12, "reservation must be in UNITS (2 × 6)");
+
+        // Payment succeeds: the reservation commits and stock moves in units.
+        gateway.set_status(crate::payment::PaymentStatus::Succeeded);
+        service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("payment finalization must succeed");
+        let (available, reserved): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(available_quantity), 0), COALESCE(SUM(reserved_quantity), 0) \
+             FROM inventory_levels WHERE product_id = $1",
+        )
+        .bind(ctx.product_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        assert_eq!(available, 0);
+        assert_eq!(reserved, 12);
+
+        idem_cleanup(&ctx).await;
+    }
+
+    /// Checkout recomputes from current stored values and NEVER charges a
+    /// different total silently: a price change refuses with "prices changed",
+    /// refreshes the cart, and the customer's retry pays the new total.
+    #[tokio::test]
+    async fn checkout_refuses_silent_price_change_and_refreshes_cart() {
+        let Some((gateway, service, ctx)) = pack_checkout_setup().await else {
+            return;
+        };
+        gateway.set_status(crate::payment::PaymentStatus::Pending);
+
+        // Merchant raises the unit price after the item was added to the cart.
+        sqlx::query("UPDATE products SET price = 3.00 WHERE id = $1")
+            .bind(ctx.product_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+
+        let err = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect_err("a changed total must refuse checkout");
+        assert!(
+            err.to_string().contains("Prices have changed"),
+            "unexpected error: {err}"
+        );
+
+        // The cart was refreshed to the new per-pack price (3.00 × 6 = 18.00)
+        // and its totals recalculated (2 packs = 36.00).
+        let unit: Decimal =
+            sqlx::query_scalar("SELECT unit_price FROM cart_items WHERE cart_id = $1")
+                .bind(ctx.cart_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        assert_eq!(unit, dec!(18.00));
+        let subtotal: Decimal = sqlx::query_scalar("SELECT subtotal FROM carts WHERE id = $1")
+            .bind(ctx.cart_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+        assert_eq!(subtotal, dec!(36.00));
+
+        // Customer confirms: the retry succeeds at the new price.
+        let result = service
+            .complete_checkout(idem_complete_request(ctx.cart_id))
+            .await
+            .expect("retry after price refresh must succeed");
+        let (price, pack): (Decimal, i32) =
+            sqlx::query_as("SELECT price, pack_size FROM order_items WHERE order_id = $1")
+                .bind(result.order.order.id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        assert_eq!(price, dec!(18.00));
+        assert_eq!(pack, 6);
+        assert_eq!(result.order.order.subtotal, dec!(36.00));
+
+        idem_cleanup(&ctx).await;
     }
 
     async fn idem_cleanup(ctx: &CheckoutTestContext) {

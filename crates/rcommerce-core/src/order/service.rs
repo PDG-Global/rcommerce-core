@@ -145,10 +145,16 @@ impl OrderService {
                 .get_product_order_details(item.product_id, item.variant_id)
                 .await?;
 
-            // Reserve inventory unless explicitly skipped (e.g. bundle parent lines)
+            // Reserve inventory unless explicitly skipped (e.g. bundle parent lines).
+            // Quantity counts PACKS; inventory is in UNITS, so reserve
+            // quantity * pack_size with checked arithmetic (issue #49).
             let reservation_id = if item.skip_inventory_reservation {
                 None
             } else {
+                let units = i64::from(item.quantity)
+                    .checked_mul(i64::from(item.pack_size))
+                    .and_then(|u| i32::try_from(u).ok())
+                    .ok_or_else(|| Error::validation("Quantity is too large"))?;
                 let reservation = self
                     .inventory_service
                     .reserve_stock(crate::inventory::StockReservation::new(
@@ -156,7 +162,7 @@ impl OrderService {
                         item.variant_id,
                         self.get_default_location_id().await?, // Support first active location
                         None, // Will be updated after order creation
-                        item.quantity,
+                        units,
                         chrono::Utc::now() + chrono::Duration::minutes(30),
                     ))
                     .await?;
@@ -199,6 +205,7 @@ impl OrderService {
                 weight: None, // TODO: Fetch from product
                 weight_unit: None,
                 is_bundle_component: None,
+                pack_size: item.pack_size,
                 metadata: if let Some(reservation_id) = reservation_id {
                     serde_json::json!({
                         "reservation_id": reservation_id,
@@ -307,9 +314,9 @@ impl OrderService {
                     id, order_id, product_id, variant_id,
                     title, variant_title, sku,
                     quantity, price, subtotal, tax_amount, total,
-                    weight, metadata
+                    weight, metadata, pack_size
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 "#,
             )
             .bind(item.id)
@@ -326,6 +333,7 @@ impl OrderService {
             .bind(item.total)
             .bind(item.weight)
             .bind(&item.metadata)
+            .bind(item.pack_size)
             .execute(self.db.pool())
             .await?;
 
@@ -1012,10 +1020,17 @@ impl OrderService {
             if product_type == "bundle" {
                 continue;
             }
+            // Restock from the order item's pack_size SNAPSHOT, not current
+            // product values: editing the pack size after the order must not
+            // change how many units a refund returns (issue #49).
+            let units = i64::from(item.quantity)
+                .checked_mul(i64::from(item.pack_size))
+                .and_then(|u| i32::try_from(u).ok())
+                .ok_or_else(|| Error::validation("Refund quantity is too large"))?;
             sqlx::query(
                 "UPDATE products SET inventory_quantity = inventory_quantity + $1, updated_at = NOW() WHERE id = $2",
             )
-            .bind(item.quantity)
+            .bind(units)
             .bind(item.product_id)
             .execute(&mut *transaction)
             .await?;
@@ -1025,7 +1040,7 @@ impl OrderService {
             )
             .bind(item.product_id)
             .bind(location_id)
-            .bind(item.quantity)
+            .bind(units)
             .bind(item.variant_id)
             .execute(&mut *transaction)
             .await?;
@@ -1038,7 +1053,7 @@ impl OrderService {
                 .bind(item.product_id)
                 .bind(item.variant_id)
                 .bind(location_id)
-                .bind(item.quantity)
+                .bind(units)
                 .execute(&mut *transaction)
                 .await?;
             }
@@ -1050,7 +1065,7 @@ impl OrderService {
             .bind(item.product_id)
             .bind(item.variant_id)
             .bind(location_id)
-            .bind(item.quantity)
+            .bind(units)
             .execute(&mut *transaction)
             .await?;
         }

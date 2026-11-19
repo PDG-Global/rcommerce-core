@@ -278,6 +278,7 @@ impl BundleService {
                 bundle_pricing_strategy: row.try_get("bundle_pricing_strategy")?,
                 bundle_discount_percentage: row.try_get("bundle_discount_percentage")?,
                 gtin: row.try_get("gtin")?,
+                pack_size: row.try_get("pack_size").unwrap_or(1),
             };
 
             components.push(BundleComponentWithProduct {
