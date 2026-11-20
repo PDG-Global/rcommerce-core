@@ -8,6 +8,17 @@ use crate::{
     Result,
 };
 
+/// The e-mail's unique index refusing a second account is a client error: two
+/// registrations can both pass the service's existence check and race here.
+fn duplicate_email(e: sqlx::Error) -> crate::Error {
+    match &e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+            crate::Error::validation("Email already exists")
+        }
+        _ => crate::Error::Database(e),
+    }
+}
+
 #[derive(Clone)]
 pub struct PostgresCustomerRepository {
     db: PostgresDb,
@@ -43,7 +54,8 @@ impl PostgresCustomerRepository {
         .bind(request.accepts_marketing)
         .bind(request.currency)
         .fetch_one(self.db.pool())
-        .await?;
+        .await
+        .map_err(duplicate_email)?;
 
         Ok(customer)
     }
@@ -68,7 +80,8 @@ impl PostgresCustomerRepository {
         .bind(request.currency)
         .bind(password_hash)
         .fetch_one(self.db.pool())
-        .await?;
+        .await
+        .map_err(duplicate_email)?;
 
         Ok(customer)
     }
@@ -291,7 +304,8 @@ impl CustomerRepositoryTrait for PostgresCustomerRepository {
         .bind(request.accepts_marketing)
         .bind(request.currency)
         .fetch_one(self.db.pool())
-        .await?;
+        .await
+        .map_err(duplicate_email)?;
 
         Ok(customer)
     }
@@ -381,6 +395,71 @@ impl PostgresCustomerRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    /// DB-backed tests: require PostgreSQL via TEST_DATABASE_URL; skipped without it
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres@localhost:5432/rcommerce_scratch".to_string());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Skipping DB test: cannot connect to {url}: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = crate::ensure_test_migrations(&pool).await {
+            eprintln!("Skipping DB test: migration failed: {e}");
+            return None;
+        }
+        Some(pool)
+    }
+
+    fn request(email: &str) -> CreateCustomerRequest {
+        CreateCustomerRequest {
+            email: email.to_string(),
+            first_name: "Twice".to_string(),
+            last_name: "Registered".to_string(),
+            phone: None,
+            accepts_marketing: false,
+            currency: crate::models::Currency::USD,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_account_for_an_email_is_a_validation_error() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresCustomerRepository::new(PostgresDb::new(pool.clone()));
+        let email = format!("twice_{}@example.com", Uuid::new_v4());
+        repo.create_with_password(request(&email), "hash".to_string())
+            .await
+            .unwrap();
+        let again = repo
+            .create_with_password(request(&email), "hash".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(again, crate::Error::Validation(_)),
+            "a client error, not a database failure: {again:?}"
+        );
+        let again = repo.create_with_request(request(&email)).await.unwrap_err();
+        assert!(matches!(again, crate::Error::Validation(_)), "{again:?}");
+        sqlx::query("DELETE FROM customers WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
