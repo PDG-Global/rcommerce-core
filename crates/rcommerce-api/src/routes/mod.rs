@@ -43,6 +43,9 @@ pub use checkout::router as checkout_router;
 pub use coupon::router as coupon_router;
 pub use customer::router as customer_router;
 pub use downloads::router as downloads_router;
+pub use downloads::{
+    admin_router as downloads_admin_router, protected_router as downloads_protected_router,
+};
 pub use dunning::{admin_router as dunning_admin_router, router as dunning_router};
 pub use newsletter::router as newsletter_router;
 pub use order::router as order_router;
