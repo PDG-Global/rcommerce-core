@@ -372,7 +372,7 @@ fn cart_access_error(error: rcommerce_core::Error) -> (StatusCode, Json<serde_js
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
-        Json(serde_json::json!({"error": error.to_string()})),
+        Json(serde_json::json!({"error": error.public_message()})),
     )
 }
 
@@ -427,10 +427,7 @@ pub async fn initiate_checkout(
         }
         Err(e) => {
             tracing::error!("Failed to initiate checkout: {}", e);
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            ))
+            Err(super::error_json(e))
         }
     }
 }
@@ -483,10 +480,7 @@ pub async fn select_shipping(
         }
         Err(e) => {
             tracing::error!("Failed to select shipping: {}", e);
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            ))
+            Err(super::error_json(e))
         }
     }
 }
@@ -533,12 +527,7 @@ pub async fn complete_checkout(
             .customer_service
             .find_by_id(auth.customer_id)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-            })?
+            .map_err(super::error_json)?
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
@@ -655,10 +644,7 @@ pub async fn complete_checkout(
         }
         Err(e) => {
             tracing::error!("Failed to complete checkout: {}", e);
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            ))
+            Err(super::error_json(e))
         }
     }
 }
@@ -919,12 +905,7 @@ pub async fn confirm_checkout(
         }
         Err(e) => {
             tracing::error!("Failed to confirm checkout: {}", e);
-            let status = if matches!(&e, rcommerce_core::Error::NotFound(_)) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            Err((status, Json(serde_json::json!({"error": e.to_string()}))))
+            Err(super::error_json(e))
         }
     }
 }

@@ -228,6 +228,17 @@ impl Error {
         }
     }
 
+    /// The message a client may see: the error itself for client errors
+    /// (4xx), a generic text for server failures (5xx), which can carry SQL,
+    /// constraint names, file paths or upstream hosts
+    pub fn public_message(&self) -> String {
+        match self.status_code() {
+            503 => "Service temporarily unavailable".to_string(),
+            500.. => "Internal server error".to_string(),
+            _ => self.to_string(),
+        }
+    }
+
     /// Get error category for monitoring
     pub fn category(&self) -> &'static str {
         match self {
@@ -312,17 +323,11 @@ impl Default for ValidationErrors {
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
-        // Server-side failures (database, config, I/O...) can carry SQL, constraint
-        // names or file paths: log them, and give the client a generic message.
-        let message = if status >= 500 {
+        // Server-side failures are logged in full; the client gets public_message()
+        if status >= 500 {
             tracing::error!(category = self.category(), "request failed: {}", self);
-            match status {
-                503 => "Service temporarily unavailable".to_string(),
-                _ => "Internal server error".to_string(),
-            }
-        } else {
-            self.to_string()
-        };
+        }
+        let message = self.public_message();
         let body = serde_json::json!({
             "error": {
                 "message": message,
