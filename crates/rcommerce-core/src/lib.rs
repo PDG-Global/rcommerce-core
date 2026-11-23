@@ -18,6 +18,7 @@ pub mod performance;
 pub mod repository;
 pub mod services;
 pub mod shipping;
+pub mod stores;
 pub mod tax;
 pub mod traits;
 pub mod websocket;

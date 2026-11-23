@@ -193,7 +193,7 @@ impl AuthService {
             exp: expiration,
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
-            aud: "rcommerce-api".to_string(),
+            aud: self.config.security.jwt.audience.clone(),
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -223,7 +223,7 @@ impl AuthService {
             exp: expiration,
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
-            aud: "rcommerce-api".to_string(),
+            aud: self.config.security.jwt.audience.clone(),
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -237,8 +237,8 @@ impl AuthService {
     pub fn verify_token(&self, token: &str) -> Result<JwtClaims> {
         let decoding_key = DecodingKey::from_secret(self.config.security.jwt.secret.as_bytes());
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-        // Disable audience validation since we're using simple validation
-        validation.validate_aud = false;
+        // Tokens are only valid for the audience (store) that issued them
+        validation.set_audience(&[self.config.security.jwt.audience.as_str()]);
 
         decode::<JwtClaims>(token, &decoding_key, &validation)
             .map(|data| data.claims)
@@ -288,7 +288,7 @@ impl AuthService {
             exp: expiration,
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
-            aud: "rcommerce-api".to_string(),
+            aud: self.config.security.jwt.audience.clone(),
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -328,7 +328,7 @@ impl AuthService {
             exp: expiration,
             iat: Utc::now().timestamp(),
             iss: "rcommerce".to_string(),
-            aud: "rcommerce-api".to_string(),
+            aud: self.config.security.jwt.audience.clone(),
         };
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -435,6 +435,39 @@ mod tests {
         config.security.jwt.secret =
             "this_is_a_test_secret_that_is_at_least_32_bytes_long".to_string();
         config
+    }
+
+    #[test]
+    fn tokens_are_only_valid_for_their_audience() {
+        let role = crate::models::CustomerRole::default();
+        let id = Uuid::new_v4();
+        // Same secret, different stores: the audience alone separates them
+        let mut store_a = test_config();
+        store_a.security.jwt.audience = "rcommerce-api:a".to_string();
+        let mut store_b = test_config();
+        store_b.security.jwt.audience = "rcommerce-api:b".to_string();
+        let a = AuthService::new(store_a);
+        let b = AuthService::new(store_b);
+
+        let token = a.generate_access_token(id, "a@example.com", &role).unwrap();
+        assert_eq!(
+            a.verify_access_token(&token).unwrap().aud,
+            "rcommerce-api:a"
+        );
+        assert!(b.verify_access_token(&token).is_err());
+        let refresh = a.generate_refresh_token(id, false).unwrap();
+        assert!(b.verify_token(&refresh).is_err());
+
+        // A single store keeps the historical audience, so existing tokens stay valid
+        let single = AuthService::new(test_config());
+        let token = single
+            .generate_access_token(id, "a@example.com", &role)
+            .unwrap();
+        assert_eq!(
+            single.verify_access_token(&token).unwrap().aud,
+            "rcommerce-api"
+        );
+        assert!(a.verify_access_token(&token).is_err());
     }
 
     #[test]
