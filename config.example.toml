@@ -24,7 +24,9 @@ graceful_shutdown_timeout_secs = 30
 
 # CORS (Cross-Origin Resource Sharing) configuration
 [server.cors]
-# Enable CORS (default: true)
+# Enable CORS (default: true). With false, no CORS headers are sent, so
+# browsers refuse every cross-origin request (same-origin and mobile/server
+# clients are unaffected)
 enabled = true
 
 # Allowed origins (default: ["http://localhost:3000"] - restrictive, local dev only)
@@ -44,11 +46,13 @@ enabled = true
 # allowed_origins = ["*"]  # development only, never in production
 allowed_origins = ["http://localhost:3000"]
 
-# Allowed HTTP methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
+# Allowed HTTP methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS; the
+# default also applies when this line is left out)
 # OPTIONS is required for preflight requests
 allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
-# Allowed headers (default: Content-Type, Authorization, X-Requested-With)
+# Allowed headers (default: Content-Type, Authorization, X-Requested-With; the
+# default also applies when this line is left out)
 # - Content-Type: Required for JSON request bodies
 # - Authorization: Required for JWT/API key authentication
 # - X-Requested-With: Common header used by frontend frameworks

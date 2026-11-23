@@ -288,16 +288,18 @@ fn default_graceful_shutdown() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsConfig {
+    /// When false, no cross-origin request is allowed (no CORS headers are
+    /// sent); same-origin and non-browser clients are unaffected
     #[serde(default = "default_true")]
     pub enabled: bool,
 
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_allowed_methods")]
     pub allowed_methods: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_allowed_headers")]
     pub allowed_headers: Vec<String>,
 
     #[serde(default = "default_true")]
@@ -312,14 +314,8 @@ impl Default for CorsConfig {
         Self {
             enabled: true,
             allowed_origins: default_allowed_origins(),
-            allowed_methods: vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            allowed_headers: vec!["Content-Type", "Authorization", "X-Requested-With"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_methods: default_allowed_methods(),
+            allowed_headers: default_allowed_headers(),
             allow_credentials: true,
             max_age: Some(3600),
         }
@@ -331,6 +327,24 @@ impl Default for CorsConfig {
 /// logs a security warning at startup when "*" is used.
 fn default_allowed_origins() -> Vec<String> {
     vec!["http://localhost:3000".to_string()]
+}
+
+/// Default CORS methods, also used when a `[server.cors]` section leaves them
+/// out (an empty list would make every preflight fail)
+fn default_allowed_methods() -> Vec<String> {
+    ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Default CORS request headers, also used when a `[server.cors]` section
+/// leaves them out (without `Authorization` no API call could carry a token)
+fn default_allowed_headers() -> Vec<String> {
+    ["Content-Type", "Authorization", "X-Requested-With"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1865,6 +1879,20 @@ pub struct UspsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_section_without_methods_or_headers_keeps_the_defaults() {
+        let toml_str = r#"
+[server.cors]
+allowed_origins = ["https://shop.example.com"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("config parses");
+        let cors = &config.server.cors;
+        assert_eq!(cors.allowed_origins, ["https://shop.example.com"]);
+        assert_eq!(cors.allowed_methods, default_allowed_methods());
+        assert_eq!(cors.allowed_headers, default_allowed_headers());
+        assert!(cors.enabled);
+    }
 
     #[test]
     fn test_branding_defaults_when_section_absent() {
