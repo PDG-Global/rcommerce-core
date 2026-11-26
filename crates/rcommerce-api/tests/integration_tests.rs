@@ -2320,3 +2320,60 @@ async fn test_product_cost_price_is_admin_only() {
 
     app.cleanup().await.ok();
 }
+
+/// Issue #54: the manual-order path must not oversell. Several concurrent
+/// orders for the last unit: exactly one succeeds, the rest are refused, and
+/// stock never goes below zero (check and deduction are one atomic step).
+#[tokio::test]
+#[ignore = "Requires PostgreSQL database with proper permissions"]
+async fn test_manual_orders_never_oversell_under_concurrency() {
+    let app = TestApp::new().await.expect("Failed to create test app");
+    let (customer, password) = app.create_test_customer().await.unwrap();
+    let token = app.login(&customer.email, &password).await.unwrap();
+    let product = app
+        .create_test_product("Last Unit", Decimal::new(1000, 2), 1)
+        .await
+        .unwrap();
+    let url = format!("{}/api/v1/orders", app.base_url());
+    let body = serde_json::json!({
+        "customer_id": customer.id,
+        "customer_email": customer.email,
+        "items": [{ "product_id": product, "quantity": 1 }]
+    });
+
+    let attempts = 8;
+    let mut handles = Vec::new();
+    for _ in 0..attempts {
+        let request = app.http_client.post(&url).bearer_auth(&token).json(&body);
+        handles.push(tokio::spawn(async move {
+            request.send().await.unwrap().status()
+        }));
+    }
+    let mut created = 0;
+    for handle in handles {
+        let status = handle.await.unwrap();
+        if status.is_success() {
+            created += 1;
+        } else {
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "refusals are 400");
+        }
+    }
+
+    let left: i32 = sqlx::query_scalar("SELECT inventory_quantity FROM products WHERE id = $1")
+        .bind(product)
+        .fetch_one(&app.db_pool)
+        .await
+        .unwrap();
+    let ordered: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity), 0)::BIGINT FROM order_items WHERE product_id = $1",
+    )
+    .bind(product)
+    .fetch_one(&app.db_pool)
+    .await
+    .unwrap();
+    assert_eq!(created, 1, "exactly one order for the last unit");
+    assert_eq!(left, 0, "stock never goes below zero");
+    assert_eq!(ordered, 1, "one unit ordered in total");
+
+    app.cleanup().await.ok();
+}
