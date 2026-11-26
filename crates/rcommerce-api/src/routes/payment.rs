@@ -2206,7 +2206,7 @@ mod tests {
         // go first: the suite is re-runnable against a reused database (CI
         // always starts fresh, a local scratch DB does not).
         sqlx::query(
-            "DELETE FROM payment_gateway_customers WHERE gateway_customer_id = 'cus_legacy'",
+            "DELETE FROM payment_gateway_customers WHERE gateway_customer_id IN ('cus_legacy', 'cus_new')",
         )
         .execute(&pool)
         .await
