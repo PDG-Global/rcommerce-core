@@ -287,8 +287,8 @@ pub async fn get_product(
         .map(|c| serde_json::json!({"id": c.id, "name": c.name, "slug": c.slug}))
         .collect();
 
-    Ok(Json(serde_json::json!({
-    "product": {
+    let is_admin = cost_price_visible(auth.as_ref());
+    let mut product = serde_json::json!({
         "id": p.id,
         "title": p.title,
         "slug": p.slug,
@@ -297,7 +297,6 @@ pub async fn get_product(
         "gtin": p.gtin,
         "price": p.price,
         "compare_at_price": p.compare_at_price,
-                "cost_price": p.cost_price,
                 "currency": p.currency,
                 "pack_size": p.pack_size,
                 "product_type": format!("{:?}", p.product_type).to_lowercase(),
@@ -339,8 +338,20 @@ pub async fn get_product(
                         "value": v.value
                     })).collect::<Vec<_>>()
                 })).collect::<Vec<_>>()
-            }
-        })))
+    });
+    // What the store pays for the product is staff-only: anonymous
+    // visitors and customers never see it.
+    if is_admin {
+        product["cost_price"] = serde_json::json!(p.cost_price);
+    }
+    Ok(Json(serde_json::json!({ "product": product })))
+}
+
+/// What the store pays for a product (`cost_price`) is staff-only:
+/// anonymous visitors and customers never see it. Same shape as
+/// [`product_visible`].
+fn cost_price_visible(auth: Option<&JwtAuth>) -> bool {
+    auth.is_some_and(|a| a.is_admin())
 }
 
 /// Derive a short purchase-option label from a pack product's title.
@@ -622,6 +633,22 @@ mod tests {
         assert!(!product_visible(false, None));
         assert!(!product_visible(false, Some(&customer)));
         assert!(product_visible(false, Some(&admin)));
+    }
+
+    #[test]
+    fn cost_price_is_visible_to_admins_only() {
+        let customer = JwtAuth {
+            customer_id: uuid::Uuid::new_v4(),
+            email: "c@example.com".to_string(),
+            permissions: vec!["read".to_string()],
+        };
+        let admin = JwtAuth {
+            permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            ..customer.clone()
+        };
+        assert!(!cost_price_visible(None));
+        assert!(!cost_price_visible(Some(&customer)));
+        assert!(cost_price_visible(Some(&admin)));
     }
 
     #[test]
