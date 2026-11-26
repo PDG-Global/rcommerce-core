@@ -47,8 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (pinned by rust-toolchain.toml)
+      - name: Install Rust (pinned to rust-toolchain.toml's channel)
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Cache cargo
         uses: actions/cache@v4
