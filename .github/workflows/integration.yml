@@ -1,0 +1,127 @@
+name: integration
+
+# Runs the Postgres-backed integration suites (the #[ignore]d tests) on
+# every PR and push to main, against a throwaway CI-internal Postgres.
+# No real credentials exist here: the database lives and dies inside the
+# runner, the JWT secret is a random throwaway, and the payment gateway
+# runs in test mode.
+#
+# Ordering is load-bearing: every suite that runs migrations or other DDL
+# finishes BEFORE the long-lived API server starts. Prepared statements
+# cached by a live server go stale when DDL lands underneath it
+# ("cached plan must not change result type"), which presents as flaky
+# 500s and (masked) empty list responses. Phase 1 (DB suites, which spawn
+# their own in-process servers) therefore runs first; phase 2 (the
+# live-server suite) runs against a server started after all DDL.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: read-all
+
+env:
+  TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/rcommerce_ci
+  TEST_SERVER_URL: http://127.0.0.1:8080
+
+jobs:
+  postgres-suites:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rcommerce_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (pinned to rust-toolchain.toml's channel)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the server
+        run: cargo build -p rcommerce-cli
+
+      - name: Write the CI config (throwaway values only)
+        run: |
+          cat > /tmp/rcommerce-ci.toml <<'EOF'
+          [server]
+          host = "127.0.0.1"
+          port = 8080
+
+          [database]
+          db_type = "Postgres"
+          host = "127.0.0.1"
+          port = 5432
+          database = "rcommerce_ci"
+          username = "postgres"
+          password = "postgres"
+
+          [logging]
+          level = "warn"
+
+          [security.jwt]
+          secret = "ci-throwaway-secret-not-a-real-credential"
+
+          [payment]
+          test_mode = true
+          EOF
+
+      - name: Phase 1 — Postgres-backed suites (no live server)
+        run: >-
+          cargo test -p rcommerce-api
+          --lib
+          --test auth_security
+          --test direct_order_pr10
+          --test e2e_test_suite
+          --test integration_tests
+          --test payment_authorization
+          --no-fail-fast
+          -- --ignored --test-threads=1
+
+      - name: Start the API server (runs migrations)
+        run: |
+          RCOMMERCE_CONFIG=/tmp/rcommerce-ci.toml nohup ./target/debug/rcommerce server > /tmp/rcommerce-server.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/health; then
+              echo "server healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become healthy; log follows"
+          cat /tmp/rcommerce-server.log
+          exit 1
+
+      - name: Phase 2 — live-server suite
+        run: >-
+          cargo test -p rcommerce-api
+          --test integration_test
+          --no-fail-fast
+          -- --ignored --test-threads=1
+
+      - name: Server log (on failure)
+        if: failure()
+        run: tail -200 /tmp/rcommerce-server.log || true

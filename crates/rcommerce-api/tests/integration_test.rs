@@ -14,12 +14,17 @@ use std::time::Duration;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
 /// Test harness that manages the test client
 pub struct TestHarness {
     base_url: String,
     http_client: Client,
+    /// Present when `TEST_DATABASE_URL` is set — used to complete the
+    /// email-verification step the designed register→login flow requires,
+    /// exactly like `integration_tests.rs`'s `create_test_customer`.
+    db: Option<Pool<Postgres>>,
 }
 
 impl TestHarness {
@@ -34,10 +39,72 @@ impl TestHarness {
         let base_url = std::env::var("TEST_SERVER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
+        let db = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&url)
+                    .await?,
+            ),
+            Err(_) => None,
+        };
+
         Ok(Self {
             base_url,
             http_client,
+            db,
         })
+    }
+
+    /// Register a unique customer, mark the email verified in the database
+    /// (login requires a verified email by design — the production flow
+    /// verifies via an emailed link, the suite bypasses the email hop),
+    /// log in, and return `(email, bearer token)`. Requires
+    /// `TEST_DATABASE_URL`.
+    pub async fn verified_customer_token(&self) -> anyhow::Result<(String, String)> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("TEST_DATABASE_URL is required for the verified-login path")
+        })?;
+        let email = format!("test-{}@example.com", Uuid::new_v4());
+
+        let register = self
+            .http_client
+            .post(format!("{}/api/v1/auth/register", self.base_url))
+            .json(&json!({
+                "email": email,
+                "password": "TestPassword123!",
+                "first_name": "Test",
+                "last_name": "User"
+            }))
+            .send()
+            .await?;
+        assert_eq!(
+            register.status(),
+            StatusCode::CREATED,
+            "registration must succeed"
+        );
+
+        sqlx::query("UPDATE customers SET email_verified = true WHERE email = $1")
+            .bind(&email)
+            .execute(db)
+            .await?;
+
+        let login = self
+            .http_client
+            .post(format!("{}/api/v1/auth/login", self.base_url))
+            .json(&json!({
+                "email": email,
+                "password": "TestPassword123!"
+            }))
+            .send()
+            .await?;
+        assert_eq!(
+            login.status(),
+            StatusCode::OK,
+            "login after email verification must succeed"
+        );
+        let auth: AuthResponse = login.json().await?;
+        Ok((email, auth.token))
     }
 
     pub fn base_url(&self) -> &str {
@@ -154,69 +221,33 @@ async fn test_complete_customer_flow() {
     let harness = TestHarness::new()
         .await
         .expect("Failed to create test harness");
-    let test_email = format!("test-{}@example.com", Uuid::new_v4());
 
-    // 1. Register a new customer
-    let register_response = harness
+    // Register → (designed) email verification → login → profile.
+    let (test_email, token) = harness
+        .verified_customer_token()
+        .await
+        .expect("verified login must succeed");
+
+    let profile_response = harness
         .client()
-        .post(format!("{}/api/v1/auth/register", harness.base_url()))
-        .json(&json!({
-            "email": test_email,
-            "password": "TestPassword123!",
-            "first_name": "Test",
-            "last_name": "User"
-        }))
+        .get(format!("{}/api/v1/customers/me", harness.base_url()))
+        .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
-        .expect("Failed to register");
+        .expect("Failed to get profile");
 
-    // Registration might fail if email already exists or server not running
-    // For MVP testing, we accept CREATED or CONFLICT (if user exists)
-    assert!(
-        register_response.status() == StatusCode::CREATED
-            || register_response.status() == StatusCode::CONFLICT
-            || register_response.status() == StatusCode::SERVICE_UNAVAILABLE,
-        "Unexpected status: {:?}",
-        register_response.status()
+    assert_eq!(profile_response.status(), StatusCode::OK);
+    let profile: serde_json::Value = profile_response
+        .json()
+        .await
+        .expect("Failed to parse profile");
+    assert_eq!(
+        profile
+            .get("customer")
+            .and_then(|c| c.get("email"))
+            .and_then(|v| v.as_str()),
+        Some(test_email.as_str())
     );
-
-    if register_response.status() == StatusCode::CREATED {
-        // Register response doesn't include token, so we need to login
-        // 2. Login with the new account
-        let login_response = harness
-            .client()
-            .post(format!("{}/api/v1/auth/login", harness.base_url()))
-            .json(&json!({
-                "email": test_email,
-                "password": "TestPassword123!"
-            }))
-            .send()
-            .await
-            .expect("Failed to login");
-
-        assert_eq!(login_response.status(), StatusCode::OK);
-
-        let auth: AuthResponse = login_response
-            .json()
-            .await
-            .expect("Failed to parse auth response");
-        assert_eq!(auth.customer.email, test_email);
-
-        // 3. Get customer profile
-        let profile_response = harness
-            .client()
-            .get(format!("{}/api/v1/customers/me", harness.base_url()))
-            .header("Authorization", format!("Bearer {}", auth.token))
-            .send()
-            .await
-            .expect("Failed to get profile");
-
-        // Profile might require valid token
-        assert!(
-            profile_response.status() == StatusCode::OK
-                || profile_response.status() == StatusCode::UNAUTHORIZED
-        );
-    }
 }
 
 #[tokio::test]
@@ -252,41 +283,46 @@ async fn test_order_creation_flow() {
     let harness = TestHarness::new()
         .await
         .expect("Failed to create test harness");
-    let test_email = format!("test-{}@example.com", Uuid::new_v4());
 
-    // First, ensure we have a product to order
-    let product_response = harness
-        .client()
-        .get(format!("{}/api/v1/products", harness.base_url()))
-        .send()
+    // Seed a dedicated in-stock product: which products exist at this
+    // point depends on which suites ran before (some leave zero-inventory
+    // fixtures, and order creation refuses overselling by design, #60).
+    let product_id = Uuid::new_v4();
+    {
+        let db = harness
+            .db
+            .as_ref()
+            .expect("TEST_DATABASE_URL is required to seed the order test product");
+        sqlx::query(
+            "INSERT INTO products (id, title, slug, product_type, price, currency, inventory_quantity, is_active, created_at, updated_at)
+             VALUES ($1, $2, $3, $4::product_type, $5, $6::currency, $7, $8, $9, $10)",
+        )
+        .bind(product_id)
+        .bind("Order Test Product")
+        .bind(format!("order-test-{product_id}"))
+        .bind("simple")
+        .bind(rust_decimal::Decimal::new(1999, 2))
+        .bind("USD")
+        .bind(100i32)
+        .bind(true)
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(db)
         .await
-        .expect("Failed to get products");
-
-    if product_response.status() != StatusCode::OK {
-        println!("Server not available or no products, skipping test");
-        return;
+        .expect("seed product insert must succeed");
     }
+    let product_id = product_id.to_string();
 
-    let products: serde_json::Value = product_response
-        .json()
+    // Create an order as a verified, authenticated customer (the order
+    // routes require auth by design).
+    let (test_email, token) = harness
+        .verified_customer_token()
         .await
-        .expect("Failed to parse products");
-    let products_array = products.get("products").and_then(|p| p.as_array());
-
-    if products_array.map(|a| a.is_empty()).unwrap_or(true) {
-        println!("Skipping order test - no products in database");
-        return;
-    }
-
-    let product_id = products_array.unwrap()[0]
-        .get("id")
-        .and_then(|id| id.as_str())
-        .expect("Product has no id");
-
-    // Create an order
+        .expect("verified login must succeed");
     let order_response = harness
         .client()
         .post(format!("{}/api/v1/orders", harness.base_url()))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&json!({
             "customer_email": test_email,
             "items": [
@@ -301,13 +337,11 @@ async fn test_order_creation_flow() {
         .expect("Failed to create order");
 
     // Order creation should succeed or return validation error
-    assert!(
-        order_response.status() == StatusCode::CREATED
-            || order_response.status() == StatusCode::UNPROCESSABLE_ENTITY
-            || order_response.status() == StatusCode::SERVICE_UNAVAILABLE,
-        "Unexpected status: {:?}",
-        order_response.status()
-    );
+    let order_status = order_response.status();
+    if order_status != StatusCode::CREATED {
+        let body = order_response.text().await.unwrap_or_default();
+        panic!("unexpected order-create status {order_status}: {body}");
+    }
 
     if order_response.status() == StatusCode::CREATED {
         let order: OrderResponse = order_response.json().await.expect("Failed to parse order");
@@ -318,6 +352,7 @@ async fn test_order_creation_flow() {
         let get_response = harness
             .client()
             .get(format!("{}/api/v1/orders/{}", harness.base_url(), order.id))
+            .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .expect("Failed to get order");
@@ -333,9 +368,14 @@ async fn test_payment_methods() {
         .await
         .expect("Failed to create test harness");
 
+    let (_email, token) = harness
+        .verified_customer_token()
+        .await
+        .expect("verified login must succeed");
     let response = harness
         .client()
         .post(format!("{}/api/v1/payments/methods", harness.base_url()))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&json!({
             "currency": "USD",
             "amount": "100.00"
@@ -403,7 +443,9 @@ async fn test_error_handling() {
         .await
         .expect("Failed to create test harness");
 
-    // Test 404 for non-existent order
+    // Unauthenticated requests to the order routes get 401, not 404: auth
+    // runs before existence (by design — order existence must not leak to
+    // anonymous callers).
     let fake_id = Uuid::new_v4();
     let response = harness
         .client()
@@ -417,7 +459,7 @@ async fn test_error_handling() {
         return;
     }
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     // Test validation error for invalid email
     let response = harness

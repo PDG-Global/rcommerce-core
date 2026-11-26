@@ -2202,6 +2202,15 @@ mod tests {
             .await
             .unwrap();
         let db = rcommerce_core::repository::Database::new(pool.clone());
+        // The fixture uses a fixed gateway id, so a previous run's rows must
+        // go first: the suite is re-runnable against a reused database (CI
+        // always starts fresh, a local scratch DB does not).
+        sqlx::query(
+            "DELETE FROM payment_gateway_customers WHERE gateway_customer_id IN ('cus_legacy', 'cus_new')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let legacy_customer = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO customers (id, email, airwallex_customer_id) VALUES ($1, $2, 'cus_legacy')",

@@ -522,8 +522,8 @@ impl<'a> DataGenerator<'a> {
             .take(count.min(categories.len()))
         {
             let id = Uuid::new_v4();
-            sqlx::query(r#"INSERT INTO product_categories (id, name, slug, description, sort_order, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#)
-                .bind(id.to_string()).bind(name).bind(slug).bind(desc)
+            sqlx::query(r#"INSERT INTO product_categories (id, name, slug, description, sort_order, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"#)
+                .bind(id).bind(name).bind(slug).bind(desc)
                 .bind(i as i32).bind(chrono::Utc::now()).bind(chrono::Utc::now())
                 .execute(self.db).await?;
             ids.push(id);
@@ -537,12 +537,12 @@ impl<'a> DataGenerator<'a> {
         for i in 0..count {
             let id = Uuid::new_v4();
             let price = Decimal::try_from(rng.gen_range(9.99..299.99)).unwrap_or(Decimal::ONE);
-            sqlx::query(r#"INSERT INTO products (id, title, slug, product_type, price, currency, inventory_quantity, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#)
-                .bind(id.to_string())
+            sqlx::query(r#"INSERT INTO products (id, title, slug, product_type, price, currency, inventory_quantity, is_active, created_at, updated_at) VALUES ($1, $2, $3, $4::product_type, $5, $6::currency, $7, $8, $9, $10)"#)
+                .bind(id)
                 .bind(format!("Product {}", i + 1))
                 .bind(format!("product-{}", i))
                 .bind("simple")
-                .bind(price.to_string())
+                .bind(price)
                 .bind("USD")
                 .bind(rng.gen_range(10..500))
                 .bind(true)
@@ -565,15 +565,15 @@ impl<'a> DataGenerator<'a> {
         for i in 0..count {
             let id = Uuid::new_v4();
             let email = format!("customer{}@test.com", i);
-            sqlx::query(r#"INSERT INTO customers (id, email, first_name, last_name, accepts_marketing, currency, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#)
-                .bind(id.to_string()).bind(&email).bind("Test").bind(format!("User{}", i))
+            sqlx::query(r#"INSERT INTO customers (id, email, first_name, last_name, accepts_marketing, currency, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6::currency, $7, $8)"#)
+                .bind(id).bind(&email).bind("Test").bind(format!("User{}", i))
                 .bind(false).bind("USD").bind(chrono::Utc::now()).bind(chrono::Utc::now())
                 .execute(self.db).await?;
             cust_ids.push(id);
             for j in 0..addr_count {
                 let addr_id = Uuid::new_v4();
-                sqlx::query(r#"INSERT INTO addresses (id, customer_id, first_name, last_name, address1, city, country, zip, is_default_shipping, is_default_billing, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#)
-                    .bind(addr_id.to_string()).bind(id.to_string()).bind("Test").bind("User")
+                sqlx::query(r#"INSERT INTO addresses (id, customer_id, first_name, last_name, address1, city, country, zip, is_default_shipping, is_default_billing, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#)
+                    .bind(addr_id).bind(id).bind("Test").bind("User")
                     .bind(format!("{} Test St", j + 1)).bind("Test City").bind("US").bind("12345")
                     .bind(j == 0).bind(j == 0).bind(chrono::Utc::now()).bind(chrono::Utc::now())
                     .execute(self.db).await?;
@@ -595,9 +595,9 @@ impl<'a> DataGenerator<'a> {
             let id = Uuid::new_v4();
             let cust_id = customers.choose(&mut rng);
             let total = Decimal::try_from(rng.gen_range(10.0..500.0)).unwrap_or(Decimal::ONE);
-            sqlx::query(r#"INSERT INTO orders (id, order_number, customer_id, email, currency, total, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#)
-                .bind(id.to_string()).bind(format!("ORD-{}", 1000 + i)).bind(cust_id.map(|c| c.to_string()))
-                .bind(format!("test{}@test.com", i)).bind("USD").bind(total.to_string())
+            sqlx::query(r#"INSERT INTO orders (id, order_number, customer_id, customer_email, currency, total, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5::currency, $6, $7::order_status, $8, $9)"#)
+                .bind(id).bind(format!("ORD-{}", 1000 + i)).bind(cust_id)
+                .bind(format!("test{}@test.com", i)).bind("USD").bind(total)
                 .bind("pending").bind(chrono::Utc::now()).bind(chrono::Utc::now())
                 .execute(self.db).await?;
             ids.push(id);
