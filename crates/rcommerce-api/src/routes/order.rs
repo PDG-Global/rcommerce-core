@@ -472,7 +472,8 @@ pub async fn create_order(
             }
         };
 
-        // Check inventory
+        // Check inventory (early refusal only; the authoritative check is the
+        // conditional deduction inside the order transaction below)
         let inventory_qty: i32 =
             match sqlx::query_scalar("SELECT inventory_quantity FROM products WHERE id = $1")
                 .bind(item.product_id)
@@ -650,6 +651,24 @@ pub async fn create_order(
 
     let order_id = Uuid::new_v4();
 
+    // Issue #54: the order, its items and the stock deduction are one
+    // transaction. The stock check above is only an early, friendly refusal;
+    // the conditional UPDATE below is the real check, so concurrent orders
+    // can't both take the last units. Any failure rolls everything back.
+    let db_error = |what: &str, e: sqlx::Error| {
+        tracing::error!("{}: {}", what, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Failed to create order"})),
+        )
+    };
+    let mut tx = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| db_error("Failed to start order transaction", e))?;
+
     // Create order
     let create_order_query = format!(
         r#"
@@ -680,26 +699,44 @@ pub async fn create_order(
         .bind(shipping_total)
         .bind(total)
         .bind(request.notes)
-        .fetch_one(state.db.pool())
+        .fetch_one(&mut *tx)
         .await
     {
         Ok(o) => o,
-        Err(e) => {
-            tracing::error!("Failed to create order: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Failed to create order"})),
-            ));
-        }
+        Err(e) => return Err(db_error("Failed to create order", e)),
     };
 
-    // Create order items and update inventory
+    // Create order items and update inventory. Rows are locked in product-id
+    // order, so two orders sharing products can't deadlock each other.
+    order_items.sort_by_key(|(product, ..)| product.id);
     for (product, quantity, item_total, pack_size) in order_items {
         let item_id = Uuid::new_v4();
         let per_pack_price = product.price * Decimal::from(pack_size);
+        // Validated above: quantity × pack_size fits in i32.
         let units = quantity.saturating_mul(pack_size);
 
-        if let Err(e) = sqlx::query(
+        // Check and deduct in one statement (units, not packs): it only
+        // succeeds while enough stock is left, so stock never goes negative.
+        let deducted = sqlx::query_scalar::<_, i32>(
+            "UPDATE products SET inventory_quantity = inventory_quantity - $1, updated_at = NOW() \
+             WHERE id = $2 AND inventory_quantity >= $1 RETURNING inventory_quantity",
+        )
+        .bind(units)
+        .bind(product.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_error("Failed to update inventory", e))?;
+        if deducted.is_none() {
+            // Dropping `tx` rolls back the order and any items already added.
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Insufficient inventory for product {}", product.title)
+                })),
+            ));
+        }
+
+        sqlx::query(
             r#"
             INSERT INTO order_items (
                 id, order_id, product_id, variant_id,
@@ -720,23 +757,14 @@ pub async fn create_order(
         .bind(&product.title)
         .bind(None::<String>) // variant_title
         .bind(pack_size)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await
-        {
-            tracing::error!("Failed to create order item: {}", e);
-        }
-
-        // Update inventory on product (units, not packs)
-        if let Err(e) = sqlx::query(
-            "UPDATE products SET inventory_quantity = inventory_quantity - $1, updated_at = NOW() WHERE id = $2"
-        )
-        .bind(units)
-        .bind(product.id)
-        .execute(state.db.pool())
-        .await {
-            tracing::error!("Failed to update inventory: {}", e);
-        }
+        .map_err(|e| db_error("Failed to create order item", e))?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| db_error("Failed to commit order", e))?;
 
     // Get items for response
     let items = match sqlx::query_as::<_, rcommerce_core::models::OrderItem>(
